@@ -201,7 +201,12 @@ const Watched = union(enum) {
 /// Serves `req` on a task of its own beside a wait for the client to
 /// leave: a client that closes its stream (the 2026-07-28 revision's
 /// cancellation over HTTP) stops the handler, which sees `error.Canceled`.
-fn serveWatched(e: *Endpoint, io: Io, arena: Allocator, request: *Request, req: wire.Request, principal: ?[]const u8, sink: parley.Sink) parley.Server.HandleError!parley.Server.Reply {
+/// A stream the request opened (`subscriptions/listen`) is ended instead,
+/// and returns on its own.
+fn serveWatched(e: *Endpoint, io: Io, arena: Allocator, request: *Request, req: wire.Request, principal: ?[]const u8, given: parley.Sink) parley.Server.HandleError!parley.Server.Reply {
+    var end: parley.Sink.End = .{};
+    var sink = given;
+    sink.end = &end;
     var buffer: [2]Watched = undefined;
     var select: Io.Select(Watched) = .init(io, &buffer);
     // Both tasks have ended before the request's memory goes.
@@ -216,9 +221,12 @@ fn serveWatched(e: *Endpoint, io: Io, arena: Allocator, request: *Request, req: 
     while (true) switch (try select.await()) {
         .served => |reply| return reply,
         .left => |left| {
-            // The client left: the handler is stopped as the select ends.
-            if (left catch false) return error.Canceled;
             // The wait could not say: the call runs to its end.
+            if (!(left catch false)) continue;
+            // The client left: a stream is ended, and its answer awaited;
+            // any other handler is stopped as the select ends.
+            if (!std.mem.eql(u8, req.method, "subscriptions/listen")) return error.Canceled;
+            end.end(io);
         },
     };
 }
@@ -391,6 +399,8 @@ fn endSession(e: *Endpoint, io: Io, response: *Response, session_id: ?[]const u8
         for (e.sessions.items, 0..) |entry, i| if (std.mem.eql(u8, &entry.id, id)) break :found e.sessions.swapRemove(i);
         break :found null;
     } orelse return refuse(io, response, .not_found, null, .invalid_request, "Session not found");
+    // Its stream, if one is open, ends with it.
+    gone.session.end(io);
     gone.release(e.gpa);
     response.status = .no_content;
     return response.end(io);

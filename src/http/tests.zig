@@ -267,6 +267,54 @@ test "the client over HTTP: modern, and a session whose input comes as the serve
     try clientRound(io, &h, &.{.@"2025-11-25"}, .session);
 }
 
+test "a session's stream ends when the session is deleted" {
+    const io = testing.io;
+    var h: Harness = undefined;
+    try h.start(io);
+    defer h.stop(io);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var url_buffer: [64]u8 = undefined;
+    const url = try std.mem.print(&url_buffer, "http://127.0.0.1:{d}/mcp", .{h.port});
+    var opened = try h.client.send(io, .{ .method = .POST, .url = url, .headers = &.{
+        .{ .name = "Content-Type", .value = "application/json" },
+        .{ .name = "Accept", .value = "application/json, text/event-stream" },
+    }, .body = .{ .bytes = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}" } });
+    const session = try arena.allocator().dupe(u8, opened.headers.get("Mcp-Session-Id") orelse return error.TestNoSession);
+    _ = try opened.collect(arena.allocator(), io, .limited(1 << 16));
+    opened.deinit(io);
+    stream_open.store(false, .release);
+    var streaming = try io.concurrent(readStream, .{ &h, io, url, session });
+    // glint-ignore: Z026 -- reached only when the test failed first; how the reader ends is not what it checks
+    defer streaming.cancel(io) catch {};
+    try Stall.until(&stream_open);
+    var deleted = try h.client.send(io, .{ .method = .DELETE, .url = url, .headers = &.{
+        .{ .name = "Mcp-Session-Id", .value = session },
+        .{ .name = "MCP-Protocol-Version", .value = "2025-11-25" },
+    } });
+    defer deleted.deinit(io);
+    try testing.expectEqual(std.http.Status.no_content, deleted.status);
+    // The stream ends with the session: its reader returns, the server still up.
+    try streaming.await(io);
+}
+
+var stream_open: std.atomic.Value(bool) = .init(false);
+
+/// Opens the session's stream and reads it to its end.
+fn readStream(h: *Harness, io: Io, url: []const u8, session: []const u8) !void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var stream = try h.client.send(io, .{ .method = .GET, .url = url, .headers = &.{
+        .{ .name = "Accept", .value = "text/event-stream" },
+        .{ .name = "Mcp-Session-Id", .value = session },
+        .{ .name = "MCP-Protocol-Version", .value = "2025-11-25" },
+    } });
+    defer stream.deinit(io);
+    try testing.expectEqual(std.http.Status.ok, stream.status);
+    stream_open.store(true, .release);
+    _ = try stream.collect(arena.allocator(), io, .limited(1 << 16));
+}
+
 /// A tool that runs until it is stopped, and says how it ended.
 const Stall = struct {
     var started: std.atomic.Value(bool) = .init(false);

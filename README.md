@@ -236,8 +236,12 @@ is JSON, or an event stream once the request has something to say before its
 result; a `subscriptions/listen` stream is kept open by a comment every
 `keep_alive`. A client that closes its stream cancels the request at once:
 its handler runs beside a wait for the client to leave, and sees
-`error.Canceled`. A session's GET stream and DELETE are served for the
-session revisions, where a disconnect is not a cancellation.
+`error.Canceled`. A stream ends by an explicit act, never by canceling its
+task: a `subscriptions/listen` stream when its client cancels it or leaves, or
+stdio's input ends; a session's stream when the session is deleted or its
+input ends; every stream when the server closes, answered `complete`. A
+session's GET stream and DELETE are served for the session revisions, where a
+disconnect is not a cancellation.
 
 **The client.** `Client.connect` asks `server/discover` at 2026-07-28 (or the
 versions `Options.revisions` names): an answer, or an error that names the

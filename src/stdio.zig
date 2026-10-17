@@ -14,6 +14,7 @@ const wire = @import("wire.zig");
 const types = @import("types.zig");
 const Server = @import("Server.zig");
 const compat = @import("compat.zig");
+const subscriptions = @import("subscriptions.zig");
 const Client = @import("Client.zig");
 const meta = @import("meta.zig");
 const Sink = @import("context.zig").Sink;
@@ -42,8 +43,11 @@ pub fn serve(io: Io, gpa: Allocator, server: *Server, in: *Io.Reader, out: *Io.W
         session.deinit();
         gpa.destroy(session);
     };
+    // A broken stream ends the streams first, each by its own act, then
+    // stops what is still computing.
     defer conn.group.cancel(io);
     defer conn.endSession();
+    defer conn.endStreams();
     while (true) {
         const job = try Job.create(&conn);
         const read = conn.readLine(in, job) catch |err| {
@@ -178,10 +182,13 @@ const Connection = struct {
         }
     }
 
+    /// Ends the session's stream and waits for it: ended, it returns on
+    /// its own.
     fn endSession(c: *Connection) void {
         if (c.session_stream) |*task| {
+            c.session.?.end(c.io);
             // glint-ignore: Z026 -- the session stream ends with the connection; its result says nothing more
-            _ = task.cancel(c.io) catch {};
+            task.await(c.io) catch {};
             c.session_stream = null;
         }
     }
@@ -229,14 +236,11 @@ const Connection = struct {
         return true;
     }
 
-    /// Cancels every `subscriptions/listen` in flight.
+    /// Ends every `subscriptions/listen` in flight, unanswered.
     fn endStreams(c: *Connection) void {
         c.jobs_mutex.lockUncancelable(c.io);
         defer c.jobs_mutex.unlock(c.io);
-        for (c.jobs.items) |j| if (std.mem.eql(u8, j.request.method, "subscriptions/listen")) {
-            j.canceled.store(true, .release);
-            j.cancel.set(c.io);
-        };
+        for (c.jobs.items) |j| if (j.streams()) j.stop(c.io);
     }
 
     fn retire(c: *Connection, job: *Job) void {
@@ -257,10 +261,7 @@ const Connection = struct {
         const id = wire.idFrom(arena, p.request_id.bytes, limits) catch return;
         try c.jobs_mutex.lock(c.io);
         defer c.jobs_mutex.unlock(c.io);
-        for (c.jobs.items) |j| if (j.request.id.eql(id)) {
-            j.canceled.store(true, .release);
-            j.cancel.set(c.io);
-        };
+        for (c.jobs.items) |j| if (j.request.id.eql(id)) j.stop(c.io);
     }
 
     /// Writes `message` and a line break, then flushes.
@@ -316,6 +317,8 @@ const Job = struct {
     request: wire.Request = undefined,
     /// Set by `notifications/cancelled`; the request's task waits on it.
     cancel: Io.Event = .unset,
+    /// How a stream the request opens is ended (`subscriptions/listen`).
+    end: subscriptions.End = .{},
     /// Once set, nothing more is written for the request.
     canceled: std.atomic.Value(bool) = .init(false),
     /// The session that answers the request, or null for the core.
@@ -325,6 +328,19 @@ const Job = struct {
         const job = try conn.gpa.create(Job);
         job.* = .{ .conn = conn, .arena = .init(conn.gpa) };
         return job;
+    }
+
+    /// Whether the request is a stream, which ends by its own act.
+    fn streams(job: *const Job) bool {
+        return std.mem.eql(u8, job.request.method, "subscriptions/listen");
+    }
+
+    /// The client's cancellation, or its input's end: nothing more is
+    /// written for the request. A stream is ended, and returns on its own;
+    /// anything else is stopped where it is.
+    fn stop(job: *Job, io: Io) void {
+        job.canceled.store(true, .release);
+        if (job.streams()) job.end.end(io) else job.cancel.set(io);
     }
 
     fn destroy(job: *Job) void {
@@ -411,7 +427,7 @@ const Job = struct {
     }
 
     fn sink(job: *Job) Sink {
-        return .{ .context = job, .sendFn = sendFn };
+        return .{ .context = job, .sendFn = sendFn, .end = &job.end };
     }
 
     fn sendFn(context: *anyopaque, io: Io, message: []const u8) Sink.SendError!void {

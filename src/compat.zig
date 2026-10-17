@@ -169,8 +169,14 @@ pub const Session = struct {
         };
     }
 
+    /// Ends the session's stream: `stream` returns at its next wait, now or
+    /// as it starts.
+    pub fn end(s: *Session, io: Io) void {
+        s.listener.end(io);
+    }
+
     /// Writes the session's list changes and resource updates to `sink`
-    /// until canceled or the server closes.
+    /// until the session ends (`end`) or the server closes.
     pub fn stream(s: *Session, io: Io, sink: Sink) Server.HandleError!void {
         s.server.hub.add(io, s.gpa, &s.listener, s.server.options.limits.listeners) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -181,7 +187,7 @@ pub const Session = struct {
         var seen: u32 = 0;
         while (true) {
             seen = (s.listener.wait(io, &s.server.hub, seen, .none) catch return error.Canceled) orelse continue;
-            if (s.server.hub.closed.load(.acquire)) return;
+            if (s.listener.over(&s.server.hub)) return;
             var turn: std.heap.ArenaAllocator = .init(s.gpa);
             defer turn.deinit();
             const a = turn.allocator();

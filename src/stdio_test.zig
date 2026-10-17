@@ -157,6 +157,37 @@ test "a long request holds up nothing behind it, and is canceled without an answ
     } else |err| return err;
 }
 
+test "a stream ends by its client's cancellation, and by the end of input, unanswered" {
+    const io = testing.io;
+    var server = try newServer(io);
+    defer server.deinit();
+    var in_storage: [4096]u8 = undefined;
+    var in_buffer: [4096]u8 = undefined;
+    var in: Pipe = .init(io, &in_storage, &in_buffer, &.{});
+    var out_storage: [4096]u8 = undefined;
+    var out_read: [4096]u8 = undefined;
+    var out_write: [4096]u8 = undefined;
+    var out: Pipe = .init(io, &out_storage, &out_read, &out_write);
+    var task = try io.concurrent(serveTask, .{ io, &server, &in, &out });
+    defer task.cancel(io);
+
+    const listen = "\"method\":\"subscriptions/listen\",\"params\":{\"notifications\":{\"toolsListChanged\":true}," ++ meta ++ "}}\n";
+    try in.write("{\"jsonrpc\":\"2.0\",\"id\":\"one\"," ++ listen);
+    try testing.expect(std.mem.find(u8, try readLine(&out), "subscriptions/acknowledged") != null);
+    try in.write("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":\"one\"}}\n");
+    // Ended: a change goes to no stream, and the next answer is the next request's.
+    try server.addTool(io, .{ .name = "another" }, echo);
+    try in.write("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{" ++ meta ++ "}}\n");
+    try testing.expect(std.mem.find(u8, try readLine(&out), "\"id\":2,") != null);
+    try in.write("{\"jsonrpc\":\"2.0\",\"id\":\"two\"," ++ listen);
+    try testing.expect(std.mem.find(u8, try readLine(&out), "subscriptions/acknowledged") != null);
+    in.close();
+    // The end of input ends the second: the server returns, having answered neither.
+    if (out.reader.takeDelimiter('\n')) |line| {
+        try testing.expect(line == null);
+    } else |err| return err;
+}
+
 test "a message past strand's defaults, within the message limit, is read and answered" {
     var server = try newServer(testing.io);
     defer server.deinit();

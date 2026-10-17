@@ -7,15 +7,13 @@ pub const layers: []const gantry.rules.Layer = &.{
         "src/wire.zig",
         "src/types.zig",
     } },
+    .{ .name = "streams", .patterns = &.{"src/subscriptions.zig"} },
     .{ .name = "a request", .patterns = &.{
         "src/meta.zig",
         "src/context.zig",
         "src/state.zig",
     } },
-    .{ .name = "handlers and streams", .patterns = &.{
-        "src/Call.zig",
-        "src/subscriptions.zig",
-    } },
+    .{ .name = "handlers", .patterns = &.{"src/Call.zig"} },
     .{ .name = "what a server offers", .patterns = &.{"src/registry.zig"} },
     .{ .name = "the tasks held", .patterns = &.{"src/tasks.zig"} },
     .{ .name = "the core and the client", .patterns = &.{

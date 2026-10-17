@@ -8,6 +8,12 @@
 //! notifications means "fetch again", so ten changes before a slow reader
 //! catches up are rightly one notification, and a listener costs the same
 //! however many changes it misses.
+//!
+//! A stream ends by an explicit act, never by canceling its task: the server
+//! closing (`Hub.close`, answered `complete`), or the stream's owner ending it
+//! (`Listener.end`, `End.end`: the client canceled the request, its input
+//! ended, its session was deleted), each seen by the stream's next wait, after
+//! which its task returns on its own.
 const std = @import("std");
 const aegis = @import("aegis");
 const wire = @import("wire.zig");
@@ -60,6 +66,22 @@ pub const Listener = struct {
     pending: std.atomic.Value(u8) = .init(0),
     /// Private: guards `watched`.
     mutex: Io.Mutex = .init,
+    /// Set by `end`: the stream's task returns at its next wait.
+    ended: std.atomic.Value(bool) = .init(false),
+
+    /// Ends the stream: its task sees it at its next wait and returns,
+    /// writing nothing more. Safe from any task, before the stream starts
+    /// too, and more than once.
+    pub fn end(l: *Listener, io: Io) void {
+        l.ended.store(true, .release);
+        _ = l.version.fetchAdd(1, .release);
+        io.futexWake(u32, &l.version.raw, 1);
+    }
+
+    /// Whether the stream is over: ended by its owner, or its server closed.
+    pub fn over(l: *const Listener, hub: *const Hub) bool {
+        return l.ended.load(.acquire) or hub.closed.load(.acquire);
+    }
 
     fn mark(l: *Listener, io: Io, kind: Kind) void {
         _ = l.pending.fetchOr(@as(u8, 1) << @backingInt(kind), .release);
@@ -67,15 +89,15 @@ pub const Listener = struct {
         io.futexWake(u32, &l.version.raw, 1);
     }
 
-    /// Waits until something is pending, the hub closes, `timeout` passes
-    /// (null), or the task is canceled. Returns the version seen, to wait
-    /// past next time.
+    /// Waits until something is pending, the stream is over (`over`),
+    /// `timeout` passes (null), or the task is canceled. Returns the version
+    /// seen, to wait past next time.
     pub fn wait(l: *Listener, io: Io, hub: *const Hub, seen: u32, timeout: Io.Timeout) Io.Cancelable!?u32 {
         const now = l.version.load(.acquire);
-        if (now != seen or hub.closed.load(.acquire)) return now;
+        if (now != seen or l.over(hub)) return now;
         try io.futexWaitTimeout(u32, &l.version.raw, seen, timeout);
         const after = l.version.load(.acquire);
-        if (after != seen or hub.closed.load(.acquire)) return after;
+        if (after != seen or l.over(hub)) return after;
         return null;
     }
 
@@ -138,6 +160,42 @@ pub const Listener = struct {
 
     pub fn deinit(l: *Listener, gpa: Allocator) void {
         for (&l.watched.values) |*w| w.deinit(gpa);
+    }
+};
+
+/// The end of one request's stream, held by the transport that carries the
+/// request (`Sink.end`): the client's cancellation, or its input ending,
+/// ends the stream through it whether or not the stream has started. A
+/// stream started after its end returns at once.
+pub const End = struct {
+    /// Private: guards the two below.
+    mutex: Io.Mutex = .init,
+    ended: bool = false,
+    listener: ?*Listener = null,
+
+    /// Ends the request's stream, now or as it starts: its task returns on
+    /// its own, so the caller awaits it rather than canceling it.
+    pub fn end(e: *End, io: Io) void {
+        e.mutex.lockUncancelable(io);
+        defer e.mutex.unlock(io);
+        e.ended = true;
+        if (e.listener) |l| l.end(io);
+    }
+
+    /// The stream's listener, from its start to `detach`; false, attaching
+    /// nothing, when the request was ended before it started.
+    pub fn attach(e: *End, io: Io, l: *Listener) bool {
+        e.mutex.lockUncancelable(io);
+        defer e.mutex.unlock(io);
+        if (e.ended) return false;
+        e.listener = l;
+        return true;
+    }
+
+    pub fn detach(e: *End, io: Io) void {
+        e.mutex.lockUncancelable(io);
+        defer e.mutex.unlock(io);
+        e.listener = null;
     }
 };
 
@@ -210,3 +268,21 @@ pub const Hub = struct {
         h.listeners.deinit(gpa);
     }
 };
+
+test "a stream's end, before or after it starts, ends its wait" {
+    const io = std.testing.io;
+    var hub: Hub = .{};
+    var early: End = .{};
+    early.end(io);
+    var unstarted: Listener = .{ .id = null, .lists = .empty };
+    try std.testing.expect(!early.attach(io, &unstarted));
+
+    var end: End = .{};
+    var listener: Listener = .{ .id = null, .lists = .empty };
+    try std.testing.expect(end.attach(io, &listener));
+    try std.testing.expectEqual(@as(?u32, null), try listener.wait(io, &hub, 0, .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } }));
+    end.end(io);
+    try std.testing.expect(listener.over(&hub));
+    try std.testing.expect(try listener.wait(io, &hub, 0, .none) != null);
+    end.detach(io);
+}

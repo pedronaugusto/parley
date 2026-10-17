@@ -5,6 +5,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const Revision = @import("revision.zig").Revision;
+const subscriptions = @import("subscriptions.zig");
 
 pub const Context = struct {
     revision: Revision,
@@ -30,6 +31,13 @@ pub const Sink = struct {
     /// `keep_alive`, while a long-lived request has nothing to send.
     keep_alive: ?std.Io.Duration = null,
     keepAliveFn: ?*const fn (context: *anyopaque, io: std.Io) SendError!void = null,
+    /// How the transport ends a stream this request opens
+    /// (`subscriptions/listen`): its client canceling it, or leaving. Null
+    /// for a transport whose streams end only with the server.
+    end: ?*End = null,
+
+    /// The end of one request's stream, which its transport holds.
+    pub const End = subscriptions.End;
 
     /// `Closed`: the stream the request came on is gone.
     pub const SendError = error{ Canceled, Closed, OutOfMemory };

@@ -1517,8 +1517,9 @@ fn complete(s: *Server, io: Io, arena: Allocator, request: wire.Request, context
 }
 
 /// `subscriptions/listen`: acknowledges what it will send, then sends each
-/// change as it comes, until the stream is canceled (nothing is answered) or
-/// the server closes (answered `complete`).
+/// change as it comes, until the transport ends the stream (`Sink.end`: the
+/// client canceled the request or left; nothing is answered) or the server
+/// closes (answered `complete`).
 fn listen(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink) BuildError!Reply {
     const p = try s.parseParams(types.ListenParams, arena, request.params) orelse return failure(.invalid_params, "params are not what the schema says");
     const caps = s.capabilities();
@@ -1572,6 +1573,9 @@ fn listen(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: 
         error.TooMany => return failure(.internal_error, "too many open streams"),
     };
     defer s.hub.remove(io, &listener);
+    // Ended before it started: the client canceled it, or its input ended.
+    if (sink.end) |end| if (!end.attach(io, &listener)) return error.Canceled;
+    defer if (sink.end) |end| end.detach(io);
 
     const tag = try subscriptionMeta(arena, request.id);
     try s.notify(io, arena, sink, "notifications/subscriptions/acknowledged", .{ .notifications = agreed }, tag);
@@ -1584,6 +1588,8 @@ fn listen(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: 
             sink.keepAlive(io) catch return error.Canceled;
             continue;
         };
+        // Ended by its client: nothing more is written, and nothing answered.
+        if (listener.ended.load(.acquire)) return error.Canceled;
         var turn: std.heap.ArenaAllocator = .init(s.gpa);
         defer turn.deinit();
         const changed = listener.takeLists();

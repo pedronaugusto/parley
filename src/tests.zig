@@ -6,6 +6,7 @@ test {
     _ = @import("compat_test.zig");
     _ = @import("client_test.zig");
     _ = @import("property_test.zig");
+    _ = @import("subscriptions.zig");
     _ = @import("tasks.zig");
     _ = @import("tasks_test.zig");
 }
