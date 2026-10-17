@@ -92,6 +92,23 @@ fn elicitation(call: *Call, args: struct { message: []const u8 }) Call.Error!Too
     return .ofText(try std.fmt.allocPrint(call.arena, "User response: action={t}, content={s}", .{ answer.action, if (answer.content) |c| c.bytes else "{}" }));
 }
 
+fn elicitWith(call: *Call, message: []const u8, schema: []const u8) Call.Error!ToolResult {
+    const answer = try call.elicit("form", .{ .form = .{ .message = message, .requested_schema = .{ .bytes = schema } } }) orelse return error.InputRequired;
+    return .ofText(try std.fmt.allocPrint(call.arena, "Elicitation completed: action={t}, content={s}", .{ answer.action, if (answer.content) |c| c.bytes else "{}" }));
+}
+
+fn elicitDefaults(call: *Call) Call.Error!ToolResult {
+    return elicitWith(call, "Please review and update the form fields with defaults",
+        \\{"type":"object","properties":{"name":{"type":"string","description":"User name","default":"John Doe"},"age":{"type":"integer","description":"User age","default":30},"score":{"type":"number","description":"User score","default":95.5},"status":{"type":"string","description":"User status","enum":["active","inactive","pending"],"default":"active"},"verified":{"type":"boolean","description":"Verification status","default":true}},"required":[]}
+    );
+}
+
+fn elicitEnums(call: *Call) Call.Error!ToolResult {
+    return elicitWith(call, "Please select options from the enum fields",
+        \\{"type":"object","properties":{"untitledSingle":{"type":"string","description":"Select one option","enum":["option1","option2","option3"]},"titledSingle":{"type":"string","description":"Select one option with titles","oneOf":[{"const":"value1","title":"First Option"},{"const":"value2","title":"Second Option"},{"const":"value3","title":"Third Option"}]},"legacyEnum":{"type":"string","description":"Select one option (legacy)","enum":["opt1","opt2","opt3"],"enumNames":["Option One","Option Two","Option Three"]},"untitledMulti":{"type":"array","description":"Select multiple options","minItems":1,"maxItems":3,"items":{"type":"string","enum":["option1","option2","option3"]}},"titledMulti":{"type":"array","description":"Select multiple options with titles","minItems":1,"maxItems":3,"items":{"anyOf":[{"const":"value1","title":"First Choice"},{"const":"value2","title":"Second Choice"},{"const":"value3","title":"Third Choice"}]}}},"required":[]}
+    );
+}
+
 // Multi round-trip requests (2026-07-28).
 
 fn text(call: *Call, comptime format: []const u8, args: anytype) Call.Error!ToolResult {
@@ -395,6 +412,8 @@ pub fn main(init: std.process.Init) !void {
     try server.addTool(io, .{ .name = "test_error_handling", .description = "Tests error response handling" }, errorHandling);
     try server.addTool(io, .{ .name = "test_sampling", .description = "Tests server-initiated sampling (LLM completion request)" }, sampling);
     try server.addTool(io, .{ .name = "test_elicitation", .description = "Tests server-initiated elicitation (user input request)" }, elicitation);
+    try server.addTool(io, .{ .name = "test_elicitation_sep1034_defaults", .description = "Tests elicitation with default values per SEP-1034" }, elicitDefaults);
+    try server.addTool(io, .{ .name = "test_elicitation_sep1330_enums", .description = "Tests elicitation with enum schema improvements per SEP-1330" }, elicitEnums);
     try server.addDynamicTool(io, .{ .name = "json_schema_2020_12_tool", .description = "Tool with JSON Schema 2020-12 features", .input_schema = json_schema_2020_12 }, .{ .call = jsonSchemaTool });
     try server.addTool(io, .{ .name = "test_missing_capability", .description = "Test tool requiring sampling" }, missingCapability);
     try server.addTool(io, .{ .name = "test_input_required_result_elicitation", .description = "MRTR: returns InputRequiredResult with elicitation request" }, mrtrElicitation);
@@ -428,6 +447,7 @@ pub fn main(init: std.process.Init) !void {
     server.setCompleter(.{ .complete = complete });
 
     var endpoint: http.Endpoint = .init(gpa, &server, .{});
+    defer endpoint.deinit();
     var router: uplink.server.Router = .init(gpa);
     defer router.deinit();
     try router.add("/mcp", endpoint.handler());

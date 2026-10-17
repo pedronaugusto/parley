@@ -134,18 +134,20 @@ const Connection = struct {
         switch (message) {
             .request => |request| {
                 job.request = request;
-                if (std.mem.eql(u8, request.method, "initialize") and c.session == null) {
+                if (std.mem.eql(u8, request.method, "initialize") and c.session == null and sessionEra(job)) {
                     const session = try c.gpa.create(compat.Session);
                     session.* = .init(c.gpa, c.server, c.options.session);
                     c.session = session;
                 }
+                // Which era answers it is decided here, in reading order.
+                job.session = if (c.session) |session| (if (sessionEra(job)) session else null) else null;
                 if (!try c.admit(job)) {
                     job.destroy();
                     return c.writeFailure(request.id, .internal_error, "the server is answering as many requests as it takes at once");
                 }
                 // The handshake is answered before the next line is read, so
                 // the requests after it find the session open.
-                if (std.mem.eql(u8, request.method, "initialize")) return Job.run(job);
+                if (job.session != null and std.mem.eql(u8, request.method, "initialize")) return Job.run(job);
                 c.group.concurrent(c.io, Job.run, .{job}) catch {
                     // No task to spare: answered here, before the next line
                     // is read (and it cannot be canceled).
@@ -176,6 +178,13 @@ const Connection = struct {
             _ = task.cancel(c.io) catch {};
             c.session_stream = null;
         }
+    }
+
+    /// Whether a request belongs to the session: its handshake, or one
+    /// without the version a 2026-07-28 request carries in its `_meta`.
+    fn sessionEra(job: *Job) bool {
+        const m = meta.read(job.arena.allocator(), job.request.params) catch return true;
+        return m.version == null;
     }
 
     fn streamSession(c: *Connection, session: *compat.Session) Io.Cancelable!void {
@@ -272,6 +281,8 @@ const Job = struct {
     cancel: Io.Event = .unset,
     /// Once set, nothing more is written for the request.
     canceled: std.atomic.Value(bool) = .init(false),
+    /// The session that answers the request, or null for the core.
+    session: ?*compat.Session = null,
 
     fn create(conn: *Connection) Allocator.Error!*Job {
         const job = try conn.gpa.create(Job);
@@ -329,17 +340,8 @@ const Job = struct {
 
     fn answer(job: *Job) Server.HandleError!Server.Reply {
         const c = job.conn;
-        if (c.session) |session| if (sessionEra(session, job)) return session.handle(c.io, job.arena.allocator(), job.request, job.sink());
+        if (job.session) |session| return session.handle(c.io, job.arena.allocator(), job.request, job.sink());
         return c.server.serve(c.io, job.arena.allocator(), job.request, null, job.sink());
-    }
-
-    /// Whether the request belongs to the session: its handshake, or one
-    /// without the version a 2026-07-28 request carries in its `_meta`.
-    fn sessionEra(session: *compat.Session, job: *Job) bool {
-        _ = session;
-        if (std.mem.eql(u8, job.request.method, "initialize")) return true;
-        const m = meta.read(job.arena.allocator(), job.request.params) catch return true;
-        return m.version == null;
     }
 
     fn waitCancel(event: *Io.Event, io: Io) Io.Cancelable!void {
