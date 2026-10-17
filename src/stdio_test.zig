@@ -23,11 +23,19 @@ fn slow(call: *Call) Call.Error!parley.ToolResult {
     return .ofText("woke");
 }
 
+/// A text larger than the limit the test sets.
+const large_text: [8192]u8 = @splat('x');
+
+fn large(_: *Call) error{}![]const u8 {
+    return &large_text;
+}
+
 fn newServer(io: std.Io) !parley.Server {
     var s = try parley.Server.init(testing.allocator, io, .{ .info = .{ .name = "stdio", .version = "0" } });
     errdefer s.deinit();
     try s.addTool(io, .{ .name = "echo" }, echo);
     try s.addTool(io, .{ .name = "slow" }, slow);
+    try s.addTool(io, .{ .name = "large" }, large);
     return s;
 }
 
@@ -94,6 +102,20 @@ test "an answer past the limit is refused, not written" {
     try testing.expect(std.mem.find(u8, answer, "-32603") != null);
     try testing.expect(std.mem.find(u8, answer, "message limit") != null);
     try testing.expect(std.mem.find(u8, answer, "\"tools\"") == null);
+}
+
+test "a tool's answer past the limit is refused, and nothing of it is written" {
+    var server = try newServer(testing.io);
+    defer server.deinit();
+    server.options.limits.message = .literal("4KiB");
+    const request = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"large\"," ++ meta ++ "}}";
+    var in: std.Io.Reader = .fixed(request ++ "\n");
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try stdio.serve(testing.io, testing.allocator, &server, &in, &out.writer, .{});
+    const answer = answerTo(out.written(), "\"id\":1,").?;
+    try testing.expect(std.mem.find(u8, answer, "message limit") != null);
+    try testing.expect(std.mem.find(u8, out.written(), "xxxx") == null);
 }
 
 fn serveTask(io: std.Io, server: *parley.Server, in: *Pipe, out: *Pipe) void {

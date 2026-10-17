@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Breaking
+
+- `Server.Reply.result` is a `Server.Body`, not bytes: a tool's result and a resource's contents are counted when the reply is made (one past the message limit is still refused before a byte goes out) and written from what the handler returned as the transport writes the answer (`Body.write`), so the answer holds no copy of them; every other result is `.json`. `Body.whole` makes one whole on an arena.
+
+### Changed
+
+- A large message costs about its own size: stdio reads each line onto the allocator, not the request's arena (whose growth kept every size the line passed through), and HTTP its body; stdio and HTTP write an answer straight to the stream (as JSON of its declared length, or as the stream's last event through uplink's `wire.sse.EventWriter`) instead of framing a copy. A 64 MiB echo over stdio peaks at 82 MiB on macOS, from 297 MiB.
+- Pins uplink 0.8.2 (`wire.sse.EventWriter`).
+
+### Fixed
+
+- A tool result or resource past one of strand's limits inside the message limit (a string longer than it) was answered "out of memory"; it is answered as past the message limit.
+
 ## [0.4.0] - 2026-10-17
 
 ### Breaking

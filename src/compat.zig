@@ -98,7 +98,7 @@ pub const Session = struct {
         } else null;
         if (index) |i| return switch (i) {
             0 => s.initialize(io, arena, request),
-            1 => .{ .result = "{}" },
+            1 => .{ .result = .{ .json = "{}" } },
             2 => s.setLevel(io, arena, request),
             3 => s.subscribe(io, arena, request, true),
             4 => s.subscribe(io, arena, request, false),
@@ -239,7 +239,7 @@ pub const Session = struct {
             wire.writeString(w, text) catch return error.OutOfMemory;
         }
         w.writeByte('}') catch return error.OutOfMemory;
-        return .{ .result = out.written() };
+        return .{ .result = .{ .json = out.written() } };
     }
 
     fn setLevel(s: *Session, io: Io, arena: Allocator, request: wire.Request) Server.HandleError!Server.Reply {
@@ -250,7 +250,7 @@ pub const Session = struct {
         s.mutex.lockUncancelable(io);
         defer s.mutex.unlock(io);
         s.log_level = p.level;
-        return .{ .result = "{}" };
+        return .{ .result = .{ .json = "{}" } };
     }
 
     fn subscribe(s: *Session, io: Io, arena: Allocator, request: wire.Request, on: bool) Server.HandleError!Server.Reply {
@@ -265,7 +265,7 @@ pub const Session = struct {
                 error.TooMany => return failure(.invalid_params, "more resources than one session may watch"),
             };
         } else s.listener.unwatch(io, s.gpa, .resource, p.uri) catch return error.Canceled;
-        return .{ .result = "{}" };
+        return .{ .result = .{ .json = "{}" } };
     }
 
     const AskError = error{ Canceled, OutOfMemory, Refused };

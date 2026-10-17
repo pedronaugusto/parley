@@ -380,12 +380,108 @@ fn changeOf(which: List) subscriptions.Kind {
 
 /// What a request is answered with.
 pub const Reply = union(enum) {
-    /// The result object, as JSON.
-    result: []const u8,
+    /// The result object.
+    result: Body,
     /// The handler needs input first. Under 2026-07-28 it is the result;
     /// under an earlier revision the session asks the client for it.
     input_required: InputRequired,
     failure: Failure,
+};
+
+/// A result object, as the transport writes it. Most are made whole; a
+/// tool's result and a resource's contents, which may be as large as a
+/// message, are written from what the handler returned as the transport
+/// writes them, so the answer never holds a copy of them.
+pub const Body = union(enum) {
+    /// The JSON, made whole.
+    json: []const u8,
+    /// Written from a handler's result, whose memory outlives the reply.
+    content: *const Content,
+
+    /// The body's bytes.
+    pub fn len(b: Body) usize {
+        return switch (b) {
+            .json => |bytes| bytes.len,
+            .content => |c| c.len,
+        };
+    }
+
+    /// Writes the body: exactly `len` bytes.
+    pub fn write(b: Body, w: *Writer) Writer.Error!void {
+        switch (b) {
+            .json => |bytes| try w.writeAll(bytes),
+            // Written once already, to count it: only the writer can fail.
+            .content => |c| c.write(w) catch return error.WriteFailed,
+        }
+    }
+
+    /// The body made whole on `arena`: for what keeps a result past its
+    /// reply (a task's), and for a test that reads one.
+    pub fn whole(b: Body, arena: Allocator) Allocator.Error![]const u8 {
+        return switch (b) {
+            .json => |json| json,
+            .content => |c| {
+                const out = try arena.alloc(u8, c.len);
+                var w: Writer = .fixed(out);
+                c.write(&w) catch unreachable; // unreachable: counted to fit exactly
+                return out;
+            },
+        };
+    }
+};
+
+/// A tool's result or a resource's contents as a result object: counted when
+/// the reply is made (so one past the message limit is refused before a byte
+/// goes out), written when the transport writes it.
+pub const Content = struct {
+    /// Private: what writes it.
+    server: *const Server,
+    revision: Revision,
+    of: Of,
+    /// The bytes it is.
+    len: usize = 0,
+
+    const Of = union(enum) {
+        /// With the server's identity when `identify`.
+        tool: struct { result: registry.ToolResult, identify: bool },
+        /// Under the read's caching hint, private when a filter decides.
+        resource: struct { contents: []const types.ResourceContents, private: bool },
+    };
+
+    /// A body for `of`, counted: `TooLong` past the server's message limit.
+    fn body(s: *const Server, arena: Allocator, revision: Revision, of: Of) BuildError!Body {
+        const c = try arena.create(Content);
+        c.* = .{ .server = s, .revision = revision, .of = of };
+        var buffer: [256]u8 = undefined;
+        var counter: Writer.Discarding = .init(&buffer);
+        try c.write(&counter.writer);
+        c.len = std.math.cast(usize, counter.fullCount()) orelse return error.TooLong;
+        if (c.len > s.jsonLimits().output_bytes) return error.TooLong;
+        return .{ .content = c };
+    }
+
+    fn write(c: *const Content, w: *Writer) BuildError!void {
+        const s = c.server;
+        var r: Result = .over(s, w, c.revision);
+        switch (c.of) {
+            .tool => |t| {
+                if (t.result.text) |text| {
+                    // The text block first, then the handler's own blocks.
+                    try r.open("content");
+                    try r.item(types.ContentBlock.ofText(text));
+                    for (t.result.content) |block| try r.item(block);
+                    try r.close();
+                } else try r.field("content", t.result.content);
+                if (t.result.structured) |value| try r.raw("structuredContent", value.bytes);
+                if (t.result.is_error) try r.field("isError", true);
+                if (t.identify) try r.end(s, null, false) else try r.endPlain();
+            },
+            .resource => |x| {
+                try r.field("contents", x.contents);
+                try r.end(s, s.options.cache.read, x.private);
+            },
+        }
+    }
 };
 
 pub const InputRequired = struct {
@@ -497,29 +593,71 @@ fn route(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *
 }
 
 /// A result object being written: `resultType` first under 2026-07-28,
-/// then the members, then the caching hints and the server's identity.
+/// then the members, then the caching hints and the server's identity. It
+/// is made whole on an arena (`begin`, then `json`) or written to a
+/// transport's writer (`over`).
 const Result = struct {
-    out: Writer.Allocating,
+    /// Set when it is made whole: the writer `w` writes to.
+    made: ?Writer.Allocating,
+    /// The writer, when it is not made whole.
+    target: ?*Writer,
     revision: Revision,
     /// The server's: no answer is longer than its message limit.
     limits: strand.core.Limits,
+    /// Whether the object's brace is written, and whether a member is.
+    opened: bool = false,
+    members: bool = false,
+    /// Whether an array is open (`open`), and whether it has an item.
+    items: bool = false,
 
     fn begin(s: *const Server, arena: Allocator, revision: Revision) Result {
-        return .{ .out = .init(arena), .revision = revision, .limits = s.jsonLimits() };
+        return .{ .made = .init(arena), .target = null, .revision = revision, .limits = s.jsonLimits() };
+    }
+
+    fn over(s: *const Server, target: *Writer, revision: Revision) Result {
+        return .{ .made = null, .target = target, .revision = revision, .limits = s.jsonLimits() };
     }
 
     fn w(r: *Result) *Writer {
-        return &r.out.writer;
+        if (r.target) |t| return t;
+        return &r.made.?.writer;
     }
 
     /// `"name":` and `value` as strand writes it, after the members before it.
-    fn field(r: *Result, name: []const u8, value: anytype) BuildError!void {
+    fn field(r: *Result, member: []const u8, v: anytype) BuildError!void {
+        try r.name(member);
+        try r.value(v);
+    }
+
+    /// `"name":[`: the items follow (`item`), then `close`.
+    fn open(r: *Result, member: []const u8) BuildError!void {
+        try r.name(member);
+        r.w().writeByte('[') catch return error.OutOfMemory;
+        r.items = false;
+    }
+
+    fn item(r: *Result, v: anytype) BuildError!void {
+        if (r.items) r.w().writeByte(',') catch return error.OutOfMemory;
+        r.items = true;
+        try r.value(v);
+    }
+
+    fn close(r: *Result) BuildError!void {
+        r.w().writeByte(']') catch return error.OutOfMemory;
+    }
+
+    fn name(r: *Result, member: []const u8) BuildError!void {
         r.separate() catch return error.OutOfMemory;
-        wire.writeString(r.w(), name) catch return error.OutOfMemory;
+        wire.writeString(r.w(), member) catch return error.OutOfMemory;
         r.w().writeByte(':') catch return error.OutOfMemory;
-        strand.json.write(r.w(), value, types.writeOptions(r.limits)) catch |err| return switch (err) {
+    }
+
+    fn value(r: *Result, v: anytype) BuildError!void {
+        strand.json.write(r.w(), v, types.writeOptions(r.limits)) catch |err| return switch (err) {
             error.OutOfMemory, error.WriteFailed => error.OutOfMemory,
-            error.OutputLimit => error.TooLong,
+            // strand's limits are the message limit's (`wire.limitsFor`): a
+            // value past one is an answer past it.
+            error.InputLimit, error.OutputLimit, error.DepthLimit, error.ItemLimit, error.LengthLimit, error.AllocationLimit, error.WorkLimit => error.TooLong,
             // A value a handler built that is not JSON (text that is not
             // UTF-8): the result cannot be written.
             else => error.OutOfMemory,
@@ -527,32 +665,36 @@ const Result = struct {
     }
 
     /// `"name":` and `json`, one value as written.
-    fn raw(r: *Result, name: []const u8, json: []const u8) BuildError!void {
-        r.separate() catch return error.OutOfMemory;
-        wire.writeString(r.w(), name) catch return error.OutOfMemory;
-        r.w().writeByte(':') catch return error.OutOfMemory;
+    fn raw(r: *Result, member: []const u8, json: []const u8) BuildError!void {
+        try r.name(member);
         r.w().writeAll(json) catch return error.OutOfMemory;
-        if (r.out.written().len > r.limits.output_bytes) return error.TooLong;
     }
 
+    /// Before a member: the object's brace (and `resultType`), or a comma.
     fn separate(r: *Result) Writer.Error!void {
-        if (r.out.written().len == 0) {
+        if (!r.opened) {
+            r.opened = true;
             try r.w().writeByte('{');
-            if (r.revision.stateless()) try r.w().writeAll("\"resultType\":\"complete\",");
-        } else if (r.out.written()[r.out.written().len - 1] != '{') try r.w().writeByte(',');
+            if (r.revision.stateless()) try r.w().writeAll("\"resultType\":\"complete\"");
+            r.members = r.revision.stateless();
+        }
+        if (r.members) try r.w().writeByte(',');
+        r.members = true;
     }
 
     /// Ends the object as it is: a result inside another.
-    fn endPlain(r: *Result) BuildError![]const u8 {
-        if (r.out.written().len == 0) r.separate() catch return error.OutOfMemory;
+    fn endPlain(r: *Result) BuildError!void {
+        if (!r.opened) {
+            r.opened = true;
+            r.w().writeByte('{') catch return error.OutOfMemory;
+            if (r.revision.stateless()) r.w().writeAll("\"resultType\":\"complete\"") catch return error.OutOfMemory;
+        }
         r.w().writeByte('}') catch return error.OutOfMemory;
-        if (r.out.written().len > r.limits.output_bytes) return error.TooLong;
-        return r.out.written();
     }
 
     /// Ends the object: caching hints when `hint` is given (2026-07-28),
     /// the server's identity when it names itself.
-    fn end(r: *Result, s: *const Server, hint: ?Cache.Hint, private: bool) BuildError![]const u8 {
+    fn end(r: *Result, s: *const Server, hint: ?Cache.Hint, private: bool) BuildError!void {
         if (r.revision.stateless()) {
             if (hint) |h| {
                 try r.field("ttlMs", h.ttl.raw());
@@ -563,12 +705,14 @@ const Result = struct {
                 r.w().print("\"_meta\":{{{s}}}", .{s.identity}) catch return error.OutOfMemory;
             }
         }
-        if (r.out.written().len == 0) {
-            r.separate() catch return error.OutOfMemory;
-        }
-        r.w().writeByte('}') catch return error.OutOfMemory;
-        if (r.out.written().len > r.limits.output_bytes) return error.TooLong;
-        return r.out.written();
+        try r.endPlain();
+    }
+
+    /// The object made whole (`begin`), ended: past the message limit, refused.
+    fn body(r: *Result) BuildError!Body {
+        const bytes = r.made.?.written();
+        if (bytes.len > r.limits.output_bytes) return error.TooLong;
+        return .{ .json = bytes };
     }
 };
 
@@ -611,7 +755,8 @@ fn discover(s: *Server, arena: Allocator, context: *const Context) BuildError!Re
     if (s.options.tasks != null) caps.extensions = .{ .bytes = extensions_json };
     try r.field("capabilities", caps);
     if (s.options.instructions) |text| try r.field("instructions", text);
-    return .{ .result = try r.end(s, s.options.cache.discover, false) };
+    try r.end(s, s.options.cache.discover, false);
+    return .{ .result = try r.body() };
 }
 
 fn admitted(s: *const Server, context: *const Context, which: List, name: []const u8) bool {
@@ -669,7 +814,8 @@ fn listPage(s: *Server, io: Io, arena: Allocator, comptime which: List, params: 
         var buffer: [32]u8 = undefined;
         try r.field("nextCursor", std.mem.print(&buffer, "{d}.{d}", .{ generation, i }) catch unreachable); // unreachable: two integers fit 32 bytes
     }
-    return .{ .result = try r.end(s, hint, s.options.filter != null) };
+    try r.end(s, hint, s.options.filter != null);
+    return .{ .result = try r.body() };
 }
 
 const Cursor = struct { generation: u32, offset: usize };
@@ -803,22 +949,7 @@ fn callTool(s: *Server, io: Io, arena: Allocator, request: wire.Request, context
 /// A tool call's answer: its result, the input it asks for, or its failure.
 fn answerTool(s: *Server, io: Io, arena: Allocator, call: *Call, returned: Call.Error!registry.ToolResult, method: []const u8, name: []const u8, revision: Revision) BuildError!Reply {
     const result = returned catch |err| return s.outcome(io, arena, call, err, method, name);
-    return .{ .result = try s.toolResultJson(arena, revision, result, true) };
-}
-
-/// A tool's result object; with the server's identity when `identify`.
-fn toolResultJson(s: *const Server, arena: Allocator, revision: Revision, result: registry.ToolResult, identify: bool) BuildError![]const u8 {
-    var out: Result = .begin(s, arena, revision);
-    if (result.text) |text| {
-        const content = try arena.alloc(types.ContentBlock, result.content.len + 1);
-        content[0] = .ofText(text);
-        @memcpy(content[1..], result.content);
-        try out.field("content", content);
-    } else try out.field("content", result.content);
-    if (result.structured) |value| try out.raw("structuredContent", value.bytes);
-    if (result.is_error) try out.field("isError", true);
-    if (!identify) return try out.endPlain();
-    return try out.end(s, null, false);
+    return .{ .result = try Content.body(s, arena, revision, .{ .tool = .{ .result = result, .identify = true } }) };
 }
 
 // Tasks: a call that may run as one runs its handler on a task of the
@@ -957,7 +1088,7 @@ fn callAsTask(s: *Server, io: Io, arena: Allocator, request: wire.Request, conte
         defer table.mutex.unlock(table.io);
         var out: Writer.Allocating = .init(arena);
         tasks.write(&out.writer, task, .created, table.options.ttl, table.options.poll_interval, s.identityMembers()) catch return error.OutOfMemory;
-        return .{ .result = out.written() };
+        return .{ .result = .{ .json = out.written() } };
     }
     table.mutex.unlock(table.io);
     // Answered as asked: the reply is written on the call's arena before the
@@ -965,8 +1096,10 @@ fn callAsTask(s: *Server, io: Io, arena: Allocator, request: wire.Request, conte
     defer table.destroy(task);
     const reply = try s.answerTool(io, arena, &run.call, run.outcome.?, request.method, name, context.revision);
     return switch (reply) {
-        .input_required => |ir| .{ .result = try s.inputRequiredJson(arena, ir) },
-        else => reply,
+        .input_required => |ir| .{ .result = .{ .json = try s.inputRequiredJson(arena, ir) } },
+        // Made whole: what the handler returned is on the round's arena.
+        .result => |body| .{ .result = .{ .json = try body.whole(arena) } },
+        .failure => reply,
     };
 }
 
@@ -1136,8 +1269,8 @@ fn recordOutcome(s: *Server, table: *tasks.Table, run: *Run, returned: Call.Erro
             return false;
         },
     };
-    const json = s.toolResultJson(a, .@"2026-07-28", result, false) catch return error.OutOfMemory;
-    try table.complete(task, at, json);
+    const body = Content.body(s, a, .@"2026-07-28", .{ .tool = .{ .result = result, .identify = false } }) catch return error.OutOfMemory;
+    try table.complete(task, at, try body.whole(a));
     return false;
 }
 
@@ -1183,7 +1316,7 @@ fn taskRequest(s: *Server, io: Io, arena: Allocator, request: wire.Request, cont
             .get => {
                 var out: Writer.Allocating = .init(arena);
                 tasks.write(&out.writer, task, .polled, table.options.ttl, table.options.poll_interval, s.identityMembers()) catch return error.OutOfMemory;
-                return .{ .result = out.written() };
+                return .{ .result = .{ .json = out.written() } };
             },
             .update => {
                 const p = (try s.parseParams(types.UpdateTaskParams, arena, request.params)).?;
@@ -1218,7 +1351,8 @@ fn taskRequest(s: *Server, io: Io, arena: Allocator, request: wire.Request, cont
     if (changed) s.hub.changed(io, .task, &id);
     if (next) |responses| s.startRound(task, handler.?, responses, task.state);
     var out: Result = .begin(s, arena, context.revision);
-    return .{ .result = try out.end(s, null, false) };
+    try out.end(s, null, false);
+    return .{ .result = try out.body() };
 }
 
 /// The task `id` as `form` writes it, or null when it is not held.
@@ -1277,9 +1411,7 @@ fn readResource(s: *Server, io: Io, arena: Allocator, request: wire.Request, con
     // An empty list would read as a resource with nothing in it (2026-07-28
     // resources: MUST NOT for one that does not exist).
     if (result.contents.len == 0) return try notFound(arena, context.revision, p.uri);
-    var out: Result = .begin(s, arena, context.revision);
-    try out.field("contents", result.contents);
-    return .{ .result = try out.end(s, s.options.cache.read, s.options.filter != null) };
+    return .{ .result = try Content.body(s, arena, context.revision, .{ .resource = .{ .contents = result.contents, .private = s.options.filter != null } }) };
 }
 
 /// A resource that does not exist: `-32602` under 2026-07-28, `-32002`
@@ -1353,7 +1485,8 @@ fn getPrompt(s: *Server, io: Io, arena: Allocator, request: wire.Request, contex
     var out: Result = .begin(s, arena, context.revision);
     if (result.description) |d| try out.field("description", d);
     try out.field("messages", result.messages);
-    return .{ .result = try out.end(s, null, false) };
+    try out.end(s, null, false);
+    return .{ .result = try out.body() };
 }
 
 fn has(object: []const u8, name: []const u8, limits: strand.core.Limits) bool {
@@ -1379,7 +1512,8 @@ fn complete(s: *Server, io: Io, arena: Allocator, request: wire.Request, context
         .total = if (capped) completion.total orelse completion.values.len else completion.total,
         .has_more = if (capped) true else completion.has_more,
     });
-    return .{ .result = try out.end(s, null, false) };
+    try out.end(s, null, false);
+    return .{ .result = try out.body() };
 }
 
 /// `subscriptions/listen`: acknowledges what it will send, then sends each
@@ -1476,7 +1610,7 @@ fn listen(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: 
     }
     var out: Writer.Allocating = .init(arena);
     out.writer.print("{{\"resultType\":\"complete\",\"_meta\":{{{s}}}}}", .{tag}) catch return error.OutOfMemory;
-    return .{ .result = out.written() };
+    return .{ .result = .{ .json = out.written() } };
 }
 
 /// `"io.modelcontextprotocol/subscriptionId":<id>`.

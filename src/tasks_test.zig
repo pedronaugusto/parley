@@ -84,7 +84,7 @@ fn ask(s: *Server, arena: std.mem.Allocator, method: []const u8, params: []const
     const request = (try parley.wire.decode(arena, message, .{ .limits = parley.wire.limitsFor(parley.wire.default_message) })).request;
     const reply = try s.serve(testing.io, arena, request, null, .none);
     return switch (reply) {
-        .result => |r| r,
+        .result => |r| try r.whole(arena),
         .input_required => |ir| try s.inputRequiredJson(arena, ir),
         .failure => |f| try arena.print("error:{d}", .{@backingInt(f.code)}),
     };

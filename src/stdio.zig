@@ -89,9 +89,12 @@ const Connection = struct {
 
     const Read = enum { line, empty, too_long, end };
 
-    /// The next line into `job`'s buffer, without its line break.
+    /// The next line into `job`'s buffer, without its line break. The
+    /// buffer is the job's own on `gpa`, not its arena: growing it frees what
+    /// it outgrew, where an arena would keep every size it passed through.
     fn readLine(c: *Connection, in: *Io.Reader, job: *Job) ServeError!Read {
-        var line: Io.Writer.Allocating = .init(job.arena.allocator());
+        var line: Io.Writer.Allocating = .fromArrayList(c.gpa, &job.bytes);
+        defer job.bytes = line.toArrayList();
         // A longer line is refused and passed over; the line break is
         // looked for one byte past it.
         const limit = @as(usize, c.server.options.limits.message.raw()) + 1;
@@ -269,6 +272,22 @@ const Connection = struct {
         try c.out.flush();
     }
 
+    /// Writes a request's answer and a line break, then flushes.
+    fn sendAnswer(c: *Connection, id: wire.Id, answer: Answer) error{ WriteFailed, Canceled }!void {
+        try c.write_mutex.lock(c.io);
+        defer c.write_mutex.unlock(c.io);
+        switch (answer) {
+            .result => |body| {
+                try wire.beginResult(c.out, id);
+                try body.write(c.out);
+                try wire.endResult(c.out);
+            },
+            .failure => |f| try wire.writeFailure(c.out, id, f.code, f.message, f.data),
+        }
+        try c.out.writeByte('\n');
+        try c.out.flush();
+    }
+
     fn writeFailure(c: *Connection, id: ?wire.Id, code: wire.Code, message: []const u8) ServeError!void {
         var buffer: [512]u8 = undefined;
         var w: Io.Writer = .fixed(&buffer);
@@ -281,10 +300,18 @@ const Connection = struct {
     }
 };
 
+/// What a request is answered with, as `sendAnswer` writes it.
+const Answer = union(enum) {
+    result: Server.Body,
+    failure: Server.Failure,
+};
+
 /// One request: its bytes, its arena, and its cancellation.
 const Job = struct {
     conn: *Connection,
     arena: std.heap.ArenaAllocator,
+    /// The line read, which the request's strings point into.
+    bytes: std.ArrayList(u8) = .empty,
     line: []const u8 = "",
     request: wire.Request = undefined,
     /// Set by `notifications/cancelled`; the request's task waits on it.
@@ -303,6 +330,7 @@ const Job = struct {
     fn destroy(job: *Job) void {
         const gpa = job.conn.gpa;
         job.arena.deinit();
+        job.bytes.deinit(gpa);
         gpa.destroy(job);
     }
 
@@ -363,22 +391,23 @@ const Job = struct {
                 return;
             },
         };
-        var out: Io.Writer.Allocating = .init(job.arena.allocator());
-        const written = switch (reply) {
-            .result => |r| wire.writeResult(&out.writer, job.request.id, r),
-            .input_required => |ir| blk: {
-                const json = c.server.inputRequiredJson(job.arena.allocator(), ir) catch break :blk error.WriteFailed;
-                break :blk wire.writeResult(&out.writer, job.request.id, json);
+        // The answer goes to the stream as it is written: a result is never
+        // copied into a message first.
+        const out: Answer = switch (reply) {
+            .result => |body| .{ .result = body },
+            .input_required => |ir| .{
+                .result = .{
+                    .json = c.server.inputRequiredJson(job.arena.allocator(), ir) catch {
+                        // glint-ignore: Z026 -- the answer could not be made and the refusal could not be written: the stream is gone
+                        c.writeFailure(job.request.id, .internal_error, "out of memory") catch {};
+                        return;
+                    },
+                },
             },
-            .failure => |f| wire.writeFailure(&out.writer, job.request.id, f.code, f.message, f.data),
-        };
-        written catch {
-            // glint-ignore: Z026 -- the answer could not be made and the refusal could not be written: the stream is gone
-            c.writeFailure(job.request.id, .internal_error, "out of memory") catch {};
-            return;
+            .failure => |f| .{ .failure = f },
         };
         // glint-ignore: Z026 -- a stream that cannot be written is gone; the reader sees its end
-        c.send(out.written()) catch {};
+        c.sendAnswer(job.request.id, out) catch {};
     }
 
     fn sink(job: *Job) Sink {

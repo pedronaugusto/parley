@@ -27,6 +27,22 @@ fn counted(call: *Call) Call.Error!parley.ToolResult {
     return .ofText("counted");
 }
 
+/// Text larger than uplink's body buffer, to be written as it is made: in
+/// lines, so an event stream splits nothing it must not.
+const large_line = "line of the large answer\n";
+const large_lines = 20_000;
+
+fn large(call: *Call, args: struct { progress: bool }) Call.Error!parley.ToolResult {
+    if (args.progress) try call.progress(1, 1, null);
+    return .ofText(try repeated(call.arena, large_line, large_lines));
+}
+
+fn repeated(arena: std.mem.Allocator, line: []const u8, n: usize) error{OutOfMemory}![]const u8 {
+    const text = try arena.alloc(u8, line.len * n);
+    for (0..n) |i| @memcpy(text[i * line.len ..][0..line.len], line);
+    return text;
+}
+
 /// A server and an endpoint in front of it, listening on loopback.
 const Harness = struct {
     core: parley.Server,
@@ -42,6 +58,7 @@ const Harness = struct {
         h.core = try .init(testing.allocator, io, .{ .info = .{ .name = "http", .version = "0" } });
         try h.core.addTool(io, .{ .name = "echo" }, echo);
         try h.core.addTool(io, .{ .name = "counted" }, counted);
+        try h.core.addTool(io, .{ .name = "large" }, large);
         try h.core.addTool(io, .{ .name = "stall" }, Stall.handle);
         h.endpoint = .init(testing.allocator, &h.core, .{ .keep_alive = .literal("100ms") });
         h.router = .init(testing.allocator);
@@ -79,7 +96,7 @@ const Harness = struct {
         var response = try h.client.send(io, .{ .method = .POST, .url = url, .headers = fields.items, .body = .{ .bytes = body } });
         defer response.deinit(io);
         const content_type = try arena.dupe(u8, response.headers.get("Content-Type") orelse "");
-        return .{ .status = response.status, .content_type = content_type, .body = try response.collect(arena, io, .limited(1 << 20)) };
+        return .{ .status = response.status, .content_type = content_type, .body = try response.collect(arena, io, .limited(4 << 20)) };
     }
 };
 
@@ -117,6 +134,36 @@ test "a request answered as JSON; one with progress as an event stream ending wi
     const first = std.mem.find(u8, progress.body, "notifications/progress").?;
     const result = std.mem.find(u8, progress.body, "\"text\":\"counted\"").?;
     try testing.expect(first < result);
+}
+
+test "an answer larger than a buffer goes out as it is written: as JSON of its length, and as the last event" {
+    const io = testing.io;
+    var h: Harness = undefined;
+    try h.start(io);
+    defer h.stop(io);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const json = try h.post(io, a, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"large\",\"arguments\":{\"progress\":false}," ++ meta ++ "}}", &standard("tools/call", "large"));
+    try testing.expectEqual(std.http.Status.ok, json.status);
+    try testing.expectEqualStrings("application/json", json.content_type);
+    try testing.expect(std.mem.startsWith(u8, json.body, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{"));
+    const text = try std.mem.concat(a, u8, &.{ "\"text\":\"", try repeated(a, "line of the large answer\\n", large_lines), "\"" });
+    try expectContains(json.body, text);
+    try testing.expect(std.mem.endsWith(u8, json.body, "}}"));
+
+    const events = try h.post(io, a, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"large\",\"arguments\":{\"progress\":true},\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{},\"progressToken\":7}}}", &standard("tools/call", "large"));
+    try testing.expectEqualStrings("text/event-stream", events.content_type);
+    // The last event is the answer, read back by uplink's own reader.
+    var in: Io.Reader = .fixed(events.body);
+    var data: [1 << 20]u8 = undefined;
+    var reader: uplink.wire.sse.Reader = .init(&in, &data);
+    var last: ?[]const u8 = null;
+    while (try reader.next()) |event| last = try a.dupe(u8, event.data);
+    const answer = last.?;
+    try testing.expect(std.mem.startsWith(u8, answer, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{"));
+    try expectContains(answer, text);
 }
 
 test "headers that disagree with the body, or are missing, are -32020 with a 400" {

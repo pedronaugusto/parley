@@ -397,7 +397,13 @@ const Bench = struct {
         const r: parley.wire.Request = .{ .id = .{ .integer = 1 }, .method = method, .params = params };
         const reply = try b.server.serve(b.io, b.arena.allocator(), r, null, .none);
         switch (reply) {
-            .result => |text| b.sink +%= text.len,
+            // Written, as a transport writes it.
+            .result => |body| {
+                var buffer: [4096]u8 = undefined;
+                var out: Io.Writer.Discarding = .init(&buffer);
+                body.write(&out.writer) catch return error.WriteFailed;
+                b.sink +%= out.fullCount();
+            },
             else => return error.Unanswered,
         }
         _ = b.arena.reset(.retain_capacity);

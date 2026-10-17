@@ -123,7 +123,7 @@ fn ask(s: *Server, arena: std.mem.Allocator, recorder: *Recorder, method: []cons
     const reply = try s.serve(testing.io, arena, request, null, recorder.sink());
     var out: std.Io.Writer.Allocating = .init(arena);
     switch (reply) {
-        .result => |r| try parley.wire.writeResult(&out.writer, request.id, r),
+        .result => |r| try parley.wire.writeResult(&out.writer, request.id, try r.whole(arena)),
         .input_required => |ir| try parley.wire.writeResult(&out.writer, request.id, try s.inputRequiredJson(arena, ir)),
         .failure => |f| try parley.wire.writeFailure(&out.writer, request.id, f.code, f.message, f.data),
     }

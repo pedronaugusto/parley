@@ -111,12 +111,15 @@ fn handle(e: *Endpoint, io: Io, request: *Request, response: *Response) anyerror
         return refuse(io, response, .not_acceptable, null, .invalid_request, "Accept must list application/json and text/event-stream");
     if (!isJson(request.headers.get("Content-Type")))
         return refuse(io, response, .unsupported_media_type, null, .invalid_request, "The body is application/json");
-    // The server's message limit bounds the body.
-    const body = request.collect(arena, io, .limited(e.server.options.limits.message.raw())) catch |err| switch (err) {
+    // The server's message limit bounds the body. It is read onto `gpa`, not
+    // the arena: growing it frees what it outgrew, where an arena would keep
+    // every size it passed through.
+    const body = request.collect(e.gpa, io, .limited(e.server.options.limits.message.raw())) catch |err| switch (err) {
         error.StreamTooLong, error.BodyTooLarge => return refuse(io, response, .payload_too_large, null, .invalid_request, "The message is longer than the server reads"),
         error.OutOfMemory => return err,
         else => return err,
     };
+    defer e.gpa.free(body);
 
     var fault: wire.Fault = .{};
     const message = wire.decode(arena, body, .{ .fault = &fault, .limits = e.server.jsonLimits() }) catch |err| switch (err) {
@@ -189,25 +192,39 @@ fn serveWatched(e: *Endpoint, io: Io, arena: Allocator, request: *Request, req: 
 }
 
 /// Writes `reply`: as the last event of a stream the request began, or as
-/// JSON with the status its refusal goes with.
+/// JSON with the status its refusal goes with. A result goes out as it is
+/// written, never copied into the message first.
 fn answer(e: *Endpoint, io: Io, arena: Allocator, response: *Response, stream: *Stream, id: wire.Id, reply: parley.Server.Reply) anyerror!void {
-    var out: Io.Writer.Allocating = .init(arena);
-    var status: std.http.Status = .ok;
-    switch (reply) {
-        .result => |r| try wire.writeResult(&out.writer, id, r),
-        .input_required => |ir| try wire.writeResult(&out.writer, id, try e.server.inputRequiredJson(arena, ir)),
+    const body: parley.Server.Body = switch (reply) {
+        .result => |b| b,
+        .input_required => |ir| .{ .json = try e.server.inputRequiredJson(arena, ir) },
         .failure => |f| {
-            status = statusOf(f);
+            var out: Io.Writer.Allocating = .init(arena);
             try wire.writeFailure(&out.writer, id, f.code, f.message, f.data);
+            if (stream.events) return stream.last(out.written());
+            response.status = statusOf(f);
+            try response.header("Content-Type", "application/json");
+            return response.send(io, out.written());
         },
-    }
+    };
+    var head: Io.Writer.Allocating = .init(arena);
+    try wire.beginResult(&head.writer, id);
     if (stream.events) {
-        try stream.event(out.written());
+        var buffer: [256]u8 = undefined;
+        var event: uplink.wire.sse.EventWriter = try .begin(try stream.begin(), &buffer, .{ .type = "message" });
+        try event.interface.writeAll(head.written());
+        try body.write(&event.interface);
+        try wire.endResult(&event.interface);
+        try event.end();
         return response.end(io);
     }
-    response.status = status;
     try response.header("Content-Type", "application/json");
-    return response.send(io, out.written());
+    try response.setLength(head.written().len + body.len() + 1);
+    const w = try response.writer(io);
+    try w.writeAll(head.written());
+    try body.write(w);
+    try wire.endResult(w);
+    return response.end(io);
 }
 
 /// Whether a request carries the version a 2026-07-28 request carries in
@@ -541,6 +558,12 @@ const Stream = struct {
         const w = try s.begin();
         try uplink.wire.sse.writeEvent(w, .{ .type = "message", .data = message });
         try s.response.flush(s.io);
+    }
+
+    /// The stream's last event, and its end.
+    fn last(s: *Stream, message: []const u8) anyerror!void {
+        try uplink.wire.sse.writeEvent(try s.begin(), .{ .type = "message", .data = message });
+        return s.response.end(s.io);
     }
 
     fn sink(s: *Stream, e: *const Endpoint) parley.Sink {
