@@ -3,6 +3,7 @@ const std = @import("std");
 const parley = @import("parley");
 const http = @import("parley.http");
 const uplink = @import("uplink");
+const process = @import("parley.process");
 
 const Io = std.Io;
 
@@ -11,8 +12,38 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     var server = try newServer(gpa, io);
     defer server.deinit();
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len > 1 and std.mem.eql(u8, args[1], "--serve")) return serveStdio(io, gpa, &server);
     try overStdio(io, gpa, &server);
     try overHttp(io, gpa, &server);
+    try overProcess(io, gpa, try std.process.executablePathAlloc(io, init.arena.allocator()));
+}
+
+/// This program as a stdio server, which `overProcess` launches.
+fn serveStdio(io: Io, gpa: std.mem.Allocator, server: *parley.Server) !void {
+    var in_buffer: [64 * 1024]u8 = undefined;
+    var out_buffer: [64 * 1024]u8 = undefined;
+    var stdin = Io.File.stdin().readerStreaming(io, &in_buffer);
+    var stdout = Io.File.stdout().writerStreaming(io, &out_buffer);
+    try parley.stdio.serve(io, gpa, server, &stdin.interface, &stdout.interface, .{});
+}
+
+fn overProcess(io: Io, gpa: std.mem.Allocator, self: []const u8) !void {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    // --- README:process ---
+    // A server launched as a child process, the client on its streams.
+    // `deinit` ends it as stdio's shutdown says: its input closed, then a
+    // grace to exit before it is asked to stop.
+    const child = try process.Child.spawn(gpa, io, .{
+        .argv = &.{ self, "--serve" },
+        .client = .{ .info = .{ .name = "weather-app", .version = "1.0.0" } },
+    });
+    defer child.deinit(io);
+    try child.client.connect(io);
+    const outcome = try child.client.callTool(io, arena.allocator(), "forecast", .{ .city = "Porto" }, null);
+    // --- README:process ---
+    std.debug.assert(std.mem.find(u8, outcome.structured.?.bytes, "Porto") != null);
 }
 
 // --- README:server ---

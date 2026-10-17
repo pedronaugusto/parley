@@ -31,12 +31,14 @@ pub const layers: []const gantry.rules.Layer = &.{
         "src/http/Transport.zig",
     } },
     .{ .name = "HTTP public", .patterns = &.{"src/http.zig"} },
+    .{ .name = "a server process", .patterns = &.{"src/process.zig"} },
 };
 
 pub const entries: []const []const u8 = &.{};
 
 pub const modules: []const gantry.NamedModule = &.{
     .{ .name = "parley", .path = "src/parley.zig", .from = "src/http/**" },
+    .{ .name = "parley", .path = "src/parley.zig", .from = "src/process*.zig" },
 };
 
 const package_references = [_]gantry.rules.ReferenceRule{
@@ -46,7 +48,9 @@ const package_references = [_]gantry.rules.ReferenceRule{
         "aegis",
         "strand",
         "uplink",
+        "conduit",
         "shakedown",
+        "test_options",
         "parley",
         "preflight_bench_options",
     } },
@@ -59,6 +63,7 @@ pub const owned: []const gantry.rules.TokenRule = &.{};
 pub const required = [_][]const u8{
     "src/parley.zig",
     "src/http.zig",
+    "src/process.zig",
     "src/wire.zig",
     "src/Server.zig",
     "src/tests.zig",

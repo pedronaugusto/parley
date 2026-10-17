@@ -28,6 +28,11 @@
             .hash = "uplink-0.7.2-0eVSJn0yFQBPnEt3EH-vd1CF41j3ne-8nYX7LdrE7QCH",
             .lazy = true,
         },
+        .conduit = .{
+            .url = "git+https://github.com/pedronaugusto/conduit?ref=v0.8.4#58e1b72ba38ae9b1945b02765d2e05c109065c49",
+            .hash = "conduit-0.8.4-4rIA7whBFABZJBNhbjMhrW1ItS90ImKKZZQ9kQxlPyo1",
+            .lazy = true,
+        },
     },
     .dev_dependencies = .{
         .preflight = .{

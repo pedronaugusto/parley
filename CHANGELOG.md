@@ -6,6 +6,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `parley.process` (a module of its own, on conduit, fetched only when built; `.process = false` leaves it out): `Child.spawn` launches an MCP server as a child process with a `parley.Client` on its standard streams; `Child.close` ends it as stdio's shutdown says (its input closed, a grace to exit, then asked to stop, then killed), and what the server started ends with it unless `Options.descendants` says otherwise; its standard error is this process's, the null device, a file, or its latest bytes kept (`Child.stderrTail`).
+- `stdio.Channel.end`: nothing more is written, so the stream under it can be closed while answers already asked for are read.
+
 ## [0.2.0] - 2026-10-17
 
 ### Breaking

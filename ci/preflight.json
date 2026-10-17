@@ -40,6 +40,13 @@
         "uplink"
       ]
     },
+    "zig build docs -- process": {
+      "source": "examples/usage.zig",
+      "region": "process",
+      "imports": [
+        "process"
+      ]
+    },
     "zig build docs -- http": {
       "source": "examples/usage.zig",
       "region": "http",

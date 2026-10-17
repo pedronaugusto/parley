@@ -18,7 +18,9 @@ and `parley.http` for Streamable HTTP, through `b.dependency` and add them to
 your executable's imports. `parley` depends on std, strand (JSON) and aegis (a
 std-only library of checked types); `parley.http` adds uplink, which is fetched
 only when it is built: a server that speaks stdio alone passes `.http = false`
-to `b.dependency` and fetches no uplink.
+to `b.dependency` and fetches no uplink. `parley.process`, a client launching a
+server as a child process, adds [conduit](https://github.com/pedronaugusto/conduit)
+the same way (`.process = false` leaves it out).
 
 ## Usage
 
@@ -112,7 +114,7 @@ defer {
 ```
 <!-- END GENERATED -->
 
-A client, over HTTP here (`stdio.Channel` is the same over a process's
+A client, over HTTP here (`stdio.Channel` is the same over any pair of
 streams):
 
 <!-- BEGIN GENERATED zig build docs -- client -->
@@ -136,6 +138,27 @@ var arena: std.heap.ArenaAllocator = .init(gpa);
 defer arena.deinit();
 const outcome = try client.callTool(io, arena.allocator(), "forecast", .{ .city = "Lisbon" }, null);
 std.debug.assert(std.mem.find(u8, outcome.structured.?.bytes, "Lisbon") != null);
+```
+<!-- END GENERATED -->
+
+A server launched as a child process, as Claude Code and Codex launch theirs,
+the client on its standard streams; its standard error is this process's, the
+null device, a file, or its latest bytes kept for a diagnosis:
+
+<!-- BEGIN GENERATED zig build docs -- process -->
+```zig
+const process = @import("parley.process");
+
+// A server launched as a child process, the client on its streams.
+// `deinit` ends it as stdio's shutdown says: its input closed, then a
+// grace to exit before it is asked to stop.
+const child = try process.Child.spawn(gpa, io, .{
+    .argv = &.{ self, "--serve" },
+    .client = .{ .info = .{ .name = "weather-app", .version = "1.0.0" } },
+});
+defer child.deinit(io);
+try child.client.connect(io);
+const outcome = try child.client.callTool(io, arena.allocator(), "forecast", .{ .city = "Porto" }, null);
 ```
 <!-- END GENERATED -->
 

@@ -1,13 +1,16 @@
 const std = @import("std");
 
 /// What a project that depends on parley builds: `parley`, on std, aegis and
-/// strand alone, and with `http` (the default) `parley.http`, Streamable
-/// HTTP on uplink, which is fetched only then: a project that serves over
-/// stdio alone sets `.http = false` and fetches no uplink.
+/// strand alone; with `http` (the default) `parley.http`, Streamable HTTP on
+/// uplink, which is fetched only then: a project that serves over stdio
+/// alone sets `.http = false` and fetches no uplink; with `process` (the
+/// default) `parley.process`, a server launched as a child process, on
+/// conduit, fetched only then.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const with_http = b.option(bool, "http", "Build parley.http, Streamable HTTP on uplink, which fetches uplink") orelse true;
+    const with_process = b.option(bool, "process", "Build parley.process, a server launched as a child process, which fetches conduit") orelse true;
     const aegis = b.dependency("aegis", .{ .target = target, .optimize = optimize }).module("aegis");
     const strand = b.dependency("strand", .{ .target = target, .optimize = optimize }).module("strand");
     const parley = b.addModule("parley", .{
@@ -19,6 +22,19 @@ pub fn build(b: *std.Build) void {
             .{ .name = "strand", .module = strand },
         },
     });
+    if (with_process) {
+        // Declared before conduit is fetched, as parley.http is below.
+        const process = b.addModule("parley.process", .{
+            .root_source_file = b.path("src/process.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "aegis", .module = aegis },
+                .{ .name = "parley", .module = parley },
+            },
+        });
+        if (b.dependencyLazy("conduit", .{ .target = target, .optimize = optimize })) |conduit| process.addImport("conduit", conduit.module("conduit")) else |_| {}
+    }
     if (!with_http) return;
     // Declared before uplink is fetched: a consumer's first pass must find
     // the module it asks for, and only learns here what to fetch.
@@ -66,6 +82,29 @@ pub fn dev(b: *std.Build, tools: type) void {
     check.dependOn(&tests.step);
     check.dependOn(&http_tests.step);
 
+    // parley.process's tests launch a real server: the fixture, built here
+    // and named to them by its path. The benchmarks launch it too.
+    _ = p.dependencyLazy("conduit", .{ .target = target, .optimize = optimize }) catch return;
+    const fixture = b.addExecutable(.{
+        .name = "parley-fixture-server",
+        .root_module = b.createModule(.{
+            .root_source_file = p.path("src/testing/server.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "parley", .module = module }},
+        }),
+    });
+    const process_module = package.module("parley.process");
+    const test_options = b.addOptions();
+    test_options.addOptionPath("server", fixture.getEmittedBin());
+    process_module.addOptions("test_options", test_options);
+    const process_tests = b.addTest(.{ .name = "parley-process-tests", .filters = filters, .root_module = process_module });
+    const process_run = b.addRunArtifact(process_tests);
+    process_run.step.dependOn(&http_run.step);
+    unit.dependOn(&process_run.step);
+    check.dependOn(&process_tests.step);
+    b.step("fixture-server", "Build the server the process tests and the benchmarks launch, into zig-out/bin").dependOn(&b.addInstallArtifact(fixture, .{}).step);
+
     // The properties alone, every test of the binary a property: what the
     // fuzzer runs over every parser of what a peer sends.
     const properties = suite(b, "parley-properties", target, optimize, &.{"property_test."});
@@ -91,6 +130,7 @@ pub fn dev(b: *std.Build, tools: type) void {
             .imports = &.{
                 .{ .name = "parley", .module = module },
                 .{ .name = "parley.http", .module = package.module("parley.http") },
+                .{ .name = "parley.process", .module = package.module("parley.process") },
                 .{ .name = "uplink", .module = uplink_package.module("uplink") },
             },
         }),
@@ -170,7 +210,7 @@ pub fn dev(b: *std.Build, tools: type) void {
     });
     // A project that depends on parley by path, with only the packages
     // parley needs: the build a consumer gets.
-    tools.preflight.addConsumerCheck(b, p, .{ .package = "parley", .program = p.path("ci/consumer.zig"), .packages = &.{ aegis, strand, uplink_package }, .modules = &.{ "parley", "parley.http" } });
+    tools.preflight.addConsumerCheck(b, p, .{ .package = "parley", .program = p.path("ci/consumer.zig"), .packages = &.{ aegis, strand, uplink_package, p.dependencyLazy("conduit", .{ .target = target, .optimize = optimize }) catch return }, .modules = &.{ "parley", "parley.http", "parley.process" } });
 }
 
 /// The tests run in the `parley` module itself, which gets shakedown for

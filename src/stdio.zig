@@ -412,6 +412,8 @@ pub const Channel = struct {
     client: ?*Client = null,
     /// Set once the server's output ended: every wait fails at once.
     closed: std.atomic.Value(bool) = .init(false),
+    /// Private, under `write_mutex`: set by `end`, nothing more is written.
+    ended: bool = false,
 
     pub const ChannelOptions = struct {
         max_message: aegis.units.Bytes(u32) = .literal("16MiB"),
@@ -438,6 +440,16 @@ pub const Channel = struct {
     pub fn deinit(ch: *Channel, io: Io) void {
         if (ch.reading) |*task| task.cancel(io);
         ch.waiting.deinit(ch.gpa);
+    }
+
+    /// Writes nothing more: what is sent from now on fails `Closed`, so the
+    /// caller may close what `out` writes to (the server's input, which is
+    /// how a stdio server is told to end) while the answers already asked
+    /// for are still read.
+    pub fn end(ch: *Channel, io: Io) void {
+        ch.write_mutex.lockUncancelable(io);
+        defer ch.write_mutex.unlock(io);
+        ch.ended = true;
     }
 
     pub fn transport(ch: *Channel) Client.Transport {
@@ -482,6 +494,7 @@ pub const Channel = struct {
     fn write(ch: *Channel, io: Io, message: []const u8) Client.RequestError!void {
         ch.write_mutex.lockUncancelable(io);
         defer ch.write_mutex.unlock(io);
+        if (ch.ended) return error.Closed;
         ch.out.writeAll(message) catch return error.Closed;
         ch.out.writeByte('\n') catch return error.Closed;
         ch.out.flush() catch return error.Closed;
