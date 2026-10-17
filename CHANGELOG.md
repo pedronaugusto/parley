@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-17
+
 ### Breaking
 
 - `registry.freeHeaderParams` frees the slice `headerParams` returned too; the caller freed it apart.
@@ -37,5 +39,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `wire`: JSON-RPC 2.0 as MCP speaks it. `decode` reads a message's envelope and tells a request, a notification, a result and an error apart, leaving `params` and `result` as their bytes; a refusal names its code and, when it could be read, the id. `writeRequest`, `writeNotification`, `writeResult` (and `beginResult`/`endResult` around a result written in place) and `writeFailure`.
 - `Revision`: the protocol revisions parley speaks.
 
-[Unreleased]: https://github.com/pedronaugusto/parley/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/pedronaugusto/parley/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/pedronaugusto/parley/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/pedronaugusto/parley/releases/tag/v0.1.0
