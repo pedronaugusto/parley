@@ -32,6 +32,12 @@ pub const layers: []const gantry.rules.Layer = &.{
     } },
     .{ .name = "HTTP public", .patterns = &.{"src/http.zig"} },
     .{ .name = "a server process", .patterns = &.{"src/process.zig"} },
+    .{ .name = "authorization", .patterns = &.{
+        "src/oauth/Authorizer.zig",
+        "src/oauth/Guard.zig",
+        "src/oauth/ResourceMetadata.zig",
+    } },
+    .{ .name = "authorization public", .patterns = &.{"src/oauth.zig"} },
 };
 
 pub const entries: []const []const u8 = &.{};
@@ -39,6 +45,8 @@ pub const entries: []const []const u8 = &.{};
 pub const modules: []const gantry.NamedModule = &.{
     .{ .name = "parley", .path = "src/parley.zig", .from = "src/http/**" },
     .{ .name = "parley", .path = "src/parley.zig", .from = "src/process*.zig" },
+    .{ .name = "parley", .path = "src/parley.zig", .from = "src/oauth/**" },
+    .{ .name = "parley.http", .path = "src/http.zig", .from = "src/oauth/**" },
 };
 
 const package_references = [_]gantry.rules.ReferenceRule{
@@ -53,6 +61,9 @@ const package_references = [_]gantry.rules.ReferenceRule{
         "test_options",
         "parley",
         "parley.http",
+        "clearance",
+        "clearance.oauth",
+        "cloak",
         "reactor",
         "preflight_bench_options",
     } },
@@ -66,6 +77,7 @@ pub const required = [_][]const u8{
     "src/parley.zig",
     "src/http.zig",
     "src/process.zig",
+    "src/oauth.zig",
     "src/wire.zig",
     "src/Server.zig",
     "src/tests.zig",

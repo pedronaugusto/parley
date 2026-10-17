@@ -7,8 +7,8 @@ which Codex and Claude Code speak today) are served above the core, from the
 same handlers. Transports: stdio, and Streamable HTTP on
 [uplink](https://github.com/pedronaugusto/uplink).
 
-Work in progress toward the public cut: the server, the client and the tasks
-extension are built; authorization is not yet.
+Work in progress toward the public cut: the server, the client, the tasks
+extension and authorization are built.
 
 ## Install
 
@@ -20,7 +20,9 @@ std-only library of checked types); `parley.http` adds uplink, which is fetched
 only when it is built: a server that speaks stdio alone passes `.http = false`
 to `b.dependency` and fetches no uplink. `parley.process`, a client launching a
 server as a child process, adds [conduit](https://github.com/pedronaugusto/conduit)
-the same way (`.process = false` leaves it out).
+the same way (`.process = false` leaves it out), and `parley.oauth`,
+authorization over HTTP, adds [clearance](https://github.com/pedronaugusto/clearance)
+(`.oauth = false` leaves it out).
 
 ## Usage
 
@@ -127,7 +129,7 @@ const uplink = @import("uplink");
 // `connect` learns which revision it speaks.
 var web: uplink.Client = .init(gpa, .{});
 defer web.deinit(io);
-var remote: http.Transport = .init(gpa, &web, url);
+var remote: http.Transport = .init(gpa, &web, url, .{});
 defer remote.deinit();
 defer remote.close(io);
 var client: parley.Client = .init(gpa, remote.transport(), .{ .info = .{ .name = "weather-app", .version = "1.0.0" } });
@@ -255,6 +257,25 @@ to no request, and a session stream the server closes is reopened with
 is polled to its end, its input given as it asks, and returned as if answered
 at once (`Options.tasks`).
 
+**Authorization.** `parley.oauth.Authorizer` is a client's side, given to
+the HTTP transport as its `authorization`. The first request goes without a
+token; a 401 (or a 403 asking for more scope) starts what MCP lays out: the
+resource's metadata from the challenge's `resource_metadata` or its
+well-known locations (its `resource` held to the server's URL), its
+authorization server's metadata, the client as that server knows it
+(registered beforehand, a client ID metadata document's URL where the server
+takes one, else registered now as a native or web application), the scope
+(what the challenge names, else what the resource lists, what was granted
+before kept, `offline_access` where the server lists it), then tokens: kept
+ones, a refresh, or a sign-in with PKCE naming the resource, the application
+opening the URL. The request is sent again, once. A server that changes is a
+new start: nothing the old one issued goes to it. `parley.oauth.Guard` is a
+server's side, an endpoint's `access`: every request held to a bearer token
+for this resource (a JWT checked against the authorization server's keys, or
+introspection) with the scopes it needs, a 401 or 403 naming where the
+resource's metadata is, which `ResourceMetadata` serves. The OAuth itself is
+clearance's.
+
 ## Scope
 
 MCP as the specification has it, in the revisions in use: 2026-07-28, and
@@ -269,6 +290,8 @@ dereferencing a schema's `$ref` over the network.
   Schemas of Zig types.
 - [aegis](https://github.com/pedronaugusto/aegis): checked types.
 - [uplink](https://github.com/pedronaugusto/uplink) (`parley.http`): HTTP.
+- [clearance](https://github.com/pedronaugusto/clearance) (`parley.oauth`):
+  OAuth 2.1 and JOSE.
 - [shakedown](https://github.com/pedronaugusto/shakedown) (tests only):
   properties, fuzzing and benchmarks.
 - [preflight](https://github.com/pedronaugusto/preflight) (development only):
@@ -276,7 +299,8 @@ dereferencing a schema's `$ref` over the network.
 
 ## Testing
 
-`bay test` runs both modules' suites, the example and each benchmark once;
+`bay test` runs the modules' suites (authorization end to end against an
+authorization server in the test), the example and each benchmark once;
 `bay properties` the properties alone (any bytes a client sends over stdio,
 every sealed state changed), which the fuzzer runs. The suite reads what
 Claude Code 2.1.302 and Codex 0.160.0 send to a stdio server, captured from
@@ -295,8 +319,8 @@ over HTTP, by hand (`bay conformance-server -- --port 3000`, then `npx
 |---|---|---|---|
 | 2025-11-25 | server | 30 | 30 |
 | 2026-07-28 | server | 37 | 37, and the 10 tasks scenarios (not scored) |
-| 2025-11-25 | client | 18 | the 4 without authorization; the 14 `auth/*` wait on OAuth |
-| 2026-07-28 | client | 32 | the 7 without authorization; the 25 `auth/*` wait on OAuth |
+| 2025-11-25 | client | 18 | 18, and the client credentials scenarios (not scored) |
+| 2026-07-28 | client | 32 | 32, and the client credentials scenarios (not scored) |
 
 ## Licence
 

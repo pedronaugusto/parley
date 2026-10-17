@@ -28,6 +28,11 @@
             .hash = "uplink-0.8.2-0eVSJmqVFQDSeKHX0MTogSAZ5I97QNUSv1tnZ8KMt4f-",
             .lazy = true,
         },
+        .clearance = .{
+            .url = "git+https://github.com/pedronaugusto/clearance#07323ac09fa0438c71329e86ad73f45a24112b74",
+            .hash = "clearance-0.2.2--QKm-LuaCgDnu6fgYby8WvTbtPzOXX5dKmYaqV3gk6AA",
+            .lazy = true,
+        },
         .conduit = .{
             .url = "git+https://github.com/pedronaugusto/conduit?ref=v0.8.5#f1fa4353c45120c1ded507f067044b4866902c8c",
             .hash = "conduit-0.8.5-4rIA71FzFADpp7SEBu81uxg8t1Jk7plnsmU_t-arO_Ox",

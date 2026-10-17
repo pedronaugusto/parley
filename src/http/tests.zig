@@ -235,7 +235,7 @@ const Transport = @import("Transport.zig");
 fn clientRound(io: Io, h: *Harness, revisions: []const parley.Revision, expect: parley.Client.Era) !void {
     var url_buffer: [64]u8 = undefined;
     const url = try std.mem.print(&url_buffer, "http://127.0.0.1:{d}/mcp", .{h.port});
-    var remote: Transport = .init(testing.allocator, &h.client, url);
+    var remote: Transport = .init(testing.allocator, &h.client, url, .{});
     defer remote.deinit();
     defer remote.close(io);
     var client: parley.Client = .init(testing.allocator, remote.transport(), .{

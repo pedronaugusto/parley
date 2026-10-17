@@ -9,6 +9,11 @@
 //! An answer is JSON, or an event stream once the request has something to
 //! say before its result (progress, a log line) and always for
 //! `subscriptions/listen`, kept open by a comment every `keep_alive`.
+//!
+//! With an `Access` (`parley.oauth.Guard` is one: OAuth bearer tokens), every
+//! request is held to it before anything else is read of it: one it refuses
+//! is answered with its status and challenge, and one it admits is served
+//! for the principal it names.
 const Endpoint = @This();
 
 const std = @import("std");
@@ -60,9 +65,9 @@ pub const Options = struct {
     origins: []const []const u8 = &.{},
     /// How often a quiet event stream is kept open with a comment.
     keep_alive: parley.Server.Duration = .literal("15s"),
-    /// Who sent a request, from its headers (an authorization the caller
-    /// verified); null: nobody is told apart.
-    principal: ?Principal = null,
+    /// Who may send a request, and who sent it; null: anyone, and nobody
+    /// is told apart.
+    access: ?Access = null,
     /// Sessions (2025-11-25 and before) open at once; the one idle longest
     /// is ended to make room.
     max_sessions: u32 = 1024,
@@ -71,11 +76,31 @@ pub const Options = struct {
     session: parley.compat.Options = .{},
 };
 
-pub const Principal = struct {
+pub const Access = struct {
     context: ?*anyopaque = null,
-    /// The caller's identity for `request`, or null when it has none. What
-    /// it returns lives as long as the request.
-    of: *const fn (context: ?*anyopaque, request: *const Request) ?[]const u8,
+    /// Whether `request` may be served, and for whom. `message` is what its
+    /// body holds (null for a GET or a DELETE), for an access whose needs
+    /// depend on the method or the tool. What it returns lives in `arena`.
+    check: *const fn (context: ?*anyopaque, io: Io, arena: Allocator, request: *const Request, message: ?wire.Message) Error!Verdict,
+
+    /// `Unavailable`: what checks credentials could not answer (an
+    /// authorization server down): a 503.
+    pub const Error = error{ Unavailable, Canceled, OutOfMemory };
+};
+
+pub const Verdict = union(enum) {
+    /// Served, for the principal named (null: nobody told apart).
+    admitted: ?[]const u8,
+    refused: Refusal,
+};
+
+pub const Refusal = struct {
+    /// 400, 401 or 403.
+    status: std.http.Status,
+    /// The `WWW-Authenticate` value: why, and where to get credentials.
+    challenge: []const u8,
+    /// The body, JSON (an OAuth error object), or empty.
+    body: []const u8 = "",
 };
 
 pub fn init(gpa: Allocator, server: *parley.Server, options: Options) Endpoint {
@@ -101,8 +126,14 @@ fn handle(e: *Endpoint, io: Io, request: *Request, response: *Response) anyerror
     if (!e.hostServed(request.headers.get("Host") orelse request.host) or !e.originServed(request.headers.get("Origin")))
         return refuse(io, response, .forbidden, null, .invalid_request, "Origin or Host not served: a page another site serves may not reach this server");
     const session_id = request.headers.get(headers.session_id);
-    if (std.mem.eql(u8, request.method.name, "GET")) return e.openStream(io, response, session_id, request.headers.get("Accept"));
-    if (std.mem.eql(u8, request.method.name, "DELETE")) return e.endSession(io, response, session_id);
+    if (std.mem.eql(u8, request.method.name, "GET")) {
+        _ = try e.checkAccess(io, arena, request, response, null) orelse return;
+        return e.openStream(io, response, session_id, request.headers.get("Accept"));
+    }
+    if (std.mem.eql(u8, request.method.name, "DELETE")) {
+        _ = try e.checkAccess(io, arena, request, response, null) orelse return;
+        return e.endSession(io, response, session_id);
+    }
     if (!std.mem.eql(u8, request.method.name, "POST")) {
         try response.header("Allow", "GET, POST, DELETE");
         return refuse(io, response, .method_not_allowed, null, .invalid_request, "The MCP endpoint takes POST, and GET and DELETE for a session");
@@ -126,6 +157,7 @@ fn handle(e: *Endpoint, io: Io, request: *Request, response: *Response) anyerror
         error.OutOfMemory => return err,
         error.Malformed, error.Invalid => return refuse(io, response, .bad_request, fault.id, fault.code, fault.reason),
     };
+    const admitted = try e.checkAccess(io, arena, request, response, message) orelse return;
 
     // The session era: a request naming a session, or one opening it.
     if (session_id) |id| {
@@ -151,7 +183,7 @@ fn handle(e: *Endpoint, io: Io, request: *Request, response: *Response) anyerror
     if (try e.mismatch(io, arena, request, req)) |why|
         return refuse(io, response, .bad_request, req.id, .header_mismatch, why);
 
-    const principal = if (e.options.principal) |p| p.of(p.context, request) else null;
+    const principal = admitted.principal;
     var stream: Stream = .{ .io = io, .response = response };
     const reply = serveWatched(e, io, arena, request, req, principal, stream.sink(e)) catch |err| switch (err) {
         // The client left, or the server is going away: nothing to answer.
@@ -477,6 +509,31 @@ fn member(arena: Allocator, params: ?[]const u8, name: []const u8, limits: stran
         return strand.json.parseLeaky([]const u8, arena, m.value, .{ .limits = limits }) catch null;
     };
     return null;
+}
+
+const Admitted = struct { principal: ?[]const u8 };
+
+/// Holds `request` to the endpoint's access: who sent it, or null when it
+/// is refused (the refusal written).
+fn checkAccess(e: *Endpoint, io: Io, arena: Allocator, request: *const Request, response: *Response, message: ?wire.Message) anyerror!?Admitted {
+    const access = e.options.access orelse return .{ .principal = null };
+    const verdict = access.check(access.context, io, arena, request, message) catch |err| switch (err) {
+        error.Unavailable => {
+            try refuse(io, response, .service_unavailable, null, .internal_error, "The server cannot check credentials now");
+            return null;
+        },
+        error.Canceled, error.OutOfMemory => |x| return x,
+    };
+    switch (verdict) {
+        .admitted => |principal| return .{ .principal = principal },
+        .refused => |r| {
+            response.status = r.status;
+            try response.header("WWW-Authenticate", r.challenge);
+            if (r.body.len != 0) try response.header("Content-Type", "application/json");
+            try response.send(io, r.body);
+            return null;
+        },
+    }
 }
 
 fn refuse(io: Io, response: *Response, status: std.http.Status, id: ?wire.Id, code: wire.Code, message: []const u8) anyerror!void {

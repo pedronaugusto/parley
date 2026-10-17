@@ -5,12 +5,15 @@ const std = @import("std");
 /// uplink, which is fetched only then: a project that serves over stdio
 /// alone sets `.http = false` and fetches no uplink; with `process` (the
 /// default) `parley.process`, a server launched as a child process, on
-/// conduit, fetched only then.
+/// conduit, fetched only then; with `oauth` (the default, and `http`)
+/// `parley.oauth`, MCP's authorization on clearance's OAuth 2.1, fetched only
+/// then.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const with_http = b.option(bool, "http", "Build parley.http, Streamable HTTP on uplink, which fetches uplink") orelse true;
     const with_process = b.option(bool, "process", "Build parley.process, a server launched as a child process, which fetches conduit") orelse true;
+    const with_oauth = b.option(bool, "oauth", "Build parley.oauth, MCP's authorization on OAuth 2.1, which fetches clearance") orelse true;
     const aegis = b.dependency("aegis", .{ .target = target, .optimize = optimize }).module("aegis");
     const strand = b.dependency("strand", .{ .target = target, .optimize = optimize }).module("strand");
     const parley = b.addModule("parley", .{
@@ -48,7 +51,26 @@ pub fn build(b: *std.Build) void {
             .{ .name = "parley", .module = parley },
         },
     });
-    if (b.dependencyLazy("uplink", .{ .target = target, .optimize = optimize })) |uplink| http.addImport("uplink", uplink.module("uplink")) else |_| {}
+    // Declared, as parley.http is, before what it needs is fetched.
+    const oauth = if (with_oauth) b.addModule("parley.oauth", .{
+        .root_source_file = b.path("src/oauth.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "aegis", .module = aegis },
+            .{ .name = "parley", .module = parley },
+            .{ .name = "parley.http", .module = http },
+        },
+    }) else null;
+    if (b.dependencyLazy("uplink", .{ .target = target, .optimize = optimize })) |uplink| {
+        http.addImport("uplink", uplink.module("uplink"));
+        if (oauth) |o| o.addImport("uplink", uplink.module("uplink"));
+    } else |_| {}
+    const oauth_module = oauth orelse return;
+    if (b.dependencyLazy("clearance", .{ .target = target, .optimize = optimize, .oauth = true })) |clearance| {
+        oauth_module.addImport("clearance", clearance.module("clearance"));
+        oauth_module.addImport("clearance.oauth", clearance.module("clearance.oauth"));
+    } else |_| {}
 }
 
 /// parley's development: its tests, its properties, the example and the
@@ -81,6 +103,20 @@ pub fn dev(b: *std.Build, tools: type) void {
     test_step.dependOn(unit);
     check.dependOn(&tests.step);
     check.dependOn(&http_tests.step);
+
+    // parley.oauth's tests: an authorization server, a guarded endpoint and
+    // a client signing in, over loopback.
+    const clearance_package = p.dependencyLazy("clearance", .{ .target = target, .optimize = optimize, .oauth = true }) catch return;
+    const oauth_module = package.module("parley.oauth");
+    // The tests sign tokens with a cloak key.
+    if (oauth_module.import_table.get("cloak") == null) {
+        oauth_module.addImport("cloak", clearance_package.builder.dependency("cloak", .{ .target = target, .optimize = optimize }).module("cloak"));
+    }
+    const oauth_tests = b.addTest(.{ .name = "parley-oauth-tests", .filters = filters, .root_module = oauth_module });
+    const oauth_run = b.addRunArtifact(oauth_tests);
+    oauth_run.step.dependOn(&http_run.step);
+    unit.dependOn(&oauth_run.step);
+    check.dependOn(&oauth_tests.step);
 
     // parley.process's tests launch a real server: the fixture, built here
     // and named to them by its path. The benchmarks launch it too.
@@ -177,8 +213,11 @@ pub fn dev(b: *std.Build, tools: type) void {
             .imports = &.{
                 .{ .name = "parley", .module = module },
                 .{ .name = "parley.http", .module = package.module("parley.http") },
+                .{ .name = "parley.oauth", .module = package.module("parley.oauth") },
                 .{ .name = "uplink", .module = uplink_package.module("uplink") },
                 .{ .name = "strand", .module = strand.module("strand") },
+                .{ .name = "clearance", .module = clearance_package.module("clearance") },
+                .{ .name = "cloak", .module = clearance_package.builder.dependency("cloak", .{ .target = target, .optimize = optimize }).module("cloak") },
             },
         }),
     });
@@ -202,7 +241,7 @@ pub fn dev(b: *std.Build, tools: type) void {
     });
     // A project that depends on parley by path, with only the packages
     // parley needs: the build a consumer gets.
-    tools.preflight.addConsumerCheck(b, p, .{ .package = "parley", .program = p.path("ci/consumer.zig"), .packages = &.{ aegis, strand, uplink_package, p.dependencyLazy("conduit", .{ .target = target, .optimize = optimize }) catch return }, .modules = &.{ "parley", "parley.http", "parley.process" } });
+    tools.preflight.addConsumerCheck(b, p, .{ .package = "parley", .program = p.path("ci/consumer.zig"), .packages = &.{ aegis, strand, uplink_package, p.dependencyLazy("conduit", .{ .target = target, .optimize = optimize }) catch return, clearance_package }, .modules = &.{ "parley", "parley.http", "parley.process", "parley.oauth" } });
 }
 
 /// The tests run in the `parley` module itself, which gets shakedown for

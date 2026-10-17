@@ -130,9 +130,11 @@ pub const Transport = struct {
 
 /// `Refused`: the server answered at the transport's level with an error
 /// that is not a JSON-RPC answer (an HTTP status with no message), which
-/// `status` names. `Closed`: the connection is gone. `TimedOut`: no answer
-/// within the request's time.
-pub const RequestError = error{ Refused, Closed, TimedOut, Canceled, OutOfMemory };
+/// `status` names. `Unauthorized`: the server refused the request's
+/// credentials, and no better ones could be had (HTTP: a 401 or 403 the
+/// transport's authorization could not answer). `Closed`: the connection is
+/// gone. `TimedOut`: no answer within the request's time.
+pub const RequestError = error{ Refused, Unauthorized, Closed, TimedOut, Canceled, OutOfMemory };
 
 /// One request on its way: what is sent, what the transport learned of it.
 pub const Exchange = struct {

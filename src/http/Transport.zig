@@ -8,6 +8,11 @@
 //! sentinel. A session (2025-11-25 and before) is named in `Mcp-Session-Id`
 //! once `initialize` gives one; a stream the server closes before its answer
 //! is reopened with `Last-Event-ID` after the `retry` it set.
+//!
+//! With an `Authorization` (`parley.oauth.Authorizer` is one), every request
+//! carries its credentials, and one the server refuses with a 401 or 403 is
+//! handed to it with the challenge: when it gets better credentials (a sign
+//! in, a refresh, a step-up to more scopes), the request is sent again, once.
 const Transport = @This();
 
 const std = @import("std");
@@ -24,6 +29,7 @@ const wire = parley.wire;
 gpa: Allocator,
 http: *uplink.Client,
 url: []const u8,
+options: Options,
 /// Private: the session's id, once `initialize` gave one.
 session: ?[]u8 = null,
 /// Private: the session's GET stream, and the client it answers for.
@@ -38,9 +44,75 @@ const Marked = struct {
     params: []const parley.registry.HeaderParam,
 };
 
+pub const Options = struct {
+    /// The requests' credentials, and what answers a server that refuses
+    /// them; null: requests carry none.
+    authorization: ?Authorization = null,
+};
+
+/// Where a request's credentials come from, and what a refusal of them is
+/// handed to.
+pub const Authorization = struct {
+    context: *anyopaque,
+    vtable: *const VTable,
+
+    pub const Error = error{ Canceled, OutOfMemory };
+
+    pub const VTable = struct {
+        /// The `Authorization` value to send, on `arena`; null when there
+        /// is none yet (the first request goes without, and its refusal
+        /// says where to get one).
+        credentials: *const fn (context: *anyopaque, io: Io, arena: Allocator) Error!?[]const u8,
+        /// The server answered `status` (401 or 403) with these
+        /// `WWW-Authenticate` values to a request sent with `sent`: true
+        /// when there are better credentials now, and the request is sent
+        /// again; false leaves the refusal as the answer.
+        refused: *const fn (context: *anyopaque, io: Io, sent: ?[]const u8, status: u16, challenges: []const []const u8) Error!bool,
+    };
+
+    pub fn credentials(a: Authorization, io: Io, arena: Allocator) Error!?[]const u8 {
+        return a.vtable.credentials(a.context, io, arena);
+    }
+
+    pub fn refused(a: Authorization, io: Io, sent: ?[]const u8, status: u16, challenges: []const []const u8) Error!bool {
+        return a.vtable.refused(a.context, io, sent, status, challenges);
+    }
+};
+
 /// The endpoint at `url`, reached through `http`, which the caller keeps.
-pub fn init(gpa: Allocator, http: *uplink.Client, url: []const u8) Transport {
-    return .{ .gpa = gpa, .http = http, .url = url };
+pub fn init(gpa: Allocator, http: *uplink.Client, url: []const u8, options: Options) Transport {
+    return .{ .gpa = gpa, .http = http, .url = url, .options = options };
+}
+
+/// Sends `request` with the credentials there are, and once more with
+/// better ones when the server refuses them and the authorization gets
+/// some. A refusal that stands is the answer, for the caller to read.
+fn send(t: *Transport, io: Io, arena: Allocator, req: uplink.Request) (uplink.Client.SendError || Authorization.Error)!uplink.Response {
+    const auth = t.options.authorization orelse return t.http.send(io, req);
+    var asked = req;
+    var tried = false;
+    while (true) {
+        const sent = try auth.credentials(io, arena);
+        if (sent) |value| {
+            const fields = try arena.alloc(std.http.Header, req.headers.len + 1);
+            @memcpy(fields[0..req.headers.len], req.headers);
+            fields[req.headers.len] = .{ .name = "Authorization", .value = value };
+            asked.headers = fields;
+        }
+        var response = try t.http.send(io, asked);
+        const code = @backingInt(response.status);
+        if (tried or (code != 401 and code != 403)) return response;
+        tried = true;
+        var challenges: std.ArrayList([]const u8) = .empty;
+        var it = response.headers.iterator();
+        while (it.next()) |f| if (std.ascii.eqlIgnoreCase(f.name, "WWW-Authenticate")) try challenges.append(arena, try arena.dupe(u8, f.value));
+        const again = auth.refused(io, sent, code, challenges.items) catch |err| {
+            response.deinit(io);
+            return err;
+        };
+        if (!again) return response;
+        response.deinit(io);
+    }
 }
 
 /// Ends the session's stream; `io` is the one the client connected with.
@@ -91,7 +163,7 @@ fn sessionStream(t: *Transport, io: Io) Io.Cancelable!void {
         .{ .name = headers.protocol_version, .value = client.revision.text() },
     }) catch return;
     if (t.session) |id| fields.append(arena, .{ .name = headers.session_id, .value = id }) catch return;
-    var response = t.http.send(io, .{ .method = .GET, .url = t.url, .headers = fields.items }) catch |err| switch (err) {
+    var response = t.send(io, arena, .{ .method = .GET, .url = t.url, .headers = fields.items }) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         else => return,
     };
@@ -180,7 +252,7 @@ fn request(context: *anyopaque, io: Io, arena: Allocator, exchange: *Client.Exch
         if (std.mem.eql(u8, exchange.method, "tools/call")) try t.mirror(io, arena, exchange, &fields);
     } else if (t.session) |id| try fields.append(arena, .{ .name = headers.session_id, .value = id });
 
-    var response = t.http.send(io, .{
+    var response = t.send(io, arena, .{
         .method = .POST,
         .url = t.url,
         .headers = fields.items,
@@ -201,6 +273,11 @@ fn request(context: *anyopaque, io: Io, arena: Allocator, exchange: *Client.Exch
         else => error.Closed,
     };
     const code = @backingInt(response.status);
+    // The credentials refused, and none better to be had.
+    if (t.options.authorization != null and (code == 401 or code == 403)) {
+        exchange.status = @intCast(code);
+        return error.Unauthorized;
+    }
     // An answer at the transport's level that is not JSON-RPC: a session
     // server refusing what it does not know, a proxy.
     if (code >= 400 and (body.len == 0 or body[0] != '{')) {
@@ -251,7 +328,7 @@ fn events(t: *Transport, io: Io, arena: Allocator, exchange: *Client.Exchange, f
         });
         if (t.session) |id| try fields.append(arena, .{ .name = headers.session_id, .value = id });
         if (reopened) |*r| r.deinit(io);
-        reopened = t.http.send(io, .{ .method = .GET, .url = t.url, .headers = fields.items, .timeout = .{ .duration = .{ .raw = exchange.timeout, .clock = .awake } } }) catch |err| return sendError(err);
+        reopened = t.send(io, arena, .{ .method = .GET, .url = t.url, .headers = fields.items, .timeout = .{ .duration = .{ .raw = exchange.timeout, .clock = .awake } } }) catch |err| return sendError(err);
         response = &reopened.?;
     }
 }
@@ -269,7 +346,7 @@ fn postAnswer(t: *Transport, io: Io, arena: Allocator, revision: parley.Revision
         .{ .name = headers.protocol_version, .value = revision.text() },
     });
     if (t.session) |id| try fields.append(arena, .{ .name = headers.session_id, .value = id });
-    var response = t.http.send(io, .{ .method = .POST, .url = t.url, .headers = fields.items, .body = .{ .bytes = message } }) catch |err| return sendError(err);
+    var response = t.send(io, arena, .{ .method = .POST, .url = t.url, .headers = fields.items, .body = .{ .bytes = message } }) catch |err| return sendError(err);
     response.deinit(io);
 }
 
@@ -283,7 +360,7 @@ fn notify(context: *anyopaque, io: Io, message: []const u8) Client.RequestError!
         .{ .name = "Accept", .value = "application/json, text/event-stream" },
     });
     if (t.session) |id| try fields.append(arena.allocator(), .{ .name = headers.session_id, .value = id });
-    var response = t.http.send(io, .{ .method = .POST, .url = t.url, .headers = fields.items, .body = .{ .bytes = message } }) catch |err| return sendError(err);
+    var response = t.send(io, arena.allocator(), .{ .method = .POST, .url = t.url, .headers = fields.items, .body = .{ .bytes = message } }) catch |err| return sendError(err);
     response.deinit(io);
 }
 
@@ -321,7 +398,7 @@ fn member(object: []const u8, name: []const u8, limits: strand.core.Limits) ?[]c
     return null;
 }
 
-fn sendError(err: uplink.Client.SendError) Client.RequestError {
+fn sendError(err: (uplink.Client.SendError || Authorization.Error)) Client.RequestError {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.Canceled => error.Canceled,

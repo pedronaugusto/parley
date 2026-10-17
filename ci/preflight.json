@@ -5,7 +5,8 @@
   "test_roots": [
     "src/tests.zig",
     "src/property_test.zig",
-    "src/http/tests.zig"
+    "src/http/tests.zig",
+    "src/oauth/tests.zig"
   ],
   "test_support": [
     "src/testing/**"

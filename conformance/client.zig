@@ -4,9 +4,18 @@
 //! lists the tools, and calls them, with the arguments the scenario's
 //! context gives (`MCP_CONFORMANCE_CONTEXT`) or with none. It answers what
 //! a server asks: forms with their defaults, a model's answer, no roots.
+//!
+//! Every request goes through parley.oauth's authorizer: a server that asks
+//! for a token gets one as MCP's authorization lays out. The suite's
+//! authorization server redirects at once, so signing in is reading where
+//! the authorization URL redirects to. A scenario that registered the
+//! client beforehand gives its credentials in the context.
 const std = @import("std");
 const parley = @import("parley");
 const http = @import("parley.http");
+const oauth = @import("parley.oauth");
+const clearance = @import("clearance");
+const cloak = @import("cloak");
 const uplink = @import("uplink");
 const strand = @import("strand");
 
@@ -56,6 +65,34 @@ fn roots(_: ?*anyopaque, _: Io, _: Allocator) parley.Client.HandlerError!types.L
     return .{ .roots = &.{} };
 }
 
+/// Signs in as the suite's authorization server lets a program: the
+/// authorization URL answers with a redirect to the redirect URI, code and
+/// all, which is read and not followed.
+fn signIn(context: ?*anyopaque, io: Io, arena: Allocator, url: []const u8) oauth.Authorizer.SignInError![]const u8 {
+    const web: *uplink.Client = @ptrCast(@alignCast(context.?)); // safe: main passes its uplink client
+    var response = web.send(io, .{ .url = url, .redirects = .none }) catch |err| return switch (err) {
+        error.Canceled => error.Canceled,
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.Declined,
+    };
+    defer response.deinit(io);
+    const location = response.headers.get("Location") orelse return error.Declined;
+    return arena.dupe(u8, location);
+}
+
+/// The client ID metadata document's URL the suite expects of a client
+/// that uses one.
+const metadata_url = "https://conformance-test.local/client-metadata.json";
+
+/// What a scenario that registered the client beforehand gives.
+const Registration = struct {
+    client_id: ?[]const u8 = null,
+    client_secret: ?[]const u8 = null,
+    issuer: ?[]const u8 = null,
+    private_key_pem: ?[]const u8 = null,
+    signing_algorithm: ?[]const u8 = null,
+};
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
@@ -68,7 +105,33 @@ pub fn main(init: std.process.Init) !void {
 
     var web: uplink.Client = .init(gpa, .{});
     defer web.deinit(io);
-    var remote: http.Transport = .init(gpa, &web, url);
+    const raw_context = init.environ_map.get("MCP_CONFORMANCE_CONTEXT");
+    const registration: Registration = if (raw_context) |raw| strand.json.parseLeaky(Registration, arena, raw, read_options) catch .{} else .{};
+    var key: ?cloak.PrivateKey = null;
+    defer if (key) |k| k.deinit();
+    var registered: [1]oauth.Authorizer.Credentials = undefined;
+    var credentials: []const oauth.Authorizer.Credentials = &.{};
+    if (registration.client_id) |id| {
+        registered[0] = .{ .issuer = registration.issuer, .client_id = id, .secret = registration.client_secret };
+        if (registration.private_key_pem) |pem| {
+            key = try cloak.PrivateKey.parse(gpa, pem, .{});
+            const alg = clearance.Algorithm.parse(registration.signing_algorithm orelse "ES256") orelse return error.UnknownAlgorithm;
+            registered[0].private_key_jwt = .{ .signer = .{ .private = .{ .alg = alg, .key = key.? } } };
+        }
+        credentials = &registered;
+    }
+    var authorizer: oauth.Authorizer = .init(gpa, &web, url, .{
+        .sign_in = .{ .context = &web, .open = signIn },
+        .redirect_uri = "http://localhost:3000/callback",
+        .client_name = "parley-conformance-client",
+        .metadata_url = metadata_url,
+        .registered = credentials,
+        // A scenario that registered the client without a user: the
+        // client's own credentials.
+        .grant = if (std.mem.startsWith(u8, scenario, "auth/client-credentials")) .client_credentials else .authorization_code,
+    });
+    defer authorizer.deinit();
+    var remote: http.Transport = .init(gpa, &web, url, .{ .authorization = authorizer.authorization() });
     defer remote.deinit();
     defer remote.close(io);
     // The suite names the revision a scenario runs at: the client speaks it
@@ -85,7 +148,7 @@ pub fn main(init: std.process.Init) !void {
 
     const listed = try client.list(io, arena, "tools/list", null, null);
     const Context = struct { toolCalls: []const struct { name: []const u8, arguments: Raw = .{ .bytes = "{}" } } = &.{} };
-    const context: Context = if (init.environ_map.get("MCP_CONFORMANCE_CONTEXT")) |raw|
+    const context: Context = if (raw_context) |raw|
         strand.json.parseLeaky(Context, arena, raw, read_options) catch .{}
     else
         .{};

@@ -8,12 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Breaking
 
+- `http.Transport.init` takes `Options`; its `authorization` gives each request its credentials and answers a 401 or 403 (`parley.oauth.Authorizer` is one). A refusal that stands is `Client.RequestError.Unauthorized`, which `Client.connect` returns instead of trying a session.
+- `http.Endpoint.Options.principal` is `access`: an `Access` checks every request (POST, GET and DELETE) before anything else is read of it, and admits it for a principal or refuses it with a status, a `WWW-Authenticate` challenge and a body (`parley.oauth.Guard` is one).
 - `Server.Reply.result` is a `Server.Body`, not bytes: a tool's result and a resource's contents are counted when the reply is made (one past the message limit is still refused before a byte goes out) and written from what the handler returned as the transport writes the answer (`Body.write`), so the answer holds no copy of them; every other result is `.json`. `Body.whole` makes one whole on an arena.
+
+### Added
+
+- `parley.oauth` (build option `oauth`, on by default with `http`; fetches clearance): MCP's authorization. `Authorizer`, a client's side: on a 401 or a 403 `insufficient_scope`, the resource's metadata (RFC 9728) from the challenge or its well-known locations, its `resource` held to the server's URL, the authorization server's metadata, the client as that server knows it (registered beforehand, a client ID metadata document, or registered now with RFC 7591 as a `native` or `web` application), the scope (the challenge's, else the resource's, what was granted before kept, `offline_access` where listed), and the tokens: kept ones, a refresh, a sign-in (the authorization code with PKCE, RFC 8707's resource, RFC 9207's `iss`), or the client's own credentials (`client_secret_basic`, `client_secret_post`, `private_key_jwt`); a token store between runs; a server that changes forgets what the old one issued. `Guard`, a server's side: an endpoint's `access` holding every request to a bearer token for this resource (a JWT against the authorization server's keys, or introspection) and the scopes it needs, 401 and 403 with the challenge. `ResourceMetadata`: the resource's metadata document and where it is served. Conformance: both client legs' `auth/*` scenarios pass (25 at 2026-07-28, 14 at 2025-11-25), and the client credentials ones (not scored).
 
 ### Changed
 
 - A large message costs about its own size: stdio reads each line onto the allocator, not the request's arena (whose growth kept every size the line passed through), and HTTP its body; stdio and HTTP write an answer straight to the stream (as JSON of its declared length, or as the stream's last event through uplink's `wire.sse.EventWriter`) instead of framing a copy. A 64 MiB echo over stdio peaks at 82 MiB on macOS, from 297 MiB.
-- Pins uplink 0.8.2 (`wire.sse.EventWriter`).
+- Pins uplink 0.8.2 (`wire.sse.EventWriter`); `parley.oauth` pins clearance 0.2.3.
 
 ### Fixed
 

@@ -130,7 +130,7 @@ fn askOverHttp(io: Io, gpa: std.mem.Allocator, port: u16) !void {
     // `connect` learns which revision it speaks.
     var web: uplink.Client = .init(gpa, .{});
     defer web.deinit(io);
-    var remote: http.Transport = .init(gpa, &web, url);
+    var remote: http.Transport = .init(gpa, &web, url, .{});
     defer remote.deinit();
     defer remote.close(io);
     var client: parley.Client = .init(gpa, remote.transport(), .{ .info = .{ .name = "weather-app", .version = "1.0.0" } });
