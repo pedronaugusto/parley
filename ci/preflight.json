@@ -31,6 +31,15 @@
         "parley"
       ]
     },
+    "zig build docs -- client": {
+      "source": "examples/usage.zig",
+      "region": "client",
+      "imports": [
+        "parley",
+        "http",
+        "uplink"
+      ]
+    },
     "zig build docs -- http": {
       "source": "examples/usage.zig",
       "region": "http",

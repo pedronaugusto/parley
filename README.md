@@ -7,8 +7,8 @@ which Codex and Claude Code speak today) are served above the core, from the
 same handlers. Transports: stdio, and Streamable HTTP on
 [uplink](https://github.com/pedronaugusto/uplink).
 
-Work in progress toward the public cut: the server is built; the client and
-the tasks extension are not yet.
+Work in progress toward the public cut: the server and the client are built;
+the tasks extension and authorization are not yet.
 
 ## Install
 
@@ -112,6 +112,33 @@ defer {
 ```
 <!-- END GENERATED -->
 
+A client, over HTTP here (`stdio.Channel` is the same over a process's
+streams):
+
+<!-- BEGIN GENERATED zig build docs -- client -->
+```zig
+const parley = @import("parley");
+const http = @import("parley.http");
+const uplink = @import("uplink");
+
+// A client: the transport reaches the server (here over HTTP), and
+// `connect` learns which revision it speaks.
+var web: uplink.Client = .init(gpa, .{});
+defer web.deinit(io);
+var remote: http.Transport = .init(gpa, &web, url);
+defer remote.deinit();
+defer remote.close(io);
+var client: parley.Client = .init(gpa, remote.transport(), .{ .info = .{ .name = "weather-app", .version = "1.0.0" } });
+defer client.deinit();
+try client.connect(io);
+
+var arena: std.heap.ArenaAllocator = .init(gpa);
+defer arena.deinit();
+const outcome = try client.callTool(io, arena.allocator(), "forecast", .{ .city = "Lisbon" }, null);
+std.debug.assert(std.mem.find(u8, outcome.structured.?.bytes, "Lisbon") != null);
+```
+<!-- END GENERATED -->
+
 ## Design
 
 **One request, one reply.** `Server.serve` answers a 2026-07-28 request from
@@ -165,6 +192,22 @@ result; a `subscriptions/listen` stream is kept open by a comment every
 `keep_alive`. A session's GET stream and DELETE are served for the session
 revisions.
 
+**The client.** `Client.connect` asks `server/discover` at 2026-07-28 (or the
+versions `Options.revisions` names): an answer, or an error that names the
+versions the server speaks, means a modern server, whose requests then carry
+the version, the client's identity and capabilities in `_meta`; anything
+else, or no answer within `probe_timeout`, means a session server, which is
+opened with `initialize`. A call that comes back asking for input is answered
+by the application's handlers (`Options.handlers`: forms, a model's answer,
+roots) and retried with the answers and the server's state exactly as it came;
+a session server's own requests reach the same handlers, and an accepted
+form's fields the user left empty get the form's defaults. Over HTTP every
+request carries the headers its revision asks for, a tool's `x-mcp-header`
+arguments mirrored from its last `tools/list` (a tool whose marks break the
+rules is left out of the list), a session's GET stream is read for what belongs
+to no request, and a session stream the server closes is reopened with
+`Last-Event-ID` after the `retry` it set.
+
 ## Scope
 
 MCP as the specification has it, in the revisions in use: 2026-07-28, and
@@ -194,14 +237,19 @@ both, and answers it.
 
 The official conformance suite
 ([@modelcontextprotocol/conformance](https://github.com/modelcontextprotocol/conformance)
-0.2.0-alpha.12) drives `conformance/server.zig` over HTTP, by hand (`bay
-conformance-server -- --port 3000`, then `npx @modelcontextprotocol/conformance
-server --url http://127.0.0.1:3000/mcp --requirements <revision>`):
+0.2.0-alpha.12) drives `conformance/server.zig` and runs `conformance/client.zig`
+over HTTP, by hand (`bay conformance-server -- --port 3000`, then `npx
+@modelcontextprotocol/conformance server --url http://127.0.0.1:3000/mcp
+--requirements <revision>`; `bay conformance-client`, then `npx
+@modelcontextprotocol/conformance client --command zig-out/bin/conformance-client
+--scenario <name>`):
 
-| Revision | Server scenarios required | Passed |
-|---|---|---|
-| 2025-11-25 | 30 | 30 |
-| 2026-07-28 | 37 | 37 |
+| Revision | Leg | Scenarios required | Passed |
+|---|---|---|---|
+| 2025-11-25 | server | 30 | 30 |
+| 2026-07-28 | server | 37 | 37 |
+| 2025-11-25 | client | 18 | the 4 without authorization; the 14 `auth/*` wait on OAuth |
+| 2026-07-28 | client | 32 | the 7 without authorization; the 25 `auth/*` wait on OAuth |
 
 ## Licence
 

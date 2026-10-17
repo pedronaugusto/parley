@@ -88,4 +88,27 @@ fn overHttp(io: Io, gpa: std.mem.Allocator, server: *parley.Server) !void {
         serving.await(io) catch {};
     }
     // --- README:http ---
+    try askOverHttp(io, gpa, listener.socket.address.getPort());
+}
+
+fn askOverHttp(io: Io, gpa: std.mem.Allocator, port: u16) !void {
+    var url_buffer: [64]u8 = undefined;
+    const url = try std.mem.print(&url_buffer, "http://127.0.0.1:{d}/mcp", .{port});
+    // --- README:client ---
+    // A client: the transport reaches the server (here over HTTP), and
+    // `connect` learns which revision it speaks.
+    var web: uplink.Client = .init(gpa, .{});
+    defer web.deinit(io);
+    var remote: http.Transport = .init(gpa, &web, url);
+    defer remote.deinit();
+    defer remote.close(io);
+    var client: parley.Client = .init(gpa, remote.transport(), .{ .info = .{ .name = "weather-app", .version = "1.0.0" } });
+    defer client.deinit();
+    try client.connect(io);
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const outcome = try client.callTool(io, arena.allocator(), "forecast", .{ .city = "Lisbon" }, null);
+    std.debug.assert(std.mem.find(u8, outcome.structured.?.bytes, "Lisbon") != null);
+    // --- README:client ---
 }
