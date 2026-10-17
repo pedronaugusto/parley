@@ -491,7 +491,7 @@ pub const Channel = struct {
         return ch.write(io, message);
     }
 
-    fn opened(_: *anyopaque, _: @import("revision.zig").Revision) void {}
+    fn opened(_: *anyopaque, _: Io, _: *Client) void {}
 
     fn retire(ch: *Channel, io: Io, waiter: *Waiter) void {
         ch.mutex.lockUncancelable(io);

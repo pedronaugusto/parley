@@ -113,6 +113,24 @@ pub fn dev(b: *std.Build, tools: type) void {
     conformance_run.addPassthruArgs();
     b.step("conformance-server", "Serve the conformance suite's scenarios: -- --port <port>").dependOn(&conformance_run.step);
     check.dependOn(&conformance.step);
+    // The client the suite runs, installed for its --command:
+    // `bay conformance-client` puts it in zig-out/bin.
+    const conformance_client = b.addExecutable(.{
+        .name = "conformance-client",
+        .root_module = b.createModule(.{
+            .root_source_file = p.path("conformance/client.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "parley", .module = module },
+                .{ .name = "parley.http", .module = package.module("parley.http") },
+                .{ .name = "uplink", .module = uplink_package.module("uplink") },
+                .{ .name = "strand", .module = strand.module("strand") },
+            },
+        }),
+    });
+    b.step("conformance-client", "Build the client the conformance suite runs, into zig-out/bin").dependOn(&b.addInstallArtifact(conformance_client, .{}).step);
+    check.dependOn(&conformance_client.step);
 
     tools.preflight.addCi(b, p, .{
         .tests = test_step,

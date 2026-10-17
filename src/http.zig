@@ -5,6 +5,8 @@
 //!   sentinel their values travel in.
 
 pub const Endpoint = @import("http/Endpoint.zig");
+/// The client's side: a server's endpoint, for `parley.Client`.
+pub const Transport = @import("http/Transport.zig");
 pub const headers = @import("http/headers.zig");
 
 // The tests run in this module, against the `parley` module it imports.

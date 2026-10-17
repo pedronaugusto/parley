@@ -58,6 +58,7 @@ const Harness = struct {
         // glint-ignore: Z026 -- serve ends with the shutdown; its result is not what the test checks
         h.serving.await(io) catch {};
         h.http.deinit(io);
+        h.endpoint.deinit();
         h.listener.deinit(io);
         h.router.deinit();
         h.core.deinit();
@@ -167,4 +168,53 @@ test "what HTTP refuses: other origins, other methods, notifications taken, unkn
     });
     try testing.expectEqual(std.http.Status.bad_request, unsupported.status);
     try expectContains(unsupported.body, "-32022");
+}
+
+fn greet(call: *Call) Call.Error!parley.ToolResult {
+    const answer = try call.elicit("name", .{ .form = .{
+        .message = "Who are you?",
+        .requested_schema = .{ .bytes = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"default\":\"ada\"}}}" },
+    } }) orelse return error.InputRequired;
+    return .ofText(answer.content.?.bytes);
+}
+
+fn acceptEmpty(_: ?*anyopaque, _: Io, _: std.mem.Allocator, _: []const u8) parley.Client.HandlerError!parley.types.ElicitResult {
+    return .{ .action = .accept, .content = .{ .bytes = "{}" } };
+}
+
+const Transport = @import("Transport.zig");
+
+fn clientRound(io: Io, h: *Harness, revisions: []const parley.Revision, expect: parley.Client.Era) !void {
+    var url_buffer: [64]u8 = undefined;
+    const url = try std.mem.print(&url_buffer, "http://127.0.0.1:{d}/mcp", .{h.port});
+    var remote: Transport = .init(testing.allocator, &h.client, url);
+    defer remote.deinit();
+    defer remote.close(io);
+    var client: parley.Client = .init(testing.allocator, remote.transport(), .{
+        .info = .{ .name = "c", .version = "1" },
+        .handlers = .{ .elicit = acceptEmpty },
+        .revisions = revisions,
+    });
+    defer client.deinit();
+    try client.connect(io);
+    try testing.expectEqual(expect, client.era);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    _ = try client.list(io, a, "tools/list", null, null);
+    const echoed = try client.callTool(io, a, "echo", .{ .text = "over http" }, null);
+    try testing.expectEqualStrings("over http", echoed.content[0].text.text);
+    // The user filled nothing: the form's default is the client's to apply.
+    const greeted = try client.callTool(io, a, "greet", .{}, null);
+    try testing.expectEqualStrings("{\"name\":\"ada\"}", greeted.content[0].text.text);
+}
+
+test "the client over HTTP: modern, and a session whose input comes as the server's requests on the stream" {
+    const io = testing.io;
+    var h: Harness = undefined;
+    try h.start(io);
+    defer h.stop(io);
+    try h.core.addTool(io, .{ .name = "greet" }, greet);
+    try clientRound(io, &h, &.{.@"2026-07-28"}, .modern);
+    try clientRound(io, &h, &.{.@"2025-11-25"}, .session);
 }

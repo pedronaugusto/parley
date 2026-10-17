@@ -17,6 +17,8 @@ pub const compat = @import("compat.zig");
 pub const Call = @import("Call.zig");
 pub const Context = @import("context.zig").Context;
 pub const Sink = @import("context.zig").Sink;
+/// What a server offers, and the `x-mcp-header` marks of a tool's schema.
+pub const registry = @import("registry.zig");
 pub const ToolResult = @import("registry.zig").ToolResult;
 pub const ToolSpec = @import("registry.zig").ToolSpec;
 pub const ToolHandler = @import("registry.zig").ToolHandler;

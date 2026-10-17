@@ -53,8 +53,10 @@ pub const Options = struct {
     timeout: Duration = .literal("60s"),
     /// Rounds of input one request may ask for.
     max_rounds: u8 = 8,
-    /// Whether a session server (2025-11-25 and before) is spoken to.
-    sessions: bool = true,
+    /// The revisions the client speaks, newest first. Without 2026-07-28
+    /// it opens a session at once; without the session revisions it speaks
+    /// to 2026-07-28 servers alone.
+    revisions: []const Revision = &.{ .@"2026-07-28", .@"2025-11-25", .@"2025-06-18" },
     /// How long `server/discover` waits before the server is taken for a
     /// session server that stays silent before `initialize` (stdio).
     probe_timeout: Duration = .literal("5s"),
@@ -86,9 +88,15 @@ pub const Transport = struct {
         request: *const fn (context: *anyopaque, io: Io, arena: Allocator, exchange: *Exchange) RequestError![]const u8,
         /// Sends a notification.
         notify: *const fn (context: *anyopaque, io: Io, message: []const u8) RequestError!void,
-        /// The session was opened (`initialize` answered at `revision`): a
-        /// transport that names its sessions keeps what it needs.
-        opened: *const fn (context: *anyopaque, revision: Revision) void,
+        /// The session was opened (`initialize` answered at
+        /// `client.revision`): a transport with a stream of the session's
+        /// own (an HTTP GET) opens it, for the server's requests and
+        /// notifications that belong to no request.
+        opened: *const fn (context: *anyopaque, io: Io, client: *Client) void,
+        /// A `tools/list` answer, as the application should see it: a
+        /// transport that mirrors arguments into headers learns the tools'
+        /// marks, and leaves out a tool whose marks it cannot honour.
+        listed: ?*const fn (context: *anyopaque, io: Io, arena: Allocator, result: []const u8) Allocator.Error![]const u8 = null,
     };
 
     pub fn request(t: Transport, io: Io, arena: Allocator, exchange: *Exchange) RequestError![]const u8 {
@@ -153,7 +161,9 @@ pub fn connect(c: *Client, io: Io) ConnectError!void {
     var scratch: std.heap.ArenaAllocator = .init(c.gpa);
     defer scratch.deinit();
     const arena = scratch.allocator();
-    c.revision = Revision.latest;
+    c.revision = for (c.options.revisions) |r| {
+        if (r.stateless()) break r;
+    } else return c.openSession(io, arena);
     var tries: u8 = 0;
     while (tries < 2) : (tries += 1) {
         const answer = c.send(io, arena, "server/discover", "{}", null, null, .modern, c.options.probe_timeout.toIoDuration()) catch |err| switch (err) {
@@ -168,7 +178,7 @@ pub fn connect(c: *Client, io: Io) ConnectError!void {
             },
             .failure => |f| switch (f.code) {
                 .unsupported_protocol_version => {
-                    const chosen = chooseVersion(arena, f.data) orelse return error.Unsupported;
+                    const chosen = chooseVersion(arena, c.options.revisions, f.data) orelse return error.Unsupported;
                     if (!chosen.stateless()) return c.openSession(io, arena);
                     c.revision = chosen;
                 },
@@ -183,12 +193,14 @@ pub fn connect(c: *Client, io: Io) ConnectError!void {
 }
 
 /// The newest version the server names that this client speaks.
-fn chooseVersion(arena: Allocator, data: ?[]const u8) ?Revision {
+fn chooseVersion(arena: Allocator, spoken: []const Revision, data: ?[]const u8) ?Revision {
     const Data = struct { supported: []const []const u8 = &.{} };
     const d = strand.json.parseLeaky(Data, arena, data orelse return null, types.read_options) catch return null;
     var best: ?Revision = null;
     for (d.supported) |name| if (Revision.named(name)) |r| {
-        if (best == null or @backingInt(r) < @backingInt(best.?)) best = r;
+        for (spoken) |known| if (known == r) {
+            if (best == null or @backingInt(r) < @backingInt(best.?)) best = r;
+        };
     };
     return best;
 }
@@ -207,9 +219,10 @@ fn keepDiscovery(c: *Client, result: []const u8) ConnectError!void {
 
 /// `initialize`, then `notifications/initialized`: a session.
 fn openSession(c: *Client, io: Io, arena: Allocator) ConnectError!void {
-    if (!c.options.sessions) return error.Unsupported;
     c.era = .session;
-    c.revision = Revision.latest_legacy;
+    c.revision = for (c.options.revisions) |r| {
+        if (!r.stateless()) break r;
+    } else return error.Unsupported;
     var params: Writer.Allocating = .init(arena);
     const w = &params.writer;
     w.print("{{\"protocolVersion\":\"{s}\",\"capabilities\":", .{c.revision.text()}) catch return error.OutOfMemory;
@@ -234,11 +247,14 @@ fn openSession(c: *Client, io: Io, arena: Allocator) ConnectError!void {
     const r = strand.json.parseLeaky(Initialized, kept, bytes, types.read_options) catch return error.Protocol;
     const revision = Revision.named(r.protocolVersion) orelse return error.Unsupported;
     if (revision.stateless()) return error.Protocol;
+    for (c.options.revisions) |spoken| {
+        if (spoken == revision) break;
+    } else return error.Unsupported;
     c.revision = revision;
     c.server_capabilities = r.capabilities.bytes;
     c.server_info = r.serverInfo;
     c.instructions = r.instructions;
-    c.transport.vtable.opened(c.transport.context, revision);
+    c.transport.vtable.opened(c.transport.context, io, c);
     try c.transport.notify(io, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
 }
 
@@ -301,14 +317,16 @@ fn writeWithMeta(c: *const Client, w: *Writer, params: []const u8) Writer.Error!
 }
 
 /// A server's request in a session, answered by the application.
-fn serveRequest(c: *Client, io: Io, arena: Allocator, request: wire.Request) Answer {
+pub fn serveRequest(c: *Client, io: Io, arena: Allocator, request: wire.Request) Answer {
     const params = request.params orelse "{}";
     var out: Writer.Allocating = .init(arena);
     const result: (HandlerError || error{ MethodNotFound, WriteFailed })![]const u8 = blk: {
         if (std.mem.eql(u8, request.method, "ping")) break :blk "{}";
         if (std.mem.eql(u8, request.method, "elicitation/create")) {
             const f = c.options.handlers.elicit orelse break :blk error.MethodNotFound;
-            break :blk encode(arena, f(c.options.handlers.context, io, arena, params) catch |err| break :blk err);
+            var answer = f(c.options.handlers.context, io, arena, params) catch |err| break :blk err;
+            if (answer.action == .accept) answer.content = .{ .bytes = withDefaults(arena, params, if (answer.content) |r| r.bytes else "{}") catch |err| break :blk err };
+            break :blk encode(arena, answer);
         }
         if (std.mem.eql(u8, request.method, "sampling/createMessage")) {
             const f = c.options.handlers.sample orelse break :blk error.MethodNotFound;
@@ -327,6 +345,46 @@ fn serveRequest(c: *Client, io: Io, arena: Allocator, request: wire.Request) Ans
         wire.writeFailure(&out.writer, request.id, code, if (err == error.Refused) "the user declined" else @errorName(err), null) catch return .none;
     }
     return .{ .message = out.written() };
+}
+
+/// An accepted form's content, with each field the user left out that the
+/// form's schema gives a default for set to that default (2025-11-25,
+/// SEP-1034).
+fn withDefaults(arena: Allocator, params: []const u8, content: []const u8) error{OutOfMemory}![]const u8 {
+    const Form = struct { requestedSchema: struct { properties: ?Raw = null } = .{} };
+    const form = strand.json.parseLeaky(Form, arena, params, types.read_options) catch return content;
+    const properties = form.requestedSchema.properties orelse return content;
+    var out: Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    const body = std.mem.trim(u8, content, " \t\r\n");
+    if (body.len < 2 or body[0] != '{') return content;
+    w.writeAll(body[0 .. body.len - 1]) catch return error.OutOfMemory;
+    var first = std.mem.trim(u8, body[1 .. body.len - 1], " \t\r\n").len == 0;
+    var each: strand.json.Members = undefined;
+    each.init(properties.bytes, .{});
+    while (each.next() catch null) |p| {
+        var name_buffer: [256]u8 = undefined;
+        const name = p.nameInto(&name_buffer) catch continue;
+        if (hasMember(content, name)) continue;
+        var fields: strand.json.Members = undefined;
+        fields.init(p.value, .{});
+        while (fields.next() catch null) |f| if (f.is("default")) {
+            if (!first) w.writeByte(',') catch return error.OutOfMemory;
+            first = false;
+            wire.writeString(w, name) catch return error.OutOfMemory;
+            w.writeByte(':') catch return error.OutOfMemory;
+            w.writeAll(f.value) catch return error.OutOfMemory;
+        };
+    }
+    w.writeByte('}') catch return error.OutOfMemory;
+    return out.written();
+}
+
+fn hasMember(object: []const u8, name: []const u8) bool {
+    var members: strand.json.Members = undefined;
+    members.init(object, .{});
+    while (members.next() catch return false) |m| if (m.is(name)) return true;
+    return false;
 }
 
 fn encode(arena: Allocator, value: anytype) error{WriteFailed}![]const u8 {
@@ -461,7 +519,9 @@ pub fn list(c: *Client, io: Io, arena: Allocator, method: []const u8, cursor: ?[
         wire.writeString(&out.writer, text) catch return error.OutOfMemory;
     }
     out.writer.writeByte('}') catch return error.OutOfMemory;
-    return c.call(io, arena, method, out.written(), null, null, diagnostics);
+    const result = try c.call(io, arena, method, out.written(), null, null, diagnostics);
+    if (std.mem.eql(u8, method, "tools/list")) if (c.transport.vtable.listed) |f| return f(c.transport.context, io, arena, result);
+    return result;
 }
 
 /// Arguments as the object a request carries: a `Raw` as it is, an empty
