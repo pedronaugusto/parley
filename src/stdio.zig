@@ -313,30 +313,24 @@ const Job = struct {
         }
         var buffer: [2]Outcome = undefined;
         var select: Io.Select(Outcome) = .init(io, &buffer);
+        // Every task of the select has ended before the job's memory goes:
+        // a task still finishing would write into what is freed. What they
+        // return lives in the job's arena.
+        defer select.cancelDiscard();
         select.concurrent(.done, answer, .{job}) catch {
             // No task to spare for watching: answered, never canceled.
             job.finish(answer(job));
             return;
         };
         select.concurrent(.canceled, waitCancel, .{ &job.cancel, io }) catch {
-            const result = select.await() catch {
-                _ = select.cancel();
-                return;
-            };
+            const result = select.await() catch return;
             job.finish(result.done);
             return;
         };
-        const first = select.await() catch {
-            _ = select.cancel();
-            return;
-        };
-        switch (first) {
-            .done => |result| {
-                _ = select.cancel();
-                job.finish(result);
-            },
+        switch (select.await() catch return) {
+            .done => |result| job.finish(result),
             // Canceled: the request's task ends; nothing is answered.
-            .canceled => _ = select.cancel(),
+            .canceled => {},
         }
     }
 

@@ -98,7 +98,20 @@ const line_examples = [_][]const u8{
 
 /// What a client sends, mutated, a few lines at a time: the server answers
 /// or refuses every line and never fails while doing it.
-fn anyLines(server: *Server, c: *shake.Case) !void {
+fn anyLines(_: void, c: *shake.Case) !void {
+    // The server answers on tasks of its own: it allocates from a
+    // thread-safe allocator (the case's arena is not), and the Io and the
+    // server live for the case, so what they hold is taken back with it
+    // (under the fuzzer the leak check runs after each input).
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var owned = try Server.init(gpa, io, .{ .info = .{ .name = "fuzz", .version = "0" } });
+    defer owned.deinit();
+    const server = &owned;
+    try server.addTool(io, .{ .name = "echo" }, echo);
+    try server.addTool(io, .{ .name = "asks" }, asks);
     var input: std.ArrayList(u8) = .empty;
     var lines = shake.gen.intRange(c.source, u8, 1, 4);
     while (lines > 0) : (lines -= 1) {
@@ -109,7 +122,7 @@ fn anyLines(server: *Server, c: *shake.Case) !void {
     }
     var in: std.Io.Reader = .fixed(input.items);
     var out: std.Io.Writer.Allocating = .init(c.gpa);
-    try stdio.serve(std.testing.io, c.gpa, server, &in, &out.writer, .{});
+    try stdio.serve(io, gpa, server, &in, &out.writer, .{});
     // Every line out is one JSON-RPC message.
     var it = std.mem.splitScalar(u8, out.written(), '\n');
     while (it.next()) |line| {
@@ -119,11 +132,7 @@ fn anyLines(server: *Server, c: *shake.Case) !void {
 }
 
 test "any lines a client sends are answered or refused, each answer a message" {
-    var server = try Server.init(std.testing.allocator, std.testing.io, .{ .info = .{ .name = "fuzz", .version = "0" } });
-    defer server.deinit();
-    try server.addTool(std.testing.io, .{ .name = "echo" }, echo);
-    try server.addTool(std.testing.io, .{ .name = "asks" }, asks);
-    try shake.check(std.testing.allocator, &server, anyLines, .{ .cases = 300 });
+    try shake.check(std.testing.allocator, {}, anyLines, .{ .cases = 300 });
 }
 
 /// A sealed state with any byte changed, cut or grown never opens; the
