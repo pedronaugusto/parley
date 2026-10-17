@@ -52,6 +52,8 @@ const package_references = [_]gantry.rules.ReferenceRule{
         "shakedown",
         "test_options",
         "parley",
+        "parley.http",
+        "reactor",
         "preflight_bench_options",
     } },
     .{ .name = "source siblings", .suffix = ".zig", .relative = true, .except_targets = &.{"src/**"} },

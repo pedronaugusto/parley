@@ -29,8 +29,8 @@
             .lazy = true,
         },
         .conduit = .{
-            .url = "git+https://github.com/pedronaugusto/conduit?ref=v0.8.4#58e1b72ba38ae9b1945b02765d2e05c109065c49",
-            .hash = "conduit-0.8.4-4rIA7whBFABZJBNhbjMhrW1ItS90ImKKZZQ9kQxlPyo1",
+            .url = "git+https://github.com/pedronaugusto/conduit?ref=v0.8.5#f1fa4353c45120c1ded507f067044b4866902c8c",
+            .hash = "conduit-0.8.5-4rIA71FzFADpp7SEBu81uxg8t1Jk7plnsmU_t-arO_Ox",
             .lazy = true,
         },
     },
@@ -40,8 +40,8 @@
             .hash = "preflight-0.6.3-LX1ZwrzeEADGGrJFgOpe3yb8nrGhhevtGTJckqGILzXn",
         },
         .shakedown = .{
-            .url = "git+https://github.com/pedronaugusto/shakedown?ref=v0.4.8#7fd3eda61e991b9e0eb754c1bd83b4ce57f221bd",
-            .hash = "shakedown-0.4.8-BR8U44xTFgCSgGkib258Bq2mgPxBk-drwk5Mg0ABYntZ",
+            .url = "git+https://github.com/pedronaugusto/shakedown?ref=v0.4.10#596a30133a1a46cf599b10f64525806510bf7880",
+            .hash = "shakedown-0.4.10-BR8U49NuFgCLIpWEPq-42XU1jQSr0qJbZdeCMapW02uN",
         },
     },
 }

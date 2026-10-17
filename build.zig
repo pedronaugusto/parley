@@ -85,15 +85,7 @@ pub fn dev(b: *std.Build, tools: type) void {
     // parley.process's tests launch a real server: the fixture, built here
     // and named to them by its path. The benchmarks launch it too.
     _ = p.dependencyLazy("conduit", .{ .target = target, .optimize = optimize }) catch return;
-    const fixture = b.addExecutable(.{
-        .name = "parley-fixture-server",
-        .root_module = b.createModule(.{
-            .root_source_file = p.path("src/testing/server.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "parley", .module = module }},
-        }),
-    });
+    const fixture = fixtureServer(b, target, optimize) orelse return;
     const process_module = package.module("parley.process");
     const test_options = b.addOptions();
     test_options.addOptionPath("server", fixture.getEmittedBin());
@@ -223,10 +215,47 @@ fn suite(b: *std.Build, name: []const u8, target: std.Build.ResolvedTarget, opti
     return b.addTest(.{ .name = name, .filters = filters, .root_module = module });
 }
 
+/// The server the process tests and the benchmarks launch
+/// (src/testing/server.zig), in the mode asked for: over stdio or HTTP, on
+/// a reactor runtime. Null until uplink is fetched.
+fn fixtureServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) ?*std.Build.Step.Compile {
+    const package = b.dependency("parley", .{ .target = target, .optimize = optimize });
+    const uplink = package.builder.dependencyLazy("uplink", .{ .target = target, .optimize = optimize }) catch return null;
+    const reactor = uplink.builder.dependencyLazy("reactor", .{ .target = target, .optimize = optimize }) catch return null;
+    return b.addExecutable(.{
+        .name = "parley-fixture-server",
+        .root_module = b.createModule(.{
+            .root_source_file = package.path("src/testing/server.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "parley", .module = package.module("parley") },
+                .{ .name = "parley.http", .module = package.module("parley.http") },
+                .{ .name = "uplink", .module = uplink.module("uplink") },
+                .{ .name = "reactor", .module = reactor.module("reactor") },
+            },
+        }),
+    });
+}
+
 /// parley again, in the mode a benchmark builds in: an imported module keeps
 /// its own mode, so a ReleaseFast benchmark over the Debug module would time
 /// the Debug module. `b` is the development build; preflight adds shakedown.
+/// With it what the process rows drive: conduit to launch a server and read
+/// its memory, uplink's client for HTTP, and the fixture server built in the
+/// same mode, named by `bench_options.server`.
 fn benchImports(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) []const std.Build.Module.Import {
-    const parley = b.dependency("parley", .{ .target = target, .optimize = optimize }).module("parley");
-    return b.allocator.dupe(std.Build.Module.Import, &.{.{ .name = "parley", .module = parley }}) catch @panic("OOM");
+    const package = b.dependency("parley", .{ .target = target, .optimize = optimize });
+    const p = package.builder;
+    const conduit = p.dependency("conduit", .{ .target = target, .optimize = optimize });
+    const uplink = p.dependency("uplink", .{ .target = target, .optimize = optimize });
+    const fixture = fixtureServer(b, target, optimize).?; // the configure pass reaching benchmarks has fetched uplink and reactor
+    const options = b.addOptions();
+    options.addOptionPath("server", fixture.getEmittedBin());
+    return b.allocator.dupe(std.Build.Module.Import, &.{
+        .{ .name = "parley", .module = package.module("parley") },
+        .{ .name = "conduit", .module = conduit.module("conduit") },
+        .{ .name = "uplink", .module = uplink.module("uplink") },
+        .{ .name = "bench_options", .module = options.createModule() },
+    }) catch @panic("OOM");
 }

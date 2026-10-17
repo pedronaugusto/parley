@@ -6,6 +6,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Pins conduit 0.8.5 (`Child.memory`, which the benchmarks read a server's memory with) and, for development, shakedown 0.4.10 (latency rows).
+- The benchmarks drive a server process as a client does, over stdio and Streamable HTTP, in both eras: cold start, `tools/list` of 100 tools with large schemas and an echo call (each request timed alone: p50 and p99), a `ping`, an echo and a cancellation beside a long call, and TM Dev Lab's MCP workload (50 clients at once, a session per call); `parley-bench memory` reads the server's memory at rest and after a large message. Any server that takes the fixture server's arguments is measured the same way: `parley-bench -- <server>`. The fixture server serves over HTTP too (`--port`), on a reactor runtime.
+
 ## [0.3.0] - 2026-10-17
 
 ### Breaking
