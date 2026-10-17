@@ -6,9 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-17
+
+### Breaking
+
+- `parley.http` is on uplink 0.8.0, whose TLS options name cloak 0.14's types: a program that pins uplink pins 0.8.
+
 ### Changed
 
-- Pins uplink 0.7.3 (`Request.gone`).
+- Pins uplink 0.8.0 (`Request.gone`; cloak 0.14 under it).
 
 ### Added
 

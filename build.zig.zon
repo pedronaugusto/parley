@@ -1,6 +1,6 @@
 .{
     .name = .parley,
-    .version = "0.2.0",
+    .version = "0.3.0",
     .minimum_zig_version = "0.17.0",
     .fingerprint = 0xaf1afeb663f077c7, // Changing this has security and trust implications.
     // What a consumer fetches: the modules and their documents. The tests,
@@ -24,8 +24,8 @@
             .hash = "strand-0.11.1-8LNWVtZJJgDujColV9BwoK1duuRMWp4bfuV2Gc2iLTEI",
         },
         .uplink = .{
-            .url = "git+https://github.com/pedronaugusto/uplink?ref=v0.7.3#e14448335c32fc5cd97f034d80938eb10d7766b7",
-            .hash = "uplink-0.7.3-0eVSJuVdFQBaDt7raUMLUAKR21Tt0v8sMy8kabb3ko8L",
+            .url = "git+https://github.com/pedronaugusto/uplink?ref=v0.8.0#6b4d52c7be54ef8df5b659711d3e1092f5b5c7b0",
+            .hash = "uplink-0.8.0-0eVSJldgFQCbf3Vo5jZ1dgJGkPP0b_X51kzMk3BS7nAR",
             .lazy = true,
         },
         .conduit = .{
