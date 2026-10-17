@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-17
+
 ### Breaking
 
 - One message limit governs every read and write: `Server.Options.limits.message` (and `Client.Options.limits.message` on the client side), 16 MiB by default. The transports read it (`stdio.Options.max_message`, `http.Endpoint.Options.max_body` and `stdio.Channel`'s options are gone; `Channel.init` takes no options, `process.Options.channel` is gone), and every decode takes strand's limits from it through `wire.limitsFor`: the envelope, params, a tool's arguments, `_meta`, the client's reads of results. Before, a message within a raised limit was refused "past a limit" by strand's 16 MiB defaults inside it. An answer longer than the limit is answered with an internal error rather than written.
