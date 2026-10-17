@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-10-17
+
 ### Added
 
 - `Sink.end` (`Sink.End`): a transport ends a stream a request opened by an explicit act, never by canceling its task. stdio ends a `subscriptions/listen` stream when its client cancels it or the input ends, and the session's stream at the input's end, then waits for each to return; HTTP ends a `subscriptions/listen` stream when its client leaves, and a session's GET stream when the session is deleted (it ran on until the server closed). A lost cancellation can no longer hang a stream at shutdown.
