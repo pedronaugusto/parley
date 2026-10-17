@@ -268,7 +268,11 @@ takes one, else registered now as a native or web application), the scope
 (what the challenge names, else what the resource lists, what was granted
 before kept, `offline_access` where the server lists it), then tokens: kept
 ones, a refresh, or a sign-in with PKCE naming the resource, the application
-opening the URL. The request is sent again, once. A server that changes is a
+opening the URL. Without a user at the keyboard: the client's own
+credentials; MCP's enterprise-managed authorization, the user's token at the
+enterprise's identity provider exchanged there for an ID-JAG that the
+authorization server redeems; or a workload's identity token from its
+platform as the grant. The request is sent again, once. A server that changes is a
 new start: nothing the old one issued goes to it. `parley.oauth.Guard` is a
 server's side, an endpoint's `access`: every request held to a bearer token
 for this resource (a JWT checked against the authorization server's keys, or
@@ -319,8 +323,8 @@ over HTTP, by hand (`bay conformance-server -- --port 3000`, then `npx
 |---|---|---|---|
 | 2025-11-25 | server | 30 | 30 |
 | 2026-07-28 | server | 37 | 37, and the 10 tasks scenarios (not scored) |
-| 2025-11-25 | client | 18 | 18, and the client credentials scenarios (not scored) |
-| 2026-07-28 | client | 32 | 32, and the client credentials scenarios (not scored) |
+| 2025-11-25 | client | 18 | 18, and the client credentials, enterprise-managed authorization and workload identity scenarios (not scored) |
+| 2026-07-28 | client | 32 | 32, and the client credentials, enterprise-managed authorization and workload identity scenarios (not scored) |
 
 ## Licence
 

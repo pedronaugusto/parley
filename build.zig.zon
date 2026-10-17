@@ -29,8 +29,8 @@
             .lazy = true,
         },
         .clearance = .{
-            .url = "git+https://github.com/pedronaugusto/clearance?ref=v0.2.3#e98fab1ccdd29000441be12b9daa66898f86892b",
-            .hash = "clearance-0.2.3--QKm-GKaCgBt5Ua7sdDmjFepIe1u7NxWCa7DCmrMVlQJ",
+            .url = "git+https://github.com/pedronaugusto/clearance?ref=v0.3.0#06ef49b2c36da5952eb2f002270d0ce253cd5651",
+            .hash = "clearance-0.3.0--QKm-JHDCwDXvifUZNnxUmwyhaQc9c0A1Wb7_naGol2I",
             .lazy = true,
         },
         .conduit = .{

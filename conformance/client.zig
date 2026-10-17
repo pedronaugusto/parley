@@ -9,7 +9,10 @@
 //! for a token gets one as MCP's authorization lays out. The suite's
 //! authorization server redirects at once, so signing in is reading where
 //! the authorization URL redirects to. A scenario that registered the
-//! client beforehand gives its credentials in the context.
+//! client beforehand gives its credentials in the context; one for
+//! enterprise-managed authorization gives the identity provider and the
+//! user's ID token there, one for workload identity federation the
+//! workload's token.
 const std = @import("std");
 const parley = @import("parley");
 const http = @import("parley.http");
@@ -91,7 +94,21 @@ const Registration = struct {
     issuer: ?[]const u8 = null,
     private_key_pem: ?[]const u8 = null,
     signing_algorithm: ?[]const u8 = null,
+    /// Enterprise-managed authorization: the identity provider, the client
+    /// there, and the user's ID token from it.
+    idp_issuer: ?[]const u8 = null,
+    idp_token_endpoint: ?[]const u8 = null,
+    idp_client_id: ?[]const u8 = null,
+    idp_id_token: ?[]const u8 = null,
+    /// Workload identity federation: the workload's token.
+    valid_jwt: ?[]const u8 = null,
 };
+
+/// A token the context gave, as the authorizer asks for one.
+fn given(context: ?*anyopaque, _: Io, _: Allocator) oauth.Authorizer.SourceError![]const u8 {
+    const token: *const []const u8 = @ptrCast(@alignCast(context.?)); // safe: main passes a token from the context
+    return token.*;
+}
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -120,6 +137,15 @@ pub fn main(init: std.process.Init) !void {
         }
         credentials = &registered;
     }
+    var enterprise: ?oauth.Authorizer.Enterprise = null;
+    if (registration.idp_issuer) |issuer| enterprise = .{
+        .issuer = issuer,
+        .token_endpoint = registration.idp_token_endpoint,
+        .client = .{ .issuer = issuer, .client_id = registration.idp_client_id orelse return error.NoIdpClient },
+        .subject = .{ .context = @ptrCast(@constCast(&registration.idp_id_token.?)), .get = given }, // safe: given casts it back to this type
+    };
+    var assertion: ?oauth.Authorizer.TokenSource = null;
+    if (registration.valid_jwt) |*jwt| assertion = .{ .context = @ptrCast(@constCast(jwt)), .get = given }; // safe: given casts it back to this type
     var authorizer: oauth.Authorizer = .init(gpa, &web, url, .{
         .sign_in = .{ .context = &web, .open = signIn },
         .redirect_uri = "http://localhost:3000/callback",
@@ -127,8 +153,11 @@ pub fn main(init: std.process.Init) !void {
         .metadata_url = metadata_url,
         .registered = credentials,
         // A scenario that registered the client without a user: the
-        // client's own credentials.
-        .grant = if (std.mem.startsWith(u8, scenario, "auth/client-credentials")) .client_credentials else .authorization_code,
+        // client's own credentials; the identity provider's word for the
+        // user; the workload's own token.
+        .grant = if (std.mem.startsWith(u8, scenario, "auth/client-credentials")) .client_credentials else if (enterprise != null) .enterprise else if (assertion != null) .jwt_bearer else .authorization_code,
+        .enterprise = enterprise,
+        .assertion = assertion,
     });
     defer authorizer.deinit();
     var remote: http.Transport = .init(gpa, &web, url, .{ .authorization = authorizer.authorization() });
