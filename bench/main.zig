@@ -737,6 +737,23 @@ const Bench = struct {
         _ = try b.askProcess(.session, "tools/call", echo_params);
         try b.io.sleep(.fromSeconds(if (write) 1 else 0), .awake);
         const rest = try p.child.memory();
+        if (write) {
+            try out.print("{{\"row\":\"stdio/memory/at-rest\",\"current\":{d},\"peak\":{d},\"commit\":\"{s}\",\"cpu\":\"{s}\",\"os\":\"{s}\"}}\n", .{ rest.current, rest.peak, provenance.commit, provenance.cpu, provenance.os });
+            try out.flush();
+        }
+        // A server that cannot take the message is a row too: what failed.
+        b.echoLarge(p, size) catch |err| {
+            if (!write) return err;
+            try out.print("{{\"row\":\"stdio/memory/message\",\"message\":{d},\"failed\":\"{t}\",\"commit\":\"{s}\",\"cpu\":\"{s}\",\"os\":\"{s}\"}}\n", .{ size, err, provenance.commit, provenance.cpu, provenance.os });
+            return;
+        };
+        const large = try p.child.memory();
+        if (!write) return;
+        try out.print("{{\"row\":\"stdio/memory/message\",\"message\":{d},\"current\":{d},\"peak\":{d},\"commit\":\"{s}\",\"cpu\":\"{s}\",\"os\":\"{s}\"}}\n", .{ size, large.current, large.peak, provenance.commit, provenance.cpu, provenance.os });
+    }
+
+    /// One echo of `size` bytes of text, its answer read and passed over.
+    fn echoLarge(b: *Bench, p: *Process, size: usize) !void {
         const id = b.next;
         b.next += 1;
         const w = &p.input.interface;
@@ -750,17 +767,13 @@ const Bench = struct {
             if (p.output.interface.takeDelimiterInclusive('\n')) |line| {
                 if (answers(line, id)) {
                     if (line.len < size) return error.Unanswered;
-                    break;
+                    return;
                 }
             } else |err| switch (err) {
-                error.StreamTooLong => if (try p.output.interface.discardDelimiterInclusive('\n') >= size) break,
+                error.StreamTooLong => if (try p.output.interface.discardDelimiterInclusive('\n') >= size) return,
                 else => |e| return e,
             }
         }
-        const large = try p.child.memory();
-        if (!write) return;
-        try out.print("{{\"row\":\"stdio/memory/at-rest\",\"current\":{d},\"peak\":{d},\"commit\":\"{s}\",\"cpu\":\"{s}\",\"os\":\"{s}\"}}\n", .{ rest.current, rest.peak, provenance.commit, provenance.cpu, provenance.os });
-        try out.print("{{\"row\":\"stdio/memory/message\",\"message\":{d},\"current\":{d},\"peak\":{d},\"commit\":\"{s}\",\"cpu\":\"{s}\",\"os\":\"{s}\"}}\n", .{ size, large.current, large.peak, provenance.commit, provenance.cpu, provenance.os });
     }
 };
 
