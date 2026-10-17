@@ -58,7 +58,109 @@ pub const Tool = struct {
     /// The `Tool` object, as `tools/list` writes it.
     listed: []const u8,
     handler: ToolHandler,
+    /// The arguments its schema mirrors into `Mcp-Param-{name}` headers.
+    headers: []const HeaderParam = &.{},
 };
+
+/// An argument a tool's input schema marks with `x-mcp-header`: an HTTP
+/// client sends its value as `Mcp-Param-{name}` too, and the server holds
+/// the two to each other.
+pub const HeaderParam = struct {
+    /// The header's name after `Mcp-Param-`.
+    name: []const u8,
+    /// The argument's place: the property names from the root.
+    path: []const []const u8,
+    kind: Kind,
+
+    pub const Kind = enum { string, integer, boolean };
+};
+
+/// The `x-mcp-header` marks of an input schema, on `gpa`, or
+/// `error.InvalidSchema` for a mark 2026-07-28 does not allow: not a token,
+/// two that differ only in case, on a property that is not a string, an
+/// integer or a boolean, or reached other than through `properties`.
+pub fn headerParams(gpa: Allocator, schema: []const u8) (Allocator.Error || error{InvalidSchema})![]const HeaderParam {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const root = strand.json.parseLeaky(strand.json.Value, arena.allocator(), schema, .{}) catch return error.InvalidSchema;
+    var found: std.ArrayList(HeaderParam) = .empty;
+    errdefer freeHeaderParams(gpa, found.items);
+    try collectHeaders(gpa, &found, root, &.{});
+    if (!marksBelowProperties(root, false)) return error.InvalidSchema;
+    for (found.items, 0..) |a, i| for (found.items[0..i]) |b| {
+        if (std.ascii.eqlIgnoreCase(a.name, b.name)) return error.InvalidSchema;
+    };
+    return found.toOwnedSlice(gpa);
+}
+
+pub fn freeHeaderParams(gpa: Allocator, params: []const HeaderParam) void {
+    for (params) |p| {
+        gpa.free(p.name);
+        for (p.path) |step| gpa.free(step);
+        gpa.free(p.path);
+    }
+}
+
+fn get(object: anytype, key: []const u8) ?strand.json.Value {
+    for (object) |m| if (std.mem.eql(u8, m.key, key)) return m.value;
+    return null;
+}
+
+fn collectHeaders(gpa: Allocator, found: *std.ArrayList(HeaderParam), schema: strand.json.Value, path: []const []const u8) (Allocator.Error || error{InvalidSchema})!void {
+    if (schema != .object) return;
+    const properties = get(schema.object, "properties") orelse return;
+    if (properties != .object) return;
+    for (properties.object) |p| {
+        if (p.value != .object) continue;
+        const here = try std.mem.concat(gpa, []const u8, &.{ path, &.{p.key} });
+        defer gpa.free(here);
+        if (get(p.value.object, "x-mcp-header")) |mark| {
+            if (mark != .string or !token(mark.string)) return error.InvalidSchema;
+            const t = get(p.value.object, "type") orelse return error.InvalidSchema;
+            if (t != .string) return error.InvalidSchema;
+            const kind = std.meta.stringToEnum(HeaderParam.Kind, t.string) orelse return error.InvalidSchema;
+            const steps = try gpa.alloc([]const u8, here.len);
+            for (steps, here) |*step, name| step.* = try gpa.dupe(u8, name);
+            try found.append(gpa, .{ .name = try gpa.dupe(u8, mark.string), .path = steps, .kind = kind });
+        }
+        try collectHeaders(gpa, found, p.value, here);
+    }
+}
+
+/// Whether every `x-mcp-header` in `schema` is reached through
+/// `properties` alone (`under` says whether `schema` itself was).
+fn marksBelowProperties(schema: strand.json.Value, under: bool) bool {
+    switch (schema) {
+        .object => |object| {
+            for (object) |m| {
+                if (std.mem.eql(u8, m.key, "x-mcp-header") and !under) return false;
+                if (std.mem.eql(u8, m.key, "properties")) {
+                    if (m.value == .object) for (m.value.object) |p| {
+                        if (!marksBelowProperties(p.value, true)) return false;
+                    };
+                    continue;
+                }
+                if (!marksBelowProperties(m.value, false)) return false;
+            }
+            return true;
+        },
+        .array => |items| {
+            for (items) |item| if (!marksBelowProperties(item, false)) return false;
+            return true;
+        },
+        else => return true,
+    }
+}
+
+/// RFC 9110's `1*tchar`.
+fn token(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| {
+        const ok = std.ascii.isAlphanumeric(c) or std.mem.findScalar(u8, "!#$%&'*+-.^_`|~", c) != null;
+        if (!ok) return false;
+    }
+    return true;
+}
 
 pub const ResourceSpec = struct {
     uri: []const u8,

@@ -11,7 +11,6 @@
 const std = @import("std");
 const aegis = @import("aegis");
 const wire = @import("wire.zig");
-const Sink = @import("context.zig").Sink;
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;

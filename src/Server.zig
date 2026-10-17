@@ -153,6 +153,10 @@ pub fn deinit(s: *Server) void {
 }
 
 fn freeEntry(s: *Server, entry: anytype) void {
+    if (@TypeOf(entry) == *registry.Tool) {
+        registry.freeHeaderParams(s.gpa, entry.headers);
+        s.gpa.free(entry.headers);
+    }
     inline for (@typeInfo(@TypeOf(entry.*)).@"struct".field_names) |name| {
         const F = @FieldType(@TypeOf(entry.*), name);
         if (F == []const u8) s.gpa.free(@field(entry, name));
@@ -193,8 +197,30 @@ fn addToolWith(s: *Server, io: Io, spec: registry.ToolSpec, input: []const u8, o
     errdefer s.gpa.free(name);
     const listed = try registry.listTool(s.gpa, spec, input, output);
     errdefer s.gpa.free(listed);
-    tool.* = .{ .name = name, .listed = listed, .handler = handler };
+    const params = try registry.headerParams(s.gpa, input);
+    errdefer {
+        registry.freeHeaderParams(s.gpa, params);
+        s.gpa.free(params);
+    }
+    tool.* = .{ .name = name, .listed = listed, .handler = handler, .headers = params };
     try s.insert(io, .tools, &s.tools, tool, name);
+}
+
+/// The `x-mcp-header` marks of the tool named `name`, copied onto `arena`;
+/// null when there is no such tool.
+pub fn toolHeaders(s: *Server, io: Io, arena: Allocator, name: []const u8) (Allocator.Error || Io.Cancelable)!?[]const registry.HeaderParam {
+    try s.lock.lockShared(io);
+    defer s.lock.unlockShared(io);
+    for (s.tools.items) |t| if (std.mem.eql(u8, t.name, name)) {
+        const out = try arena.alloc(registry.HeaderParam, t.headers.len);
+        for (out, t.headers) |*o, h| {
+            const path = try arena.alloc([]const u8, h.path.len);
+            for (path, h.path) |*p, step| p.* = try arena.dupe(u8, step);
+            o.* = .{ .name = try arena.dupe(u8, h.name), .path = path, .kind = h.kind };
+        }
+        return out;
+    };
+    return null;
 }
 
 /// Removes the tool named `name`; false when there is none.
@@ -577,7 +603,7 @@ fn listPage(s: *Server, io: Io, arena: Allocator, comptime which: List, params: 
     r.w().writeByte(']') catch return error.OutOfMemory;
     if (i < items.len) {
         var buffer: [32]u8 = undefined;
-        try r.field("nextCursor", std.fmt.bufPrint(&buffer, "{d}.{d}", .{ generation, i }) catch unreachable); // unreachable: two integers fit 32 bytes
+        try r.field("nextCursor", std.mem.print(&buffer, "{d}.{d}", .{ generation, i }) catch unreachable); // unreachable: two integers fit 32 bytes
     }
     return .{ .result = try r.end(s, hint, s.options.filter != null) };
 }
@@ -639,7 +665,8 @@ fn inputRequired(s: *Server, io: Io, arena: Allocator, call: *Call, method: []co
     if (call.pending.items.len > s.options.limits.input_requests) return failure(.internal_error, "the handler asked for more input than the server allows at once");
     var sealed: ?[]const u8 = null;
     if (call.state_out) |payload| {
-        if (payload.len > s.options.limits.state.raw()) return failure(.internal_error, "the handler's state is past the server's limit");
+        const size: aegis.units.Bytes(u32) = .fromRaw(std.math.cast(u32, payload.len) orelse std.math.maxInt(u32));
+        if (size.compare(s.options.limits.state) == .gt) return failure(.internal_error, "the handler's state is past the server's limit");
         sealed = s.sealer.seal(io, arena, .{ .principal = call.context.principal, .method = method, .subject = subject }, payload) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Canceled => return error.Canceled,
@@ -835,19 +862,18 @@ fn complete(s: *Server, io: Io, arena: Allocator, request: wire.Request, context
     const completer = s.completer orelse return failure(.method_not_found, "Method not found");
     const p = try parseParams(types.CompleteParams, arena, request.params) orelse return failure(.invalid_params, "params are not what the schema says");
     var call = newCall(io, arena, request, context, sink, .{ .responses = null, .state = null });
-    const completion = completer.complete(completer.context, &call, p) catch |err| switch (err) {
+    const completion: types.Completion = completer.complete(completer.context, &call, p) catch |err| switch (err) {
         error.NotFound => return failure(.invalid_params, "nothing to complete there"),
         else => |e| return s.outcome(io, arena, &call, e, request.method, ""),
     };
     var out: Result = .begin(arena, context.revision);
     // At most 100 values in one answer (2025-11-25 completion: MUST NOT exceed).
-    var c = completion;
-    if (c.values.len > 100) {
-        c.has_more = true;
-        c.total = c.total orelse c.values.len;
-        c.values = c.values[0..100];
-    }
-    try out.field("completion", c);
+    const capped = completion.values.len > 100;
+    try out.field("completion", types.Completion{
+        .values = if (capped) completion.values[0..100] else completion.values,
+        .total = if (capped) completion.total orelse completion.values.len else completion.total,
+        .has_more = if (capped) true else completion.has_more,
+    });
     return .{ .result = try out.end(s, null, false) };
 }
 

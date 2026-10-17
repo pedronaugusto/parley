@@ -4,7 +4,6 @@
 const std = @import("std");
 const strand = @import("strand");
 const types = @import("types.zig");
-const Revision = @import("revision.zig").Revision;
 
 const json = strand.json;
 const Allocator = std.mem.Allocator;

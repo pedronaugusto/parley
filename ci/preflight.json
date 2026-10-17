@@ -4,7 +4,8 @@
   ],
   "test_roots": [
     "src/tests.zig",
-    "src/property_test.zig"
+    "src/property_test.zig",
+    "src/http/tests.zig"
   ],
   "test_support": [
     "src/testing/**"
@@ -12,14 +13,30 @@
   "test_dependencies": [
     "shakedown"
   ],
+  "shipped": {},
   "function_exceptions": {},
   "layout_exceptions": {},
   "docs": {
-    "zig build docs -- usage": {
+    "zig build docs -- server": {
       "source": "examples/usage.zig",
-      "region": "usage",
+      "region": "server",
       "imports": [
         "parley"
+      ]
+    },
+    "zig build docs -- stdio": {
+      "source": "examples/usage.zig",
+      "region": "stdio",
+      "imports": [
+        "parley"
+      ]
+    },
+    "zig build docs -- http": {
+      "source": "examples/usage.zig",
+      "region": "http",
+      "imports": [
+        "http",
+        "uplink"
       ]
     }
   },

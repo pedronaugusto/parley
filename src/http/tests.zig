@@ -5,6 +5,10 @@ const parley = @import("parley");
 const uplink = @import("uplink");
 const Endpoint = @import("Endpoint.zig");
 
+test {
+    _ = @import("headers.zig");
+}
+
 const testing = std.testing;
 const Io = std.Io;
 const Call = parley.Call;
@@ -51,6 +55,7 @@ const Harness = struct {
     fn stop(h: *Harness, io: Io) void {
         h.client.deinit(io);
         h.http.shutdown(io);
+        // glint-ignore: Z026 -- serve ends with the shutdown; its result is not what the test checks
         h.serving.await(io) catch {};
         h.http.deinit(io);
         h.listener.deinit(io);
@@ -62,7 +67,7 @@ const Harness = struct {
 
     fn post(h: *Harness, io: Io, arena: std.mem.Allocator, body: []const u8, extra: []const uplink.Header) !Answer {
         var url_buffer: [64]u8 = undefined;
-        const url = try std.fmt.bufPrint(&url_buffer, "http://127.0.0.1:{d}/mcp", .{h.port});
+        const url = try std.mem.print(&url_buffer, "http://127.0.0.1:{d}/mcp", .{h.port});
         var fields: std.ArrayList(uplink.Header) = .empty;
         try fields.appendSlice(arena, &.{
             .{ .name = "Content-Type", .value = "application/json" },

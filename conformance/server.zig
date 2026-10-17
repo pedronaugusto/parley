@@ -58,11 +58,11 @@ fn withProgress(call: *Call) Call.Error!ToolResult {
     var step: u32 = 0;
     while (step <= 100) : (step += 50) {
         if (step != 0) call.io.sleep(.fromMilliseconds(50), .awake) catch return error.Canceled;
-        try call.progress(@floatFromInt(step), 100, try std.fmt.allocPrint(call.arena, "Completed step {d} of 100", .{step}));
+        try call.progress(@floatFromInt(step), 100, try call.arena.print("Completed step {d} of 100", .{step}));
     }
     const token = call.context.progress_token orelse return .ofText("0");
     return .ofText(switch (token) {
-        .integer => |n| try std.fmt.allocPrint(call.arena, "{d}", .{n}),
+        .integer => |n| try call.arena.print("{d}", .{n}),
         .string => |s| s,
     });
 }
@@ -81,7 +81,7 @@ fn sampling(call: *Call, args: struct { prompt: []const u8 }) Call.Error!ToolRes
     const answer = try call.sample("sample", .{ .messages = messages, .max_tokens = 100 }) orelse return error.InputRequired;
     const Text = struct { text: ?[]const u8 = null };
     const said = strand.json.parseLeaky(Text, call.arena, answer.content.bytes, parley.types.read_options) catch Text{};
-    return .ofText(try std.fmt.allocPrint(call.arena, "LLM response: {s}", .{said.text orelse "No response"}));
+    return .ofText(try call.arena.print("LLM response: {s}", .{said.text orelse "No response"}));
 }
 
 fn elicitation(call: *Call, args: struct { message: []const u8 }) Call.Error!ToolResult {
@@ -89,12 +89,12 @@ fn elicitation(call: *Call, args: struct { message: []const u8 }) Call.Error!Too
         .message = args.message,
         .requested_schema = .{ .bytes = "{\"type\":\"object\",\"properties\":{\"response\":{\"type\":\"string\",\"description\":\"User's response\"}},\"required\":[\"response\"]}" },
     } }) orelse return error.InputRequired;
-    return .ofText(try std.fmt.allocPrint(call.arena, "User response: action={t}, content={s}", .{ answer.action, if (answer.content) |c| c.bytes else "{}" }));
+    return .ofText(try call.arena.print("User response: action={t}, content={s}", .{ answer.action, if (answer.content) |c| c.bytes else "{}" }));
 }
 
 fn elicitWith(call: *Call, message: []const u8, schema: []const u8) Call.Error!ToolResult {
     const answer = try call.elicit("form", .{ .form = .{ .message = message, .requested_schema = .{ .bytes = schema } } }) orelse return error.InputRequired;
-    return .ofText(try std.fmt.allocPrint(call.arena, "Elicitation completed: action={t}, content={s}", .{ answer.action, if (answer.content) |c| c.bytes else "{}" }));
+    return .ofText(try call.arena.print("Elicitation completed: action={t}, content={s}", .{ answer.action, if (answer.content) |c| c.bytes else "{}" }));
 }
 
 fn elicitDefaults(call: *Call) Call.Error!ToolResult {
@@ -112,7 +112,7 @@ fn elicitEnums(call: *Call) Call.Error!ToolResult {
 // Multi round-trip requests (2026-07-28).
 
 fn text(call: *Call, comptime format: []const u8, args: anytype) Call.Error!ToolResult {
-    return .ofText(try std.fmt.allocPrint(call.arena, format, args));
+    return .ofText(try call.arena.print(format, args));
 }
 
 /// A field of an elicitation's accepted content, or "unknown".
@@ -212,7 +212,7 @@ fn mrtrMultiRound(call: *Call) Call.Error!ToolResult {
         .message = "Step 2: What is your favorite color?",
         .requested_schema = .{ .bytes = "{\"type\":\"object\",\"properties\":{\"color\":{\"type\":\"string\"}},\"required\":[\"color\"]}" },
     } });
-    try call.setState(try std.fmt.allocPrint(call.arena, "round-2:{s}", .{field(call, first, "name")}));
+    try call.setState(try call.arena.print("round-2:{s}", .{field(call, first, "name")}));
     return error.InputRequired;
 }
 
@@ -332,7 +332,7 @@ fn watched(_: ?*anyopaque, call: *Call, uri: []const u8) Call.Error!parley.ReadR
 fn templated(_: ?*anyopaque, call: *Call, uri: []const u8) Call.Error!parley.ReadResult {
     const prefix = "test://template/";
     const id = uri[prefix.len .. uri.len - "/data".len];
-    const body = try std.fmt.allocPrint(call.arena, "{{\"id\":\"{s}\",\"templateTest\":true,\"data\":\"Data for ID: {s}\"}}", .{ id, id });
+    const body = try call.arena.print("{{\"id\":\"{s}\",\"templateTest\":true,\"data\":\"Data for ID: {s}\"}}", .{ id, id });
     return .{ .contents = try call.arena.dupe(types.ResourceContents, &.{.{ .uri = uri, .mime_type = "application/json", .text = body }}) };
 }
 
@@ -345,7 +345,7 @@ fn simplePrompt(_: *Call) error{}!parley.PromptResult {
 }
 
 fn promptWithArguments(call: *Call, args: struct { arg1: []const u8, arg2: []const u8 }) Call.Error!parley.PromptResult {
-    const t = try std.fmt.allocPrint(call.arena, "Prompt with arguments: arg1='{s}', arg2='{s}'", .{ args.arg1, args.arg2 });
+    const t = try call.arena.print("Prompt with arguments: arg1='{s}', arg2='{s}'", .{ args.arg1, args.arg2 });
     return .{ .messages = try call.arena.dupe(types.PromptMessage, &.{.{ .role = .user, .content = .ofText(t) }}) };
 }
 
@@ -368,7 +368,7 @@ fn promptInputRequired(call: *Call) Call.Error!parley.PromptResult {
         .message = "What context should the prompt use?",
         .requested_schema = .{ .bytes = "{\"type\":\"object\",\"properties\":{\"context\":{\"type\":\"string\"}},\"required\":[\"context\"]}" },
     } }) orelse return error.InputRequired;
-    const t = try std.fmt.allocPrint(call.arena, "Prompt with context: {s}", .{field(call, answer, "context")});
+    const t = try call.arena.print("Prompt with context: {s}", .{field(call, answer, "context")});
     return .{ .messages = try call.arena.dupe(types.PromptMessage, &.{.{ .role = .user, .content = .ofText(t) }}) };
 }
 
@@ -415,6 +415,9 @@ pub fn main(init: std.process.Init) !void {
     try server.addTool(io, .{ .name = "test_elicitation_sep1034_defaults", .description = "Tests elicitation with default values per SEP-1034" }, elicitDefaults);
     try server.addTool(io, .{ .name = "test_elicitation_sep1330_enums", .description = "Tests elicitation with enum schema improvements per SEP-1330" }, elicitEnums);
     try server.addDynamicTool(io, .{ .name = "json_schema_2020_12_tool", .description = "Tool with JSON Schema 2020-12 features", .input_schema = json_schema_2020_12 }, .{ .call = jsonSchemaTool });
+    try server.addDynamicTool(io, .{ .name = "test_custom_headers", .description = "Mirrors its region into a header (x-mcp-header)", .input_schema =
+        \\{"type":"object","properties":{"region":{"type":"string","description":"The region to run in","x-mcp-header":"Region"},"query":{"type":"string"}},"required":["region"]}
+    }, .{ .call = jsonSchemaTool });
     try server.addTool(io, .{ .name = "test_missing_capability", .description = "Test tool requiring sampling" }, missingCapability);
     try server.addTool(io, .{ .name = "test_input_required_result_elicitation", .description = "MRTR: returns InputRequiredResult with elicitation request" }, mrtrElicitation);
     try server.addTool(io, .{ .name = "test_input_required_result_sampling", .description = "MRTR: returns InputRequiredResult with sampling request" }, mrtrSampling);

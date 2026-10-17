@@ -81,6 +81,7 @@ test "a line past the limit is refused and the next one read" {
 }
 
 fn serveTask(io: std.Io, server: *parley.Server, in: *Pipe, out: *Pipe) void {
+    // glint-ignore: Z026 -- the test reads what was written; how the serving ended is not what it checks
     stdio.serve(io, testing.allocator, server, &in.reader, &out.writer, .{}) catch {};
     out.close();
 }

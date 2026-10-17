@@ -32,7 +32,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "parley", .module = parley },
         },
     });
-    if (b.lazyDependency("uplink", .{ .target = target, .optimize = optimize })) |uplink| http.addImport("uplink", uplink.module("uplink"));
+    if (b.dependencyLazy("uplink", .{ .target = target, .optimize = optimize })) |uplink| http.addImport("uplink", uplink.module("uplink")) else |_| {}
 }
 
 /// parley's development: its tests, its properties, the example and the
@@ -80,7 +80,11 @@ pub fn dev(b: *std.Build, tools: type) void {
             .root_source_file = p.path("examples/usage.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "parley", .module = module }},
+            .imports = &.{
+                .{ .name = "parley", .module = module },
+                .{ .name = "parley.http", .module = package.module("parley.http") },
+                .{ .name = "uplink", .module = uplink_package.module("uplink") },
+            },
         }),
     });
     const examples = b.step("examples", "Build and run the usage example");

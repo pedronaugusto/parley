@@ -6,8 +6,6 @@
 //!   stream), one message a line.
 //! - `wire`: JSON-RPC 2.0 as MCP speaks it, read and written without I/O.
 //! - `types`: MCP's data.
-const std = @import("std");
-
 pub const wire = @import("wire.zig");
 pub const types = @import("types.zig");
 pub const Revision = @import("revision.zig").Revision;

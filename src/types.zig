@@ -3,7 +3,6 @@
 //! revision does not know is left off what is written for it (absent fields
 //! are null and written with `nulls = .omit`), and what a peer sends is read
 //! with unknown fields passed over, as MCP asks of both sides.
-const std = @import("std");
 const strand = @import("strand");
 
 const Raw = strand.json.Raw;

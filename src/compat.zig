@@ -203,6 +203,7 @@ pub const Session = struct {
     pub fn initialized(s: *Session, io: Io) void {
         s.mutex.lockUncancelable(io);
         defer s.mutex.unlock(io);
+        // glint-ignore: Z026 -- an initialized notice outside the handshake changes nothing; the session goes on as it is
         _ = s.lifecycle.step(.initialized) catch {};
     }
 

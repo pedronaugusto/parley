@@ -127,6 +127,7 @@ test "the session's own methods: ping, the log level, subscriptions; requests be
 }
 
 fn serveTask(io: std.Io, server: *parley.Server, in: *Pipe, out: *Pipe) void {
+    // glint-ignore: Z026 -- the test reads what was written; how the serving ended is not what it checks
     stdio.serve(io, testing.allocator, server, &in.reader, &out.writer, .{}) catch {};
     out.close();
 }
@@ -158,7 +159,7 @@ test "input the handler asks for goes to the client as the server's request, and
     const id_start = std.mem.find(u8, asked, "\"id\":").? + 5;
     const id_end = std.mem.findScalarPos(u8, asked, id_start, ',').?;
     var answer_buffer: [256]u8 = undefined;
-    const answer = try std.fmt.bufPrint(&answer_buffer, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"action\":\"accept\",\"content\":{{\"name\":\"ada\"}}}}}}\n", .{asked[id_start..id_end]});
+    const answer = try std.mem.print(&answer_buffer, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"action\":\"accept\",\"content\":{{\"name\":\"ada\"}}}}}}\n", .{asked[id_start..id_end]});
     try in.write(answer);
     const done = try readLine(&out);
     try expectContains(done, "\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"name\\\":\\\"ada\\\"}\"}]}");

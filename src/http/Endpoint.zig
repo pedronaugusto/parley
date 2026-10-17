@@ -146,7 +146,7 @@ fn handle(e: *Endpoint, io: Io, request: *Request, response: *Response) anyerror
         },
     };
 
-    if (try e.mismatch(arena, request, req)) |why|
+    if (try e.mismatch(io, arena, request, req)) |why|
         return refuse(io, response, .bad_request, req.id, .header_mismatch, why);
 
     const principal = if (e.options.principal) |p| p.of(p.context, request) else null;
@@ -298,7 +298,9 @@ fn openStream(e: *Endpoint, io: Io, response: *Response, session_id: ?[]const u8
     var stream: Stream = .{ .io = io, .response = response };
     // The head goes now: the client learns the stream is open.
     stream.keepAlive(io) catch return;
+    // glint-ignore: Z026 -- the stream ends when its client leaves or the server closes; either way there is nothing to answer
     entry.session.stream(io, stream.sink(e)) catch {};
+    // glint-ignore: Z026 -- the stream was the answer; a client gone before its end needs no more
     response.end(io) catch {};
 }
 
@@ -328,8 +330,7 @@ fn statusOf(f: parley.Server.Failure) std.http.Status {
 }
 
 /// Why the headers disagree with the body, or null when they agree.
-fn mismatch(e: *Endpoint, arena: Allocator, request: *const Request, req: wire.Request) Allocator.Error!?[]const u8 {
-    _ = e;
+fn mismatch(e: *Endpoint, io: Io, arena: Allocator, request: *const Request, req: wire.Request) Allocator.Error!?[]const u8 {
     const m = parley.meta.read(arena, req.params) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         // The core refuses params that are not what the schema says.
@@ -352,7 +353,60 @@ fn mismatch(e: *Endpoint, arena: Allocator, request: *const Request, req: wire.R
             error.Invalid => return "Mcp-Name holds a value no header holds",
         };
         if (!std.mem.eql(u8, given, expected)) return "Mcp-Name does not match the body";
+        if (std.mem.eql(u8, req.method, "tools/call")) return e.paramMismatch(io, arena, request, req, expected);
     }
+    return null;
+}
+
+/// Why the tool's `Mcp-Param-*` headers disagree with its arguments, or
+/// null when they agree (2026-07-28 streamable-http, custom headers).
+fn paramMismatch(e: *Endpoint, io: Io, arena: Allocator, request: *const Request, req: wire.Request, tool: []const u8) Allocator.Error!?[]const u8 {
+    const params = e.server.toolHeaders(io, arena, tool) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Canceled => return null,
+    } orelse return null;
+    const arguments = rawMember(req.params, "arguments");
+    for (params) |p| {
+        const header_name = try std.mem.concat(arena, u8, &.{ headers.param_prefix, p.name });
+        const header = request.headers.get(header_name);
+        const value = if (arguments) |a| at(a, p.path) else null;
+        const present = if (value) |v| !std.mem.eql(u8, v, "null") else false;
+        if (!present) continue;
+        const raw = header orelse return try arena.print("{s} is missing", .{header_name});
+        const given = headers.decode(arena, raw) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Invalid => return try arena.print("{s} holds a value no header holds", .{header_name}),
+        };
+        const v = value.?;
+        const same = switch (p.kind) {
+            .string => if (@import("strand").json.parseLeaky([]const u8, arena, v, .{})) |text| std.mem.eql(u8, text, given) else |_| false,
+            .boolean => std.mem.eql(u8, v, given),
+            .integer => numericallyEqual(v, given),
+        };
+        if (!same) return try arena.print("{s} does not match the argument", .{header_name});
+    }
+    return null;
+}
+
+/// Whether two integers' spellings name one number (`42` and `42.0`).
+fn numericallyEqual(a: []const u8, b: []const u8) bool {
+    const x = std.fmt.parseFloat(f64, a) catch return false;
+    const y = std.fmt.parseFloat(f64, b) catch return false;
+    return x == y;
+}
+
+/// The value at `path` (property names) in the JSON object `object`.
+fn at(object: []const u8, path: []const []const u8) ?[]const u8 {
+    var current = object;
+    for (path) |step| current = rawMember(current, step) orelse return null;
+    return current;
+}
+
+fn rawMember(object: ?[]const u8, name: []const u8) ?[]const u8 {
+    const bytes = object orelse return null;
+    var members: @import("strand").json.Members = undefined;
+    members.init(bytes, .{});
+    while (members.next() catch return null) |m| if (m.is(name)) return m.value;
     return null;
 }
 
@@ -463,7 +517,7 @@ const Stream = struct {
 
     fn send(context: *anyopaque, io: Io, message: []const u8) parley.Sink.SendError!void {
         _ = io;
-        const s: *Stream = @ptrCast(@alignCast(context));
+        const s: *Stream = @ptrCast(@alignCast(context)); // safe: the sink was made from this stream
         s.event(message) catch |err| return switch (err) {
             error.Canceled => error.Canceled,
             error.OutOfMemory => error.OutOfMemory,
@@ -473,7 +527,7 @@ const Stream = struct {
 
     fn keepAliveFn(context: *anyopaque, io: Io) parley.Sink.SendError!void {
         _ = io;
-        const s: *Stream = @ptrCast(@alignCast(context));
+        const s: *Stream = @ptrCast(@alignCast(context)); // safe: the sink was made from this stream
         const w = s.begin() catch |err| return switch (err) {
             error.Canceled => error.Canceled,
             else => error.Closed,

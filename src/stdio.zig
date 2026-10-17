@@ -175,6 +175,7 @@ const Connection = struct {
 
     fn endSession(c: *Connection) void {
         if (c.session_stream) |*task| {
+            // glint-ignore: Z026 -- the session stream ends with the connection; its result says nothing more
             _ = task.cancel(c.io) catch {};
             c.session_stream = null;
         }
@@ -201,7 +202,7 @@ const Connection = struct {
 
     fn sendLine(context: *anyopaque, io: Io, message: []const u8) Sink.SendError!void {
         _ = io;
-        const c: *Connection = @ptrCast(@alignCast(context));
+        const c: *Connection = @ptrCast(@alignCast(context)); // safe: the sink was made from this connection
         c.send(message) catch |err| return switch (err) {
             error.Canceled => error.Canceled,
             error.WriteFailed => error.Closed,
@@ -354,6 +355,7 @@ const Job = struct {
         const reply = result catch |err| switch (err) {
             error.Canceled => return,
             error.OutOfMemory => {
+                // glint-ignore: Z026 -- the answer could not be made and the refusal could not be written: the stream is gone
                 c.writeFailure(job.request.id, .internal_error, "out of memory") catch {};
                 return;
             },
@@ -368,9 +370,11 @@ const Job = struct {
             .failure => |f| wire.writeFailure(&out.writer, job.request.id, f.code, f.message, f.data),
         };
         written catch {
+            // glint-ignore: Z026 -- the answer could not be made and the refusal could not be written: the stream is gone
             c.writeFailure(job.request.id, .internal_error, "out of memory") catch {};
             return;
         };
+        // glint-ignore: Z026 -- a stream that cannot be written is gone; the reader sees its end
         c.send(out.written()) catch {};
     }
 
@@ -380,7 +384,7 @@ const Job = struct {
 
     fn sendFn(context: *anyopaque, io: Io, message: []const u8) Sink.SendError!void {
         _ = io;
-        const job: *Job = @ptrCast(@alignCast(context));
+        const job: *Job = @ptrCast(@alignCast(context)); // safe: the sink was made from this job
         if (job.canceled.load(.acquire)) return error.Canceled;
         job.conn.send(message) catch |err| return switch (err) {
             error.Canceled => error.Canceled,

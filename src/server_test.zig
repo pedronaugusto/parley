@@ -72,7 +72,7 @@ fn greet(call: *Call) Call.Error!parley.ToolResult {
     if (!std.mem.eql(u8, call.state() orelse "", "round-1")) return error.InvalidInput;
     const Content = struct { name: []const u8 };
     const content = strand.json.parseLeaky(Content, call.arena, answer.content.?.bytes, .{}) catch return error.InvalidInput;
-    return .ofText(try std.fmt.allocPrint(call.arena, "hello {s}", .{content.name}));
+    return .ofText(try call.arena.print("hello {s}", .{content.name}));
 }
 
 fn sampleIt(call: *Call) Call.Error!parley.ToolResult {
@@ -227,15 +227,15 @@ test "input across rounds: asked, retried with the answer and the sealed state, 
     const parsed = try strand.json.parseLeaky(Answer, a, first, .{ .ignore_unknown_fields = true });
     const sealed = parsed.result.requestState;
     try testing.expect(std.mem.find(u8, sealed, "round-1") == null);
-    const retry = try std.fmt.allocPrint(a, "{{\"name\":\"greet\",\"inputResponses\":{{\"name\":{{\"action\":\"accept\",\"content\":{{\"name\":\"ada\"}}}}}},\"requestState\":\"{s}\",{s}}}", .{ sealed, meta });
+    const retry = try a.print("{{\"name\":\"greet\",\"inputResponses\":{{\"name\":{{\"action\":\"accept\",\"content\":{{\"name\":\"ada\"}}}}}},\"requestState\":\"{s}\",{s}}}", .{ sealed, meta });
     const done = try ask(&s, a, &r, "tools/call", retry);
     try expectContains(done, "\"text\":\"hello ada\"");
     // The same state on another tool, or changed, is refused.
-    const elsewhere = try std.fmt.allocPrint(a, "{{\"name\":\"echo\",\"arguments\":{{\"text\":\"x\"}},\"requestState\":\"{s}\",{s}}}", .{ sealed, meta });
+    const elsewhere = try a.print("{{\"name\":\"echo\",\"arguments\":{{\"text\":\"x\"}},\"requestState\":\"{s}\",{s}}}", .{ sealed, meta });
     try expectContains(try ask(&s, a, &r, "tools/call", elsewhere), "\"code\":-32602");
     const changed = try a.dupe(u8, sealed);
     changed[changed.len / 2] = if (changed[changed.len / 2] == 'A') 'B' else 'A';
-    const tampered = try std.fmt.allocPrint(a, "{{\"name\":\"greet\",\"inputResponses\":{{\"name\":{{\"action\":\"accept\",\"content\":{{\"name\":\"ada\"}}}}}},\"requestState\":\"{s}\",{s}}}", .{ changed, meta });
+    const tampered = try a.print("{{\"name\":\"greet\",\"inputResponses\":{{\"name\":{{\"action\":\"accept\",\"content\":{{\"name\":\"ada\"}}}}}},\"requestState\":\"{s}\",{s}}}", .{ changed, meta });
     try expectContains(try ask(&s, a, &r, "tools/call", tampered), "\"code\":-32602");
     // An answer that is not an elicitation's is a protocol error.
     const wrong = try ask(&s, a, &r, "tools/call", "{\"name\":\"greet\",\"inputResponses\":{\"name\":12345}," ++ meta ++ "}");

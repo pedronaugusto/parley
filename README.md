@@ -1,75 +1,184 @@
 # parley
 
-parley is the Model Context Protocol (MCP) for Zig: servers and clients, a
-stateless core on the 2026-07-28 revision with the 2025-11-25 handshake served
-above it, over stdio and Streamable HTTP. It is for any Zig program that gives
-tools, resources and prompts to a model, or uses them.
+parley is the Model Context Protocol (MCP) for Zig: servers and clients. Its
+core answers one request with one reply, statelessly, as the 2026-07-28
+revision has it; the session revisions before it (2025-11-25 and 2025-06-18,
+which Codex and Claude Code speak today) are served above the core, from the
+same handlers. Transports: stdio, and Streamable HTTP on
+[uplink](https://github.com/pedronaugusto/uplink).
 
-Work in progress toward the public cut: the JSON-RPC layer is built; the
-server, the transports and the client are not yet.
+Work in progress toward the public cut: the server is built; the client and
+the tasks extension are not yet.
 
 ## Install
 
 Requires Zig 0.17.0. Fetch with `zig fetch --save
-git+https://github.com/pedronaugusto/parley`, then take the `parley` module
-through `b.dependency` and add it to your executable's imports. At run time
-parley depends on std, on strand (JSON) and on aegis, a std-only library of
-checked types.
+git+https://github.com/pedronaugusto/parley`, then take the `parley` module,
+and `parley.http` for Streamable HTTP, through `b.dependency` and add them to
+your executable's imports. `parley` depends on std, strand (JSON) and aegis (a
+std-only library of checked types); `parley.http` adds uplink, which is fetched
+only when it is built: a server that speaks stdio alone passes `.http = false`
+to `b.dependency` and fetches no uplink.
 
 ## Usage
 
-`wire` reads a JSON-RPC message off its bytes and tells it apart without
-reading what it carries, and writes one around bytes its caller produces:
+A server offers tools, resources and prompts. A tool's handler takes its
+arguments as a Zig struct and returns a struct, text, or a `ToolResult`; the
+input and output JSON Schemas `tools/list` gives are derived from those types
+when the program is compiled, and a call's arguments are decoded into them,
+a bad one answered as an error the model can correct:
 
-<!-- BEGIN GENERATED zig build docs -- usage -->
+<!-- BEGIN GENERATED zig build docs -- server -->
 ```zig
 const parley = @import("parley");
 
-fn envelope(arena: std.mem.Allocator) !void {
-    // A message as a peer sent it, told apart without reading what it carries.
-    const line = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\"}}";
-    var fault: parley.wire.Fault = .{};
-    const message = parley.wire.decode(arena, line, .{ .fault = &fault }) catch {
-        // Refused: answer with the code and the id the fault names.
-        var buffer: [256]u8 = undefined;
-        var w: std.Io.Writer = .fixed(&buffer);
-        try parley.wire.writeFailure(&w, fault.id, fault.code, fault.reason, null);
-        return;
-    };
-    const request = message.request;
-    std.debug.assert(std.mem.eql(u8, request.method, "tools/call"));
+/// A tool's arguments and result are Zig types: their JSON Schemas, in
+/// `tools/list`, are derived from them when the program is compiled.
+const Forecast = struct {
+    city: []const u8,
+    days: u8 = 1,
 
-    // The answer, around a result its caller writes.
-    var buffer: [256]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&buffer);
-    try parley.wire.writeResult(&w, request.id, "{\"resultType\":\"complete\",\"content\":[]}");
+    pub const strand = .{ .fields = .{
+        .city = .{ .description = "The city to forecast" },
+        .days = .{ .range = .{ .min = 1, .max = 7 } },
+    } };
+};
+
+const Weather = struct { city: []const u8, celsius: f64 };
+
+fn forecast(call: *parley.Call, args: Forecast) parley.Call.Error!Weather {
+    // Progress and log lines go on the request's own stream, when asked for.
+    try call.progress(1, 1, "asked the sky");
+    return .{ .city = args.city, .celsius = 21.5 };
+}
+
+/// Asks the user through the client, and continues once it is answered.
+fn greet(call: *parley.Call) parley.Call.Error!parley.ToolResult {
+    const answer = try call.elicit("name", .{ .form = .{
+        .message = "What should I call you?",
+        .requested_schema = .{ .bytes = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}}}" },
+    } }) orelse return error.InputRequired;
+    return .ofText(if (answer.action == .accept) "hello" else "hello, stranger");
+}
+
+fn newServer(gpa: std.mem.Allocator, io: Io) !parley.Server {
+    var server = try parley.Server.init(gpa, io, .{
+        .info = .{ .name = "weather", .version = "1.0.0" },
+        .cache = .{ .tools = .{ .ttl = .literal("5m") } },
+    });
+    errdefer server.deinit();
+    try server.addTool(io, .{ .name = "forecast", .description = "The weather in a city" }, forecast);
+    try server.addTool(io, .{ .name = "greet", .description = "Greets the user by name" }, greet);
+    return server;
+}
+```
+<!-- END GENERATED -->
+
+Over stdio, as a client launches a server:
+
+<!-- BEGIN GENERATED zig build docs -- stdio -->
+```zig
+const parley = @import("parley");
+
+// A server a client launches: one message a line on stdin and stdout,
+// both eras, until the client closes stdin.
+try parley.stdio.serve(io, gpa, server, &in, &out.writer, .{});
+```
+<!-- END GENERATED -->
+
+Over Streamable HTTP, mounted on an uplink router:
+
+<!-- BEGIN GENERATED zig build docs -- http -->
+```zig
+const http = @import("parley.http");
+const uplink = @import("uplink");
+
+// Streamable HTTP: the endpoint is an uplink handler, mounted at a path.
+var endpoint: http.Endpoint = .init(gpa, server, .{});
+defer endpoint.deinit();
+var router: uplink.server.Router = .init(gpa);
+defer router.deinit();
+try router.add("/mcp", endpoint.handler());
+var web: uplink.Server = .init(gpa, .{}, router.handler());
+defer web.deinit(io);
+var listener = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{ .reuse_address = true });
+defer listener.deinit(io);
+var serving = try io.concurrent(uplink.Server.serve, .{ &web, io, &listener });
+defer {
+    web.shutdown(io);
+    // glint-ignore: Z026 -- serve ends with the shutdown; the example only shows it starting
+    serving.await(io) catch {};
 }
 ```
 <!-- END GENERATED -->
 
 ## Design
 
-**JSON-RPC.** `wire.decode` reads only the envelope (`jsonrpc`, `id`,
-`method`, `params`, `result`, `error`) with strand's member reader, so a
-message's params and result stay the bytes they were written as for the layer
-that knows their shape, and nothing is allocated for a message without
-escapes. An id is a string or an integer, never null; a refusal says which
-code answers it (`-32700` for bytes that are not JSON, `-32600` for JSON that
-is not a message: a batch, a scalar, a member given twice, a missing or wrong
-`jsonrpc`) and the id when one could be read, so the answer names the request
-it refuses. A string written is JSON whatever its bytes: controls are escaped
-and broken UTF-8 is written as U+FFFD.
+**One request, one reply.** `Server.serve` answers a 2026-07-28 request from
+what it carries: its `_meta` names the protocol version and the client's
+capabilities (a request without them is refused, `-32602`; a version not
+served, `-32022` with the versions that are), and nothing is kept between
+requests. A request's notifications (progress, log lines when its `_meta` asks
+for them) go to a sink the transport gives, the request's own stream. Every
+result carries `resultType`; `server/discover`, the lists and `resources/read`
+carry caching hints (`ttlMs`, `cacheScope`), set per list in `Server.Options`.
+Lists are written in the order their items were added, a page at a time when
+`page_size` is set, each item's JSON made once when it is added; a cursor into
+a list that changed since is refused.
+
+**Input across rounds.** A handler that needs the user (an elicitation), the
+client's model (sampling) or its roots asks through its `Call` and returns
+`error.InputRequired`; the client is asked for everything recorded at once and
+retries with the answers. What the handler keeps between rounds
+(`Call.setState`) travels with the client sealed with XChaCha20-Poly1305 under
+the server's key, bound to who asked, the method and the tool, prompt or
+resource, and an expiry: it can be neither read, changed nor replayed on
+another request. Asking a client for what it did not declare is `-32021`,
+naming the capability.
+
+**The session revisions.** An `initialize` without a 2026-07-28 `_meta` opens a
+session (`compat.Session`): the process on stdio, an `Mcp-Session-Id` over
+HTTP. The session holds what a modern request would carry, and answers what
+only those revisions have: `ping`, `logging/setLevel`, `resources/subscribe`.
+Input a handler asks for goes to the client as the server's own requests
+(`elicitation/create`, `sampling/createMessage`, `roots/list`), and the
+handler is called again with the answers. A handler is the same in both eras.
+
+**Changes.** A tool, prompt or resource added or removed, or a resource
+updated, is told to every open `subscriptions/listen` stream that asked for
+it, and to every session's stream. A change never queues: each stream keeps a
+flag per list and a bit per watched resource, so a slow reader costs the same
+however many changes it misses.
+
+**stdio.** One message a line. Each request is a task of its own: a long tool
+holds up nothing behind it, and `notifications/cancelled` cancels its task,
+after which nothing more is written for it. A line past `max_message` is
+refused and the next one read. At the end of input the requests read are
+answered and the streams ended.
+
+**Streamable HTTP.** One endpoint, POST. A request's `Host` and `Origin` must
+be this machine's (or listed): a page another site serves cannot reach a local
+server. `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` are held to the
+body (`-32020`, a 400), `Mcp-Name` read through the Base64 sentinel. An answer
+is JSON, or an event stream once the request has something to say before its
+result; a `subscriptions/listen` stream is kept open by a comment every
+`keep_alive`. A session's GET stream and DELETE are served for the session
+revisions.
 
 ## Scope
 
-MCP as the specification has it, both revisions in use: 2026-07-28 and
-2025-11-25 with 2025-06-18. JSON-RPC batches are not read: MCP removed them
-in 2025-06-18.
+MCP as the specification has it, in the revisions in use: 2026-07-28, and
+2025-11-25 and 2025-06-18 through a session. Not built: the HTTP+SSE transport
+(deprecated since 2025-03-26), a session's resumable streams (`Last-Event-ID`,
+removed in 2026-07-28), JSON-RPC batches (removed in 2025-06-18), and
+dereferencing a schema's `$ref` over the network.
 
 ## Built with
 
-- [strand](https://github.com/pedronaugusto/strand): JSON.
+- [strand](https://github.com/pedronaugusto/strand): JSON, and the JSON
+  Schemas of Zig types.
 - [aegis](https://github.com/pedronaugusto/aegis): checked types.
+- [uplink](https://github.com/pedronaugusto/uplink) (`parley.http`): HTTP.
 - [shakedown](https://github.com/pedronaugusto/shakedown) (tests only):
   properties, fuzzing and benchmarks.
 - [preflight](https://github.com/pedronaugusto/preflight) (development only):
@@ -77,10 +186,22 @@ in 2025-06-18.
 
 ## Testing
 
-`bay test` runs the suite, the example and each benchmark once; `bay
-properties` the properties alone, which the fuzzer runs (`bay properties
---fuzz`). The suite reads what Claude Code 2.1.302 and Codex 0.160.0 send to
-an MCP server, captured from both.
+`bay test` runs both modules' suites, the example and each benchmark once;
+`bay properties` the properties alone (any bytes a client sends over stdio,
+every sealed state changed), which the fuzzer runs. The suite reads what
+Claude Code 2.1.302 and Codex 0.160.0 send to a stdio server, captured from
+both, and answers it.
+
+The official conformance suite
+([@modelcontextprotocol/conformance](https://github.com/modelcontextprotocol/conformance)
+0.2.0-alpha.12) drives `conformance/server.zig` over HTTP, by hand (`bay
+conformance-server -- --port 3000`, then `npx @modelcontextprotocol/conformance
+server --url http://127.0.0.1:3000/mcp --requirements <revision>`):
+
+| Revision | Server scenarios required | Passed |
+|---|---|---|
+| 2025-11-25 | 30 | 30 |
+| 2026-07-28 | 37 | 37 |
 
 ## Licence
 
