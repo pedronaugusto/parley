@@ -16,27 +16,27 @@
     },
     .dependencies = .{
         .aegis = .{
-            .url = "git+https://github.com/pedronaugusto/aegis?ref=v0.1.10#96f082383b0117bed15f23e47cc16833ce89630a",
-            .hash = "aegis-0.1.10-rsxouhjpBwCHYhFd0VvVBLZ7jbZfFKYXfFMQmv3wrx_A",
+            .url = "git+https://github.com/pedronaugusto/aegis?ref=v0.1.11#56636db4145754561d287a037b73c045fd087db6",
+            .hash = "aegis-0.1.11-rsxouuXxBwDqlz_tsMEeBAODszKlLvlRoJwCfY-Xh9zg",
         },
         .strand = .{
             .url = "git+https://github.com/pedronaugusto/strand?ref=v0.11.1#b344241da8d6611fd00202250633bc0b97b1e0f6",
             .hash = "strand-0.11.1-8LNWVtZJJgDujColV9BwoK1duuRMWp4bfuV2Gc2iLTEI",
         },
         .uplink = .{
-            .url = "git+https://github.com/pedronaugusto/uplink?ref=v0.7.1#e9bd5a89c6827559a62f44c3889825955f9a386a",
-            .hash = "uplink-0.7.1-0eVSJjHRFAAuX-C8ugQ7eMM2BqfV4cfM_LRslagurbTa",
+            .url = "git+https://github.com/pedronaugusto/uplink?ref=v0.7.2#38f6a072417a054277cd621c6a4cf83f886ad6f2",
+            .hash = "uplink-0.7.2-0eVSJn0yFQBPnEt3EH-vd1CF41j3ne-8nYX7LdrE7QCH",
             .lazy = true,
         },
     },
     .dev_dependencies = .{
         .preflight = .{
-            .url = "git+https://github.com/pedronaugusto/preflight?ref=v0.6.2#d7ccc1bdcfe7cf6f480a434201f8690b325f6504",
-            .hash = "preflight-0.6.2-LX1ZwgPWEAAh_GQ61_8uRRfqxC-d6ru3oz3cKfSQ0W40",
+            .url = "git+https://github.com/pedronaugusto/preflight?ref=v0.6.3#1c3bddc8c1d82d2eba04a3e67af6c3af18b16344",
+            .hash = "preflight-0.6.3-LX1ZwrzeEADGGrJFgOpe3yb8nrGhhevtGTJckqGILzXn",
         },
         .shakedown = .{
-            .url = "git+https://github.com/pedronaugusto/shakedown?ref=v0.4.7#8e98b162a5db14742df94dde33a55fadcbf8c40c",
-            .hash = "shakedown-0.4.7-BR8U42BQFgAbwe3nP57AtS5JzGGw5WdiKCRjMPeAQWlM",
+            .url = "git+https://github.com/pedronaugusto/shakedown?ref=v0.4.8#7fd3eda61e991b9e0eb754c1bd83b4ce57f221bd",
+            .hash = "shakedown-0.4.8-BR8U44xTFgCSgGkib258Bq2mgPxBk-drwk5Mg0ABYntZ",
         },
     },
 }
