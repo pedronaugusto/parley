@@ -151,12 +151,42 @@ fn handle(e: *Endpoint, io: Io, request: *Request, response: *Response) anyerror
 
     const principal = if (e.options.principal) |p| p.of(p.context, request) else null;
     var stream: Stream = .{ .io = io, .response = response };
-    const reply = e.server.serve(io, arena, req, principal, stream.sink(e)) catch |err| switch (err) {
+    const reply = serveWatched(e, io, arena, request, req, principal, stream.sink(e)) catch |err| switch (err) {
         // The client left, or the server is going away: nothing to answer.
         error.Canceled => return,
         error.OutOfMemory => return err,
     };
     return e.answer(io, arena, response, &stream, req.id, reply);
+}
+
+const Watched = union(enum) {
+    served: parley.Server.HandleError!parley.Server.Reply,
+    left: Request.GoneError!bool,
+};
+
+/// Serves `req` on a task of its own beside a wait for the client to
+/// leave: a client that closes its stream (the 2026-07-28 revision's
+/// cancellation over HTTP) stops the handler, which sees `error.Canceled`.
+fn serveWatched(e: *Endpoint, io: Io, arena: Allocator, request: *Request, req: wire.Request, principal: ?[]const u8, sink: parley.Sink) parley.Server.HandleError!parley.Server.Reply {
+    var buffer: [2]Watched = undefined;
+    var select: Io.Select(Watched) = .init(io, &buffer);
+    // Both tasks have ended before the request's memory goes.
+    defer select.cancelDiscard();
+    select.concurrent(.served, parley.Server.serve, .{ e.server, io, arena, req, principal, sink }) catch
+        // No task to spare: served here, and never stopped.
+        return e.server.serve(io, arena, req, principal, sink);
+    select.concurrent(.left, Request.gone, .{ request, io, .none }) catch {
+        const outcome = try select.await();
+        return outcome.served;
+    };
+    while (true) switch (try select.await()) {
+        .served => |reply| return reply,
+        .left => |left| {
+            // The client left: the handler is stopped as the select ends.
+            if (left catch false) return error.Canceled;
+            // The wait could not say: the call runs to its end.
+        },
+    };
 }
 
 /// Writes `reply`: as the last event of a stream the request began, or as

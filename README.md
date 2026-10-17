@@ -225,8 +225,10 @@ server. `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` are held to the
 body (`-32020`, a 400), `Mcp-Name` read through the Base64 sentinel. An answer
 is JSON, or an event stream once the request has something to say before its
 result; a `subscriptions/listen` stream is kept open by a comment every
-`keep_alive`. A session's GET stream and DELETE are served for the session
-revisions.
+`keep_alive`. A client that closes its stream cancels the request at once:
+its handler runs beside a wait for the client to leave, and sees
+`error.Canceled`. A session's GET stream and DELETE are served for the
+session revisions, where a disconnect is not a cancellation.
 
 **The client.** `Client.connect` asks `server/discover` at 2026-07-28 (or the
 versions `Options.revisions` names): an answer, or an error that names the

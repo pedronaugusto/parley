@@ -42,6 +42,7 @@ const Harness = struct {
         h.core = try .init(testing.allocator, io, .{ .info = .{ .name = "http", .version = "0" } });
         try h.core.addTool(io, .{ .name = "echo" }, echo);
         try h.core.addTool(io, .{ .name = "counted" }, counted);
+        try h.core.addTool(io, .{ .name = "stall" }, Stall.handle);
         h.endpoint = .init(testing.allocator, &h.core, .{ .keep_alive = .literal("100ms") });
         h.router = .init(testing.allocator);
         try h.router.add("/mcp", h.endpoint.handler());
@@ -217,4 +218,45 @@ test "the client over HTTP: modern, and a session whose input comes as the serve
     try h.core.addTool(io, .{ .name = "greet" }, greet);
     try clientRound(io, &h, &.{.@"2026-07-28"}, .modern);
     try clientRound(io, &h, &.{.@"2025-11-25"}, .session);
+}
+
+/// A tool that runs until it is stopped, and says how it ended.
+const Stall = struct {
+    var started: std.atomic.Value(bool) = .init(false);
+    var canceled: std.atomic.Value(bool) = .init(false);
+
+    fn handle(call: *Call) Call.Error!parley.ToolResult {
+        started.store(true, .release);
+        call.io.sleep(.fromSeconds(60), .awake) catch {
+            canceled.store(true, .release);
+            return error.Canceled;
+        };
+        return .ofText("woke");
+    }
+
+    fn until(flag: *std.atomic.Value(bool)) !void {
+        var waited: u32 = 0;
+        while (!flag.load(.acquire) and waited < 1000) : (waited += 1) try testing.io.sleep(.fromMilliseconds(10), .awake);
+        try testing.expect(flag.load(.acquire));
+    }
+};
+
+fn postStall(h: *Harness, io: Io) !void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    _ = try h.post(io, arena.allocator(), "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"stall\"," ++ meta ++ "}}", &standard("tools/call", "stall"));
+}
+
+test "a client that closes its stream stops the call: the handler is canceled" {
+    const io = testing.io;
+    var h: Harness = undefined;
+    try h.start(io);
+    defer h.stop(io);
+    Stall.started.store(false, .release);
+    Stall.canceled.store(false, .release);
+    var calling = try io.concurrent(postStall, .{ &h, io });
+    try Stall.until(&Stall.started);
+    // glint-ignore: Z026 -- the client gives up; how its own call ends is not what the test checks
+    calling.cancel(io) catch {};
+    try Stall.until(&Stall.canceled);
 }

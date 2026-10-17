@@ -6,9 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Pins uplink 0.7.3 (`Request.gone`).
+
 ### Added
 
 - `parley.process` (a module of its own, on conduit, fetched only when built; `.process = false` leaves it out): `Child.spawn` launches an MCP server as a child process with a `parley.Client` on its standard streams; `Child.close` ends it as stdio's shutdown says (its input closed, a grace to exit, then asked to stop, then killed), and what the server started ends with it unless `Options.descendants` says otherwise; its standard error is this process's, the null device, a file, or its latest bytes kept (`Child.stderrTail`).
+- `parley.http`: a 2026-07-28 request whose client closes its stream is canceled while its handler runs (the revision's cancellation over HTTP), not only at its next write: the handler runs beside uplink's `Request.gone`. The session era keeps a disconnect apart from a cancellation, as its revisions say.
 - `stdio.Channel.end`: nothing more is written, so the stream under it can be closed while answers already asked for are read.
 
 ## [0.2.0] - 2026-10-17
