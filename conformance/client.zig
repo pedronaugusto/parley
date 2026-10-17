@@ -97,6 +97,18 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (std.mem.eql(u8, scenario, "json-schema-ref-no-deref") or std.mem.eql(u8, scenario, "request-metadata")) return;
+    if (std.mem.eql(u8, scenario, "json-schema-2020-12-preservation")) {
+        // The focal tool's input schema goes back as the client received
+        // it, byte for byte, as the echo tool's `schema` argument.
+        const Schemas = struct { tools: []const struct { name: []const u8, inputSchema: ?Raw = null } = &.{} };
+        const listed_schemas = (strand.json.parseLeaky(Schemas, arena, listed, types.read_options) catch Schemas{}).tools;
+        for (listed_schemas) |tool| if (std.mem.eql(u8, tool.name, "json_schema_2020_12_tool")) {
+            const schema = tool.inputSchema orelse return error.NoSchema;
+            const arguments: Raw = .{ .bytes = try std.mem.concat(arena, u8, &.{ "{\"schema\":", schema.bytes, "}" }) };
+            _ = try client.callTool(io, arena, "json_schema_echo", arguments, null);
+        };
+        return;
+    }
     // Every other scenario: each tool, once, with no arguments.
     for (tools) |tool| _ = client.callTool(io, arena, tool.name, .{}, null) catch |err| std.log.warn("{s}: {t}", .{ tool.name, err });
 }
