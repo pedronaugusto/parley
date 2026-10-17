@@ -4,5 +4,6 @@ test {
     _ = @import("server_test.zig");
     _ = @import("stdio_test.zig");
     _ = @import("compat_test.zig");
+    _ = @import("client_test.zig");
     _ = @import("property_test.zig");
 }

@@ -14,6 +14,7 @@ const wire = @import("wire.zig");
 const types = @import("types.zig");
 const Server = @import("Server.zig");
 const compat = @import("compat.zig");
+const Client = @import("Client.zig");
 const meta = @import("meta.zig");
 const Sink = @import("context.zig").Sink;
 
@@ -390,5 +391,175 @@ const Job = struct {
             error.Canceled => error.Canceled,
             error.WriteFailed => error.Closed,
         };
+    }
+};
+
+/// The client's side of stdio: requests written a line each, answers read
+/// by a task of the channel's own and handed to the request that waits for
+/// each, the server's own requests (a session's) answered by the client.
+pub const Channel = struct {
+    gpa: Allocator,
+    in: *Io.Reader,
+    out: *Io.Writer,
+    options: ChannelOptions,
+    /// Private: one message at a time on `out`.
+    write_mutex: Io.Mutex = .init,
+    /// Private: the requests waiting for their answers.
+    mutex: Io.Mutex = .init,
+    waiting: std.ArrayList(*Waiter) = .empty,
+    reading: ?Io.Future(void) = null,
+    client: ?*Client = null,
+    /// Set once the server's output ended: every wait fails at once.
+    closed: std.atomic.Value(bool) = .init(false),
+
+    pub const ChannelOptions = struct {
+        max_message: aegis.units.Bytes(u32) = .literal("16MiB"),
+    };
+
+    const Waiter = struct {
+        id: wire.Id,
+        event: Io.Event = .unset,
+        /// The answer, on the channel's allocator; null until it comes.
+        answer: ?[]u8 = null,
+    };
+
+    pub fn init(gpa: Allocator, in: *Io.Reader, out: *Io.Writer, options: ChannelOptions) Channel {
+        return .{ .gpa = gpa, .in = in, .out = out, .options = options };
+    }
+
+    /// Starts reading the server's output, for `client`'s requests.
+    pub fn start(ch: *Channel, io: Io, client: *Client) Io.ConcurrentError!void {
+        ch.client = client;
+        ch.reading = try io.concurrent(readLoop, .{ ch, io });
+    }
+
+    /// Stops reading; the requests still waiting fail.
+    pub fn deinit(ch: *Channel, io: Io) void {
+        if (ch.reading) |*task| task.cancel(io);
+        ch.waiting.deinit(ch.gpa);
+    }
+
+    pub fn transport(ch: *Channel) Client.Transport {
+        return .{ .context = ch, .vtable = &.{ .request = request, .notify = notify, .opened = opened } };
+    }
+
+    fn request(context: *anyopaque, io: Io, arena: Allocator, exchange: *Client.Exchange) Client.RequestError![]const u8 {
+        const ch: *Channel = @ptrCast(@alignCast(context)); // safe: the transport was made from this channel
+        if (ch.closed.load(.acquire)) return error.Closed;
+        var waiter: Waiter = .{ .id = exchange.id };
+        {
+            try ch.mutex.lock(io);
+            defer ch.mutex.unlock(io);
+            try ch.waiting.append(ch.gpa, &waiter);
+        }
+        defer {
+            ch.retire(io, &waiter);
+            if (waiter.answer) |a| ch.gpa.free(a);
+        }
+        try ch.write(io, exchange.message);
+        waiter.event.waitTimeout(io, .{ .duration = .{ .raw = exchange.timeout, .clock = .awake } }) catch |err| {
+            // Canceled or out of time: the server is told, and stops.
+            var buffer: [128]u8 = undefined;
+            var w: Io.Writer = .fixed(&buffer);
+            w.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":") catch unreachable; // unreachable: the buffer holds it
+            if (exchange.id.write(&w)) |_| {
+                w.writeAll("}}") catch unreachable; // unreachable: an integer id fits the buffer
+                // glint-ignore: Z026 -- the request ends either way; a notice the server cannot take changes nothing
+                ch.write(io, w.buffered()) catch {};
+            } else |_| {}
+            return switch (err) {
+                error.Canceled => error.Canceled,
+                error.Timeout => error.TimedOut,
+            };
+        };
+        const answer = waiter.answer orelse return error.Closed;
+        defer ch.gpa.free(answer);
+        waiter.answer = null;
+        return arena.dupe(u8, answer);
+    }
+
+    fn write(ch: *Channel, io: Io, message: []const u8) Client.RequestError!void {
+        ch.write_mutex.lockUncancelable(io);
+        defer ch.write_mutex.unlock(io);
+        ch.out.writeAll(message) catch return error.Closed;
+        ch.out.writeByte('\n') catch return error.Closed;
+        ch.out.flush() catch return error.Closed;
+    }
+
+    fn notify(context: *anyopaque, io: Io, message: []const u8) Client.RequestError!void {
+        const ch: *Channel = @ptrCast(@alignCast(context)); // safe: the transport was made from this channel
+        return ch.write(io, message);
+    }
+
+    fn opened(_: *anyopaque, _: @import("revision.zig").Revision) void {}
+
+    fn retire(ch: *Channel, io: Io, waiter: *Waiter) void {
+        ch.mutex.lockUncancelable(io);
+        defer ch.mutex.unlock(io);
+        for (ch.waiting.items, 0..) |w, i| if (w == waiter) {
+            _ = ch.waiting.swapRemove(i);
+            break;
+        };
+    }
+
+    fn readLoop(ch: *Channel, io: Io) void {
+        defer {
+            ch.closed.store(true, .release);
+            ch.mutex.lockUncancelable(io);
+            defer ch.mutex.unlock(io);
+            for (ch.waiting.items) |w| w.event.set(io);
+        }
+        var line_buffer: Io.Writer.Allocating = .init(ch.gpa);
+        defer line_buffer.deinit();
+        while (true) {
+            line_buffer.clearRetainingCapacity();
+            _ = ch.in.streamDelimiterLimit(&line_buffer.writer, '\n', .limited(ch.options.max_message.raw())) catch |err| switch (err) {
+                error.StreamTooLong => {
+                    _ = ch.in.discardDelimiterInclusive('\n') catch return;
+                    continue;
+                },
+                else => return,
+            };
+            const at_end = if (ch.in.peekByte()) |_| blk: {
+                ch.in.toss(1);
+                break :blk false;
+            } else |_| true;
+            const bytes = std.mem.trimEnd(u8, line_buffer.written(), "\r");
+            if (bytes.len != 0) ch.handle(io, bytes);
+            if (at_end) return;
+        }
+    }
+
+    /// One message from the server.
+    fn handle(ch: *Channel, io: Io, bytes: []const u8) void {
+        var arena: std.heap.ArenaAllocator = .init(ch.gpa);
+        defer arena.deinit();
+        const message = wire.decode(arena.allocator(), bytes, .{}) catch return;
+        switch (message) {
+            .result, .failure => {
+                const id = switch (message) {
+                    .result => |r| r.id,
+                    .failure => |f| f.id orelse return,
+                    else => unreachable,
+                };
+                ch.mutex.lockUncancelable(io);
+                defer ch.mutex.unlock(io);
+                for (ch.waiting.items) |w| if (w.id.eql(id) and w.answer == null) {
+                    w.answer = ch.gpa.dupe(u8, bytes) catch return;
+                    w.event.set(io);
+                    return;
+                };
+            },
+            // A session server's own request: answered by the client.
+            .request => {
+                const client = ch.client orelse return;
+                var exchange: Client.Exchange = .{ .id = .{ .integer = 0 }, .method = "", .message = "", .revision = client.revision, .timeout = .zero, .client = client };
+                switch (exchange.inbound(io, arena.allocator(), message)) {
+                    .message => |answer| ch.write(io, answer) catch return,
+                    .none => {},
+                }
+            },
+            .notification => {},
+        }
     }
 };

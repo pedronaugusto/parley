@@ -11,6 +11,7 @@ pub const types = @import("types.zig");
 pub const Revision = @import("revision.zig").Revision;
 pub const Server = @import("Server.zig");
 pub const stdio = @import("stdio.zig");
+pub const Client = @import("Client.zig");
 /// The revisions before 2026-07-28: a session opened by `initialize`.
 pub const compat = @import("compat.zig");
 pub const Call = @import("Call.zig");
