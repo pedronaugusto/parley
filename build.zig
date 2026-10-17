@@ -93,6 +93,19 @@ pub fn dev(b: *std.Build, tools: type) void {
     check.dependOn(&example.step);
     b.getInstallStep().dependOn(check);
 
+    // A server over stdio for a client to launch: `bay stdio-server`.
+    const stdio_server = b.addExecutable(.{
+        .name = "stdio-server",
+        .root_module = b.createModule(.{
+            .root_source_file = p.path("examples/stdio_server.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "parley", .module = module }},
+        }),
+    });
+    b.step("stdio-server", "Build the example stdio server into zig-out/bin").dependOn(&b.addInstallArtifact(stdio_server, .{}).step);
+    check.dependOn(&stdio_server.step);
+
     // The server the official conformance suite drives, by hand:
     // `bay conformance-server -- --port 3000`. CI compiles it.
     const conformance = b.addExecutable(.{
