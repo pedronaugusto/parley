@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-17
+
 ### Added
 
 - `Server`, the core: a 2026-07-28 request answered from what it carries (`serve`: the `_meta` version, client capabilities and identity; `-32602` without them, `-32022` naming the versions served), one reply per request. `server/discover`; tools, resources, resource templates (RFC 6570) and prompts, listed in the order they were added, a page at a time with cursors refused once their list changed, with `ttlMs` and `cacheScope` set per list; `completion/complete`; progress and per-request log lines on the request's stream; `subscriptions/listen`, acknowledged, tagged, and fed by coalescing per-stream flags.
@@ -19,4 +21,5 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `wire`: JSON-RPC 2.0 as MCP speaks it. `decode` reads a message's envelope and tells a request, a notification, a result and an error apart, leaving `params` and `result` as their bytes; a refusal names its code and, when it could be read, the id. `writeRequest`, `writeNotification`, `writeResult` (and `beginResult`/`endResult` around a result written in place) and `writeFailure`.
 - `Revision`: the protocol revisions parley speaks.
 
-[Unreleased]: https://github.com/pedronaugusto/parley/commits/main
+[Unreleased]: https://github.com/pedronaugusto/parley/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/pedronaugusto/parley/releases/tag/v0.1.0
