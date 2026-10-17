@@ -97,6 +97,55 @@ test "a 2026-07-28 server: discovered, listed, called, input given across rounds
     wiring.to_server.close();
 }
 
+/// Runs as a task and asks who is there, as the task's input.
+fn knock(call: *Call) Call.Error!parley.ToolResult {
+    _ = try call.runAsTask();
+    const answer = try call.elicit("who", .{ .form = .{
+        .message = "Who are you?",
+        .requested_schema = .{ .bytes = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}}}" },
+    } }) orelse return error.InputRequired;
+    return .ofText(answer.content.?.bytes);
+}
+
+fn refuseTask(call: *Call) Call.Error!parley.ToolResult {
+    _ = try call.runAsTask();
+    return error.HandlerFailed;
+}
+
+test "a call the server runs as a task: polled, its input given, answered as if at once" {
+    const io = testing.io;
+    var server = try parley.Server.init(testing.allocator, io, .{ .info = .{ .name = "s", .version = "1" }, .tasks = .{ .poll_interval = .literal("5ms") } });
+    defer server.deinit();
+    try server.addTool(io, .{ .name = "knock", .task = .required }, knock);
+    try server.addTool(io, .{ .name = "refuse", .task = .optional }, refuseTask);
+
+    var wiring: Wiring = .{ .to_server = undefined, .from_server = undefined };
+    wiring.init(io);
+    var task = try io.concurrent(serveTask, .{ io, &server, &wiring.to_server, &wiring.from_server });
+    defer task.cancel(io);
+    var writer_buffer: [4096]u8 = undefined;
+    var out = PipeWriter.init(&wiring.to_server, &writer_buffer);
+    var channel: stdio.Channel = .init(testing.allocator, &wiring.from_server.reader, &out.writer, .{});
+    var client: Client = .init(testing.allocator, channel.transport(), .{
+        .info = .{ .name = "c", .version = "1" },
+        .handlers = .{ .elicit = answerName },
+    });
+    defer client.deinit();
+    try channel.start(io, &client);
+    defer channel.deinit(io);
+    try client.connect(io);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const knocked = try client.callTool(io, a, "knock", .{}, null);
+    try testing.expectEqualStrings("{\"name\":\"ada\"}", knocked.content[0].text.text);
+    var why: Client.Diagnostics = .{};
+    try testing.expectError(error.Failed, client.callTool(io, a, "refuse", .{}, &why));
+    try testing.expectEqual(parley.wire.Code.internal_error, why.failure.?.code);
+    wiring.to_server.close();
+}
+
 /// A writer into a pipe, flushed a line at a time by the channel.
 const PipeWriter = struct {
     pipe: *Pipe,

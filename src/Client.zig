@@ -19,6 +19,8 @@ const wire = @import("wire.zig");
 const meta = @import("meta.zig");
 const Revision = @import("revision.zig").Revision;
 
+const tasks_extension = "io.modelcontextprotocol/tasks";
+
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
@@ -60,6 +62,10 @@ pub const Options = struct {
     /// How long `server/discover` waits before the server is taken for a
     /// session server that stays silent before `initialize` (stdio).
     probe_timeout: Duration = .literal("5s"),
+    /// Declare the tasks extension (2026-07-28): a tool call the server
+    /// runs as a task is polled to its end, its input given as it asks,
+    /// and answers as if it had been answered at once.
+    tasks: bool = true,
 };
 
 /// The application's answers to a server's requests for input. Each takes
@@ -264,6 +270,7 @@ fn writeCapabilities(c: *const Client, w: *Writer) Writer.Error!void {
     if (h.roots != null) caps.roots = .{ .bytes = "{}" };
     if (h.sample != null) caps.sampling = .{};
     if (h.elicit != null) caps.elicitation = .{ .form = .{ .bytes = "{}" } };
+    if (c.options.tasks and c.revision.stateless()) caps.extensions = .{ .bytes = "{\"" ++ tasks_extension ++ "\":{}}" };
     strand.json.write(w, caps, types.write_options) catch return error.WriteFailed;
 }
 
@@ -418,6 +425,7 @@ fn call(c: *Client, io: Io, arena: Allocator, method: []const u8, params: []cons
             .result => |r| {
                 const kind = resultType(r.result);
                 if (std.mem.eql(u8, kind, "complete")) return r.result;
+                if (std.mem.eql(u8, kind, "task") and std.mem.eql(u8, method, "tools/call") and c.options.tasks) return c.followTask(io, arena, r.result, diagnostics);
                 if (!std.mem.eql(u8, kind, "input_required")) return error.Protocol;
                 rounds += 1;
                 if (rounds > c.options.max_rounds) return error.TooManyRounds;
@@ -469,34 +477,8 @@ fn answerInput(c: *Client, io: Io, arena: Allocator, params: []const u8, result:
     if (requests) |object| {
         if (!first) w.writeByte(',') catch return error.OutOfMemory;
         first = false;
-        w.writeAll("\"inputResponses\":{") catch return error.OutOfMemory;
-        var each: strand.json.Members = undefined;
-        each.init(object, .{});
-        var n: usize = 0;
-        while (each.next() catch return error.Protocol) |m| {
-            const Request = struct { method: []const u8, params: Raw = .{ .bytes = "{}" } };
-            const r = strand.json.parseLeaky(Request, arena, m.value, types.read_options) catch return error.Protocol;
-            const message = try arena.print("{{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"{s}\",\"params\":{s}}}", .{ r.method, r.params.bytes });
-            const asked = wire.decode(arena, message, .{}) catch return error.Protocol;
-            const answer = c.serveRequest(io, arena, asked.request);
-            const bytes = switch (answer) {
-                .message => |b| b,
-                .none => return error.Protocol,
-            };
-            const reply = wire.decode(arena, bytes, .{}) catch return error.Protocol;
-            const value = switch (reply) {
-                .result => |x| x.result,
-                // The application did not answer: the server learns it
-                // when the answer is missing, and may ask again.
-                else => continue,
-            };
-            if (n != 0) w.writeByte(',') catch return error.OutOfMemory;
-            n += 1;
-            // The key as the server wrote it, then the answer.
-            w.writeAll(object[m.start..m.value_start]) catch return error.OutOfMemory;
-            w.writeAll(value) catch return error.OutOfMemory;
-        }
-        w.writeByte('}') catch return error.OutOfMemory;
+        w.writeAll("\"inputResponses\":") catch return error.OutOfMemory;
+        w.writeAll(try c.inputResponses(io, arena, object, null)) catch return error.OutOfMemory;
     }
     if (state) |s| {
         if (!first) w.writeByte(',') catch return error.OutOfMemory;
@@ -505,6 +487,127 @@ fn answerInput(c: *Client, io: Io, arena: Allocator, params: []const u8, result:
     }
     w.writeByte('}') catch return error.OutOfMemory;
     return out.written();
+}
+
+/// The answers to an `inputRequests` object, as an `inputResponses` one;
+/// with `given`, the keys answered before are passed over and the ones
+/// answered now added to it.
+fn inputResponses(c: *Client, io: Io, arena: Allocator, object: []const u8, given: ?*std.ArrayList([]const u8)) CallError![]const u8 {
+    var out: Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    w.writeByte('{') catch return error.OutOfMemory;
+    var each: strand.json.Members = undefined;
+    each.init(object, .{});
+    var n: usize = 0;
+    while (each.next() catch return error.Protocol) |m| {
+        if (given) |keys| {
+            const key = strand.json.parseLeaky([]const u8, arena, object[m.start .. m.value_start - 1], .{}) catch return error.Protocol;
+            const seen = for (keys.items) |k| {
+                if (std.mem.eql(u8, k, key)) break true;
+            } else false;
+            if (seen) continue;
+            try keys.append(c.gpa, try c.gpa.dupe(u8, key));
+        }
+        const Request = struct { method: []const u8, params: Raw = .{ .bytes = "{}" } };
+        const r = strand.json.parseLeaky(Request, arena, m.value, types.read_options) catch return error.Protocol;
+        const message = try arena.print("{{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"{s}\",\"params\":{s}}}", .{ r.method, r.params.bytes });
+        const asked = wire.decode(arena, message, .{}) catch return error.Protocol;
+        const answer = c.serveRequest(io, arena, asked.request);
+        const bytes = switch (answer) {
+            .message => |b| b,
+            .none => return error.Protocol,
+        };
+        const reply = wire.decode(arena, bytes, .{}) catch return error.Protocol;
+        const value = switch (reply) {
+            .result => |x| x.result,
+            // The application did not answer: the server learns it
+            // when the answer is missing, and may ask again.
+            else => continue,
+        };
+        if (n != 0) w.writeByte(',') catch return error.OutOfMemory;
+        n += 1;
+        // The key as the server wrote it, then the answer.
+        w.writeAll(object[m.start..m.value_start]) catch return error.OutOfMemory;
+        w.writeAll(value) catch return error.OutOfMemory;
+    }
+    w.writeByte('}') catch return error.OutOfMemory;
+    return out.written();
+}
+
+/// Polls the task a tool call became until it ends, giving the input it
+/// asks for along the way: the call's result, as JSON on `arena`.
+fn followTask(c: *Client, io: Io, arena: Allocator, created: []const u8, diagnostics: ?*Diagnostics) CallError![]const u8 {
+    const Created = struct { taskId: []const u8, pollIntervalMs: ?u32 = null };
+    const task = strand.json.parseLeaky(Created, arena, created, types.read_options) catch return error.Protocol;
+    var interval: u32 = task.pollIntervalMs orelse 1000;
+    var id_out: Writer.Allocating = .init(arena);
+    wire.writeString(&id_out.writer, task.taskId) catch return error.OutOfMemory;
+    const quoted = id_out.written();
+    const params = try arena.print("{{\"taskId\":{s}}}", .{quoted});
+    // The keys answered, so a request seen on two polls is answered once.
+    var given: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (given.items) |k| c.gpa.free(k);
+        given.deinit(c.gpa);
+    }
+    const timeout = c.options.timeout.toIoDuration();
+    while (true) {
+        io.sleep(.fromMilliseconds(interval), .awake) catch return error.Canceled;
+        // Each poll on its own arena: a long task is polled many times.
+        var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const polled = switch (try c.send(io, a, "tasks/get", params, task.taskId, null, c.era, timeout)) {
+            .result => |r| r.result,
+            .failure => |f| return failed(arena, diagnostics, f.code, f.message, f.data),
+            else => return error.Protocol,
+        };
+        const Polled = struct {
+            status: TaskStatus,
+            statusMessage: ?[]const u8 = null,
+            pollIntervalMs: ?u32 = null,
+            inputRequests: ?Raw = null,
+            result: ?Raw = null,
+            @"error": ?Raw = null,
+        };
+        const p = strand.json.parseLeaky(Polled, a, polled, types.read_options) catch return error.Protocol;
+        if (p.pollIntervalMs) |next| interval = next;
+        switch (p.status) {
+            .working => {},
+            .input_required => {
+                const requests = p.inputRequests orelse return error.Protocol;
+                const responses = try c.inputResponses(io, a, requests.bytes, &given);
+                if (responses.len <= 2) continue;
+                var update: Writer.Allocating = .init(a);
+                update.writer.print("{{\"taskId\":{s},\"inputResponses\":{s}}}", .{ quoted, responses }) catch return error.OutOfMemory;
+                switch (try c.send(io, a, "tasks/update", update.written(), task.taskId, null, c.era, timeout)) {
+                    .result => {},
+                    .failure => |f| return failed(arena, diagnostics, f.code, f.message, f.data),
+                    else => return error.Protocol,
+                }
+            },
+            .completed => return try arena.dupe(u8, (p.result orelse return error.Protocol).bytes),
+            .failed => {
+                const Fault = struct { code: i64, message: []const u8 = "", data: ?Raw = null };
+                const f = strand.json.parseLeaky(Fault, a, (p.@"error" orelse return error.Protocol).bytes, types.read_options) catch return error.Protocol;
+                const code: wire.Code = @fromBackingInt(@intCast(f.code)); // safe: the codes are open, any integer is one
+                return failed(arena, diagnostics, code, f.message, if (f.data) |d| d.bytes else null);
+            },
+            .cancelled => return failed(arena, diagnostics, .internal_error, p.statusMessage orelse "the task was cancelled", null),
+        }
+    }
+}
+
+const TaskStatus = enum { working, input_required, completed, failed, cancelled };
+
+/// Records a failure (copied onto `arena`) for the caller and fails.
+fn failed(arena: Allocator, diagnostics: ?*Diagnostics, code: wire.Code, message: []const u8, data: ?[]const u8) CallError {
+    if (diagnostics) |d| d.failure = .{
+        .code = code,
+        .message = arena.dupe(u8, message) catch return error.OutOfMemory,
+        .data = if (data) |x| arena.dupe(u8, x) catch return error.OutOfMemory else null,
+    };
+    return error.Failed;
 }
 
 // What applications call.

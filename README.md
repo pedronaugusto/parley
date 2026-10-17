@@ -7,8 +7,8 @@ which Codex and Claude Code speak today) are served above the core, from the
 same handlers. Transports: stdio, and Streamable HTTP on
 [uplink](https://github.com/pedronaugusto/uplink).
 
-Work in progress toward the public cut: the server and the client are built;
-the tasks extension and authorization are not yet.
+Work in progress toward the public cut: the server, the client and the tasks
+extension are built; authorization is not yet.
 
 ## Install
 
@@ -163,6 +163,19 @@ resource, and an expiry: it can be neither read, changed nor replayed on
 another request. Asking a client for what it did not declare is `-32021`,
 naming the capability.
 
+**Tasks.** A server given `Options.tasks` serves the tasks extension
+(`io.modelcontextprotocol/tasks`). A tool registered with `.task = .optional`
+or `.required` may run as a task: its handler calls `Call.runAsTask`, the call
+is answered with the task at once, and the handler goes on as it; the client
+polls `tasks/get` for its status and outcome, gives the input it asks for with
+`tasks/update` (the handler runs again with the answers, as a retry would) and
+stops it with `tasks/cancel`. A `subscriptions/listen` stream that names tasks
+carries their statuses. Input asked before `runAsTask` is the call's own
+rounds. A task's id is 128 random bits and only the principal that made it
+sees it; tasks are held up to `max`, each for `ttl` from its creation. A
+client that did not declare the extension gets the call answered as asked, or
+`-32021` for a tool that must run as a task.
+
 **The session revisions.** An `initialize` without a 2026-07-28 `_meta` opens a
 session (`compat.Session`): the process on stdio, an `Mcp-Session-Id` over
 HTTP. The session holds what a modern request would carry, and answers what
@@ -206,7 +219,9 @@ request carries the headers its revision asks for, a tool's `x-mcp-header`
 arguments mirrored from its last `tools/list` (a tool whose marks break the
 rules is left out of the list), a session's GET stream is read for what belongs
 to no request, and a session stream the server closes is reopened with
-`Last-Event-ID` after the `retry` it set.
+`Last-Event-ID` after the `retry` it set. A tool call a server runs as a task
+is polled to its end, its input given as it asks, and returned as if answered
+at once (`Options.tasks`).
 
 ## Scope
 
@@ -247,7 +262,7 @@ over HTTP, by hand (`bay conformance-server -- --port 3000`, then `npx
 | Revision | Leg | Scenarios required | Passed |
 |---|---|---|---|
 | 2025-11-25 | server | 30 | 30 |
-| 2026-07-28 | server | 37 | 37 |
+| 2026-07-28 | server | 37 | 37, and the 10 tasks scenarios (not scored) |
 | 2025-11-25 | client | 18 | the 4 without authorization; the 14 `auth/*` wait on OAuth |
 | 2026-07-28 | client | 32 | the 7 without authorization; the 25 `auth/*` wait on OAuth |
 

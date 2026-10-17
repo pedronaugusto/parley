@@ -17,6 +17,7 @@ pub const layers: []const gantry.rules.Layer = &.{
         "src/subscriptions.zig",
     } },
     .{ .name = "what a server offers", .patterns = &.{"src/registry.zig"} },
+    .{ .name = "the tasks held", .patterns = &.{"src/tasks.zig"} },
     .{ .name = "the core and the client", .patterns = &.{
         "src/Server.zig",
         "src/Client.zig",

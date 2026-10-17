@@ -427,12 +427,29 @@ pub const SubscriptionFilter = struct {
     prompts_list_changed: ?bool = null,
     resources_list_changed: ?bool = null,
     resource_subscriptions: ?[]const []const u8 = null,
+    /// The tasks whose status the stream carries (the tasks extension).
+    task_ids: ?[]const []const u8 = null,
 
     pub const strand = .{ .rename_all = .camel_case };
 };
 
 pub const ListenParams = struct {
     notifications: SubscriptionFilter,
+};
+
+/// `tasks/get` and `tasks/cancel` (the tasks extension).
+pub const TaskParams = struct {
+    task_id: []const u8,
+
+    pub const strand = .{ .rename_all = .camel_case };
+};
+
+/// `tasks/update`: answers to what a task waits for.
+pub const UpdateTaskParams = struct {
+    task_id: []const u8,
+    input_responses: Raw,
+
+    pub const strand = .{ .rename_all = .camel_case };
 };
 
 pub const CancelledParams = struct {

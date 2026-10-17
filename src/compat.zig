@@ -190,7 +190,7 @@ pub const Session = struct {
             if (changed.contains(.prompts)) try Server.notify(io, a, sink, "notifications/prompts/list_changed", .{}, "");
             if (changed.contains(.resources)) try Server.notify(io, a, sink, "notifications/resources/list_changed", .{}, "");
             if (changed.contains(.resource)) {
-                const uris = s.listener.takeUpdated(io, a) catch |err| switch (err) {
+                const uris = s.listener.takeChanged(io, a, .resource) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.Canceled => return error.Canceled,
                 };
@@ -259,12 +259,12 @@ pub const Session = struct {
             else => return failure(.invalid_params, "uri is missing"),
         };
         if (on) {
-            s.listener.watch(io, s.gpa, p.uri, s.server.options.limits.watched) catch |err| switch (err) {
+            s.listener.watch(io, s.gpa, .resource, p.uri, s.server.options.limits.watched) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Canceled => return error.Canceled,
                 error.TooMany => return failure(.invalid_params, "more resources than one session may watch"),
             };
-        } else s.listener.unwatch(io, s.gpa, p.uri) catch return error.Canceled;
+        } else s.listener.unwatch(io, s.gpa, .resource, p.uri) catch return error.Canceled;
         return .{ .result = "{}" };
     }
 

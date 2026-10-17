@@ -33,6 +33,8 @@ pub const PromptHandler = @import("registry.zig").PromptHandler;
 pub const meta = @import("meta.zig");
 /// The state a handler keeps across rounds, sealed.
 pub const state = @import("state.zig");
+/// The tasks extension: the tasks a server holds, and how they are written.
+pub const tasks = @import("tasks.zig");
 
 // The tests run in this module, so test support that links parley takes
 // this copy and the test binary holds one parley.

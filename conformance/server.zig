@@ -376,6 +376,68 @@ fn complete(_: ?*anyopaque, _: *Call, _: types.CompleteParams) Call.Error!types.
     return .{ .values = &.{}, .total = 0, .has_more = false };
 }
 
+// The tasks extension's fixtures: `greet` answers as asked; the others may
+// run as tasks, and run as one whenever the client declared the extension.
+
+fn greetNamed(call: *Call, args: struct { name: []const u8 = "friend" }) Call.Error!ToolResult {
+    return .ofText(try call.arena.print("Hello, {s}!", .{args.name}));
+}
+
+fn sleepFor(io: Io, seconds: f64) Call.Error!void {
+    const ns: i96 = @intFromFloat(@max(seconds, 0) * std.time.ns_per_s); // safe: clamped below at zero; the suite asks seconds, not ages
+    io.sleep(.fromNanoseconds(ns), .awake) catch return error.Canceled;
+}
+
+fn slowCompute(call: *Call, args: struct { seconds: f64 = 1, label: []const u8 = "compute" }) Call.Error!ToolResult {
+    _ = try call.runAsTask();
+    try sleepFor(call.io, args.seconds);
+    return .ofText(try call.arena.print("slow_compute({s}) done after {d}s", .{ args.label, args.seconds }));
+}
+
+fn failingJob(call: *Call) Call.Error!ToolResult {
+    _ = try call.runAsTask();
+    try sleepFor(call.io, 1);
+    return .failure("failing_job: intentional tool execution error");
+}
+
+fn protocolErrorJob(call: *Call) Call.Error!ToolResult {
+    _ = try call.runAsTask();
+    try sleepFor(call.io, 0.2);
+    return error.HandlerFailed;
+}
+
+fn confirmDelete(call: *Call, args: struct { filename: []const u8 = "file.txt" }) Call.Error!ToolResult {
+    _ = try call.runAsTask();
+    const answer = try call.elicit("confirm", .{ .form = .{
+        .message = try call.arena.print("Delete {s}?", .{args.filename}),
+        .requested_schema = .{ .bytes = "{\"type\":\"object\",\"properties\":{\"confirm\":{\"type\":\"boolean\"}},\"required\":[\"confirm\"]}" },
+    } }) orelse return error.InputRequired;
+    const Confirmed = struct { confirm: bool = false };
+    const confirmed = if (answer.content) |c| (strand.json.parseLeaky(Confirmed, call.arena, c.bytes, .{ .ignore_unknown_fields = true }) catch Confirmed{}).confirm else false;
+    return .ofText(try call.arena.print("confirm_delete({s}): confirmed = {}", .{ args.filename, confirmed }));
+}
+
+fn multiInput(call: *Call) Call.Error!ToolResult {
+    _ = try call.runAsTask();
+    const schema: strand.json.Raw = .{ .bytes = "{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"]}" };
+    const a = try call.elicit("input-a", .{ .form = .{ .message = "Provide value A", .requested_schema = schema } });
+    const b = try call.elicit("input-b", .{ .form = .{ .message = "Provide value B", .requested_schema = schema } });
+    if (a == null or b == null) return error.InputRequired;
+    return .ofText("multi_input: both values given");
+}
+
+fn toolWithTask(call: *Call) Call.Error!ToolResult {
+    const answer = try call.elicit("user_name", .{ .form = .{
+        .message = "What is your name?",
+        .requested_schema = .{ .bytes = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"]}" },
+    } }) orelse return error.InputRequired;
+    const Named = struct { name: []const u8 = "friend" };
+    const named = if (answer.content) |c| strand.json.parseLeaky(Named, call.arena, c.bytes, .{ .ignore_unknown_fields = true }) catch Named{} else Named{};
+    _ = try call.runAsTask();
+    try sleepFor(call.io, 0.2);
+    return .ofText(try call.arena.print("Hello, {s}! (async)", .{named.name}));
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
@@ -398,6 +460,7 @@ pub fn main(init: std.process.Init) !void {
             .templates = .{ .ttl = .literal("5m") },
             .read = .{ .ttl = .literal("5m"), .scope = .private },
         },
+        .tasks = .{ .poll_interval = .literal("200ms") },
     });
     defer server.deinit();
     server_handle = &server;
@@ -431,6 +494,13 @@ pub fn main(init: std.process.Init) !void {
     try server.addTool(io, .{ .name = "test_logging_tool", .description = "Diagnostic logging validator tool" }, loggingTool);
     try server.addTool(io, .{ .name = "test_trigger_tool_change", .description = "Adds or removes test_dynamic_tool" }, triggerToolChange);
     try server.addTool(io, .{ .name = "test_trigger_prompt_change", .description = "Adds or removes test_dynamic_prompt" }, triggerPromptChange);
+    try server.addTool(io, .{ .name = "greet", .description = "Sync-only greeting fixture (tasks extension)" }, greetNamed);
+    try server.addTool(io, .{ .name = "slow_compute", .description = "Sleeps `seconds`, then answers; runs as a task", .task = .optional }, slowCompute);
+    try server.addTool(io, .{ .name = "failing_job", .description = "Returns a tool execution error; must run as a task", .task = .required }, failingJob);
+    try server.addTool(io, .{ .name = "protocol_error_job", .description = "Fails with a protocol error; runs as a task", .task = .optional }, protocolErrorJob);
+    try server.addTool(io, .{ .name = "confirm_delete", .description = "Asks for a confirmation as a task", .task = .required }, confirmDelete);
+    try server.addTool(io, .{ .name = "multi_input", .description = "Asks for two values at once as a task", .task = .required }, multiInput);
+    try server.addTool(io, .{ .name = "test_tool_with_task", .description = "Asks for a name, then runs as a task", .task = .required }, toolWithTask);
 
     try server.addResource(io, .{ .uri = "test://static-text", .name = "static-text", .title = "Static Text Resource", .description = "A static text resource for testing", .mime_type = "text/plain" }, .{ .read = staticText });
     try server.addResource(io, .{ .uri = "test://static-binary", .name = "static-binary", .title = "Static Binary Resource", .description = "A static binary resource (image) for testing", .mime_type = "image/png" }, .{ .read = staticBinary });

@@ -344,6 +344,9 @@ fn mismatch(e: *Endpoint, io: Io, arena: Allocator, request: *const Request, req
         member(arena, req.params, "name")
     else if (std.mem.eql(u8, req.method, "resources/read"))
         member(arena, req.params, "uri")
+    else if (taskMethod(req.method))
+        // The tasks extension: a task's requests name it, for routing.
+        member(arena, req.params, "taskId")
     else
         null;
     if (subject) |expected| {
@@ -411,6 +414,13 @@ fn rawMember(object: ?[]const u8, name: []const u8) ?[]const u8 {
 }
 
 /// A string member of `params`, or null.
+/// `tasks/get`, `tasks/update` and `tasks/cancel`, the methods that name a
+/// task (the tasks extension, Streamable HTTP routing headers).
+fn taskMethod(method: []const u8) bool {
+    for ([_][]const u8{ "tasks/get", "tasks/update", "tasks/cancel" }) |m| if (std.mem.eql(u8, method, m)) return true;
+    return false;
+}
+
 fn member(arena: Allocator, params: ?[]const u8, name: []const u8) ?[]const u8 {
     const bytes = params orelse return null;
     var members: @import("strand").json.Members = undefined;

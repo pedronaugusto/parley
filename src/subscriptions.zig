@@ -22,6 +22,25 @@ pub const Kind = enum(u3) {
     resources,
     /// A watched resource was updated (its bit says which).
     resource,
+    /// A watched task's status changed (its bit says which).
+    task,
+};
+
+/// What a listener watches one by one, by name: resources by URI, tasks by
+/// id.
+pub const Watch = enum { resource, task };
+
+/// The names a listener watches of one kind, and which changed.
+const Watched = struct {
+    names: std.ArrayList([]const u8) = .empty,
+    /// One bit per name: changed and not yet written.
+    changed: std.DynamicBitSetUnmanaged = .{},
+
+    fn deinit(w: *Watched, gpa: Allocator) void {
+        for (w.names.items) |n| gpa.free(n);
+        w.names.deinit(gpa);
+        w.changed.deinit(gpa);
+    }
 };
 
 /// One open stream.
@@ -32,15 +51,14 @@ pub const Listener = struct {
     id: ?wire.Id,
     /// The kinds of list change asked for.
     lists: std.EnumSet(Kind),
-    /// The resources watched, as given. A legacy session adds to them.
-    uris: std.ArrayList([]const u8) = .empty,
+    /// The resources and the tasks watched, as given. A legacy session adds
+    /// to the resources.
+    watched: std.EnumArray(Watch, Watched) = .initFill(.{}),
     /// Bumped by every change for this listener: the futex its task waits on.
     version: std.atomic.Value(u32) = .init(0),
-    /// Lists changed and not yet written.
+    /// Kinds changed and not yet written.
     pending: std.atomic.Value(u8) = .init(0),
-    /// One bit per entry of `uris`: updated and not yet written.
-    updated: std.DynamicBitSetUnmanaged = .{},
-    /// Private: guards `uris` and `updated`.
+    /// Private: guards `watched`.
     mutex: Io.Mutex = .init,
 
     fn mark(l: *Listener, io: Io, kind: Kind) void {
@@ -61,7 +79,7 @@ pub const Listener = struct {
         return null;
     }
 
-    /// The lists changed since the last call, cleared.
+    /// The kinds changed since the last call, cleared.
     pub fn takeLists(l: *Listener) std.EnumSet(Kind) {
         const bits = l.pending.swap(0, .acquire);
         var set: std.EnumSet(Kind) = .empty;
@@ -72,49 +90,54 @@ pub const Listener = struct {
         return set;
     }
 
-    /// The watched resources updated since the last call, cleared, as
-    /// copies on `arena`.
-    pub fn takeUpdated(l: *Listener, io: Io, arena: Allocator) (Allocator.Error || Io.Cancelable)![]const []const u8 {
+    /// The watched names of `which` changed since the last call, cleared,
+    /// as copies on `arena`.
+    pub fn takeChanged(l: *Listener, io: Io, arena: Allocator, which: Watch) (Allocator.Error || Io.Cancelable)![]const []const u8 {
         try l.mutex.lock(io);
         defer l.mutex.unlock(io);
+        const w = l.watched.getPtr(which);
         var out: std.ArrayList([]const u8) = .empty;
-        var it = l.updated.iterator(.{});
-        while (it.next()) |i| try out.append(arena, try arena.dupe(u8, l.uris.items[i]));
-        l.updated.unsetAll();
+        var it = w.changed.iterator(.{});
+        while (it.next()) |i| try out.append(arena, try arena.dupe(u8, w.names.items[i]));
+        w.changed.unsetAll();
         return out.items;
     }
 
-    /// Watches `uri` too (a legacy `resources/subscribe`), up to `max`.
-    pub fn watch(l: *Listener, io: Io, gpa: Allocator, uri: []const u8, max: usize) (Allocator.Error || Io.Cancelable || error{TooMany})!void {
+    /// Watches `name` too (for resources, also a legacy
+    /// `resources/subscribe`), up to `max` of its kind.
+    pub fn watch(l: *Listener, io: Io, gpa: Allocator, which: Watch, name: []const u8, max: usize) (Allocator.Error || Io.Cancelable || error{TooMany})!void {
         try l.mutex.lock(io);
         defer l.mutex.unlock(io);
-        for (l.uris.items) |u| if (std.mem.eql(u8, u, uri)) return;
-        if (l.uris.items.len >= max) return error.TooMany;
-        try l.updated.resize(gpa, l.uris.items.len + 1, false);
-        const copy = try gpa.dupe(u8, uri);
-        errdefer gpa.free(copy);
-        try l.uris.append(gpa, copy);
+        const w = l.watched.getPtr(which);
+        for (w.names.items) |n| if (std.mem.eql(u8, n, name)) return;
+        if (w.names.items.len >= max) return error.TooMany;
+        try w.names.ensureUnusedCapacity(gpa, 1);
+        try w.changed.resize(gpa, w.names.items.len + 1, false);
+        const copy = gpa.dupe(u8, name) catch |err| {
+            w.changed.resize(gpa, w.names.items.len, false) catch unreachable; // unreachable: shrinking never allocates
+            return err;
+        };
+        w.names.appendAssumeCapacity(copy);
     }
 
-    /// Stops watching `uri` (a legacy `resources/unsubscribe`).
-    pub fn unwatch(l: *Listener, io: Io, gpa: Allocator, uri: []const u8) Io.Cancelable!void {
+    /// Stops watching `name` (a legacy `resources/unsubscribe`).
+    pub fn unwatch(l: *Listener, io: Io, gpa: Allocator, which: Watch, name: []const u8) Io.Cancelable!void {
         try l.mutex.lock(io);
         defer l.mutex.unlock(io);
-        for (l.uris.items, 0..) |u, i| if (std.mem.eql(u8, u, uri)) {
-            gpa.free(u);
-            _ = l.uris.orderedRemove(i);
+        const w = l.watched.getPtr(which);
+        for (w.names.items, 0..) |n, i| if (std.mem.eql(u8, n, name)) {
+            gpa.free(n);
+            _ = w.names.orderedRemove(i);
             // The bits after `i` move down one.
             var k = i;
-            while (k + 1 < l.updated.bit_length) : (k += 1) l.updated.setValue(k, l.updated.isSet(k + 1));
-            l.updated.resize(gpa, l.uris.items.len, false) catch unreachable; // unreachable: shrinking never allocates
+            while (k + 1 < w.changed.bit_length) : (k += 1) w.changed.setValue(k, w.changed.isSet(k + 1));
+            w.changed.resize(gpa, w.names.items.len, false) catch unreachable; // unreachable: shrinking never allocates
             return;
         };
     }
 
     pub fn deinit(l: *Listener, gpa: Allocator) void {
-        for (l.uris.items) |u| gpa.free(u);
-        l.uris.deinit(gpa);
-        l.updated.deinit(gpa);
+        for (&l.watched.values) |*w| w.deinit(gpa);
     }
 };
 
@@ -146,22 +169,28 @@ pub const Hub = struct {
 
     /// A list changed: every listener that asked for `kind` learns it.
     pub fn listChanged(h: *Hub, io: Io, kind: Kind) void {
-        aegis.assert.pre(kind != .resource, "a resource's update names the resource");
+        aegis.assert.pre(kind != .resource and kind != .task, "a resource's update and a task's change name what changed");
         h.mutex.lockUncancelable(io);
         defer h.mutex.unlock(io);
         for (h.listeners.items) |l| if (l.lists.contains(kind)) l.mark(io, kind);
     }
 
-    /// The resource `uri` was updated: every listener watching it learns it.
-    pub fn resourceUpdated(h: *Hub, io: Io, uri: []const u8) void {
+    /// The resource or task `name` changed: every listener watching it
+    /// learns it.
+    pub fn changed(h: *Hub, io: Io, which: Watch, name: []const u8) void {
+        const kind: Kind = switch (which) {
+            .resource => .resource,
+            .task => .task,
+        };
         h.mutex.lockUncancelable(io);
         defer h.mutex.unlock(io);
         for (h.listeners.items) |l| {
             l.mutex.lockUncancelable(io);
             defer l.mutex.unlock(io);
-            for (l.uris.items, 0..) |u, i| if (std.mem.eql(u8, u, uri)) {
-                l.updated.set(i);
-                l.mark(io, .resource);
+            const w = l.watched.getPtr(which);
+            for (w.names.items, 0..) |n, i| if (std.mem.eql(u8, n, name)) {
+                w.changed.set(i);
+                l.mark(io, kind);
             };
         }
     }

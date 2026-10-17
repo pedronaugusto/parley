@@ -7,7 +7,7 @@ const parley = @import("parley");
 const shakedown = @import("shakedown");
 const provenance = @import("preflight_bench_options");
 
-const WorkloadError = error{ OutOfMemory, Malformed, Invalid, WriteFailed, Canceled, Duplicate, InvalidSchema, EntropyUnavailable, Unanswered };
+const WorkloadError = error{ OutOfMemory, Malformed, Invalid, WriteFailed, Canceled, Duplicate, InvalidSchema, TasksNotServed, EntropyUnavailable, Unanswered };
 const Row = shakedown.bench.Row(Bench, WorkloadError);
 
 /// What Claude Code sends to call a tool, `_meta` and all.

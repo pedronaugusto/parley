@@ -44,6 +44,20 @@ pub const ToolSpec = struct {
     output_schema: ?[]const u8 = null,
     /// The tool's `_meta`, one JSON object.
     meta: ?[]const u8 = null,
+    /// Whether a call may run as a task (the tasks extension).
+    task: TaskSupport = .forbidden,
+};
+
+/// Whether a tool's calls may run as tasks: the handler decides per call
+/// with `Call.runAsTask`, when the client declared the extension.
+pub const TaskSupport = enum {
+    /// Every call is answered as it is asked.
+    forbidden,
+    /// A call may run as a task.
+    optional,
+    /// A call must be able to run as a task: a client that did not declare
+    /// the extension is refused (`-32021`) before the handler runs.
+    required,
 };
 
 /// A handler whose types are erased: `arguments` is the call's arguments
@@ -60,6 +74,7 @@ pub const Tool = struct {
     handler: ToolHandler,
     /// The arguments its schema mirrors into `Mcp-Param-{name}` headers.
     headers: []const HeaderParam = &.{},
+    task: TaskSupport = .forbidden,
 };
 
 /// An argument a tool's input schema marks with `x-mcp-header`: an HTTP

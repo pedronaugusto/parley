@@ -9,6 +9,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Breaking
 
 - `registry.freeHeaderParams` frees the slice `headerParams` returned too; the caller freed it apart.
+- `Server.AddError` has `TasksNotServed`: a tool that may run as a task, on a server without `Options.tasks`.
 
 ### Fixed
 
@@ -17,6 +18,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- The tasks extension (`io.modelcontextprotocol/tasks`), both sides. Server: `Options.tasks` (how many held, their time to live, the poll interval), `ToolSpec.task` (`forbidden`, `optional`, `required`), `Call.runAsTask` (the call answered with a task, the handler going on as it), `tasks/get`, `tasks/update` (input given, the handler run again with it), `tasks/cancel`, task statuses on `subscriptions/listen` (`taskIds`, `notifications/tasks`), `-32021` for a required-task tool or a task method asked by a client that did not declare it, `Mcp-Name` held to the task's id over HTTP. Client: `Options.tasks` declares it; a tool call answered with a task is polled to its end, its input given, and returned as if answered at once. The conformance server's task fixtures; the suite's ten tasks scenarios pass.
+- `Server.Limits.quiet_rounds`: rounds a task's handler may run back to back asking for nothing.
 - Properties, fuzzed, over the header values a peer sends (the Base64 sentinel) and over the `x-mcp-header` marks of any input schema.
 
 ## [0.1.0] - 2026-10-17

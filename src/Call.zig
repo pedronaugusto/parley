@@ -47,6 +47,14 @@ state_out: ?[]const u8 = null,
 missing: ?types.InputKind = null,
 /// Private: the last progress sent, which every next one must pass.
 progress_sent: ?f64 = null,
+/// Private: how the call becomes a task, when it may.
+task: ?TaskHook = null,
+
+/// How a call becomes a task: given by the server for a call that may.
+pub const TaskHook = struct {
+    context: *anyopaque,
+    become: *const fn (context: *anyopaque) Error!bool,
+};
 
 /// What a handler fails with, beside its own errors.
 pub const Error = error{
@@ -102,6 +110,21 @@ pub fn sample(call: *Call, key: []const u8, request: types.CreateMessageParams) 
 pub fn roots(call: *Call, key: []const u8) Error!?types.ListRootsResult {
     const raw = try call.input(key, .roots) orelse return null;
     return try parseAnswer(types.ListRootsResult, call.arena, raw);
+}
+
+/// Answers the request with a task (the tasks extension) and goes on as
+/// it: the client polls for the outcome. True once the call runs as a task;
+/// false when it may not (the tool forbids it, the client did not declare
+/// the extension, the server holds as many tasks as it takes or has no task
+/// to run it on), and the call goes on to be answered as it was asked.
+///
+/// From here the request's progress and log lines go nowhere, and input
+/// asked for (`error.InputRequired`) is the task's: the client gives it
+/// with `tasks/update`, and the handler runs again with it, as a retry
+/// would. Input gathered before is the request's own rounds.
+pub fn runAsTask(call: *Call) Error!bool {
+    const hook = call.task orelse return false;
+    return hook.become(hook.context);
 }
 
 /// The bytes the handler kept in the round before, or null in the first.
