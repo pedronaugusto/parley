@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-17
+
+### Added
+
+- `parley.oauth.Authorizer` grants `.enterprise` and `.jwt_bearer`. `.enterprise` is MCP's enterprise-managed authorization: the user's token at the enterprise's identity provider (`Options.enterprise`: its issuer, its token endpoint or discovery, the client there, the token as a `TokenSource` the application keeps) exchanged for an ID-JAG naming the authorization server, the client and the resource, which the authorization server redeems for the access token; no sign-in, and a step-up is a new exchange for the wider scope. `.jwt_bearer` presents a workload's identity token (`Options.assertion`) as the grant, with the client registered beforehand or none. Conformance: `auth/enterprise-managed-authorization` and `auth/wif-jwt-bearer` pass at both revisions (not scored); every scored client scenario is unchanged.
+- A secret registered beforehand is also sent as `client_secret_jwt` where the server lists only that.
+
+### Changed
+
+- `parley.oauth` pins clearance 0.3.0.
+
 ## [0.5.0] - 2026-10-17
 
 ### Breaking
@@ -98,6 +109,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `wire`: JSON-RPC 2.0 as MCP speaks it. `decode` reads a message's envelope and tells a request, a notification, a result and an error apart, leaving `params` and `result` as their bytes; a refusal names its code and, when it could be read, the id. `writeRequest`, `writeNotification`, `writeResult` (and `beginResult`/`endResult` around a result written in place) and `writeFailure`.
 - `Revision`: the protocol revisions parley speaks.
 
-[Unreleased]: https://github.com/pedronaugusto/parley/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/pedronaugusto/parley/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/pedronaugusto/parley/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/pedronaugusto/parley/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/pedronaugusto/parley/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/pedronaugusto/parley/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/pedronaugusto/parley/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/pedronaugusto/parley/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/pedronaugusto/parley/releases/tag/v0.1.0
