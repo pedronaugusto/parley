@@ -1,6 +1,6 @@
 .{
     .name = .parley,
-    .version = "0.4.0",
+    .version = "0.5.0",
     .minimum_zig_version = "0.17.0",
     .fingerprint = 0xaf1afeb663f077c7, // Changing this has security and trust implications.
     // What a consumer fetches: the modules and their documents. The tests,
@@ -29,8 +29,8 @@
             .lazy = true,
         },
         .clearance = .{
-            .url = "git+https://github.com/pedronaugusto/clearance#07323ac09fa0438c71329e86ad73f45a24112b74",
-            .hash = "clearance-0.2.2--QKm-LuaCgDnu6fgYby8WvTbtPzOXX5dKmYaqV3gk6AA",
+            .url = "git+https://github.com/pedronaugusto/clearance?ref=v0.2.3#e98fab1ccdd29000441be12b9daa66898f86892b",
+            .hash = "clearance-0.2.3--QKm-GKaCgBt5Ua7sdDmjFepIe1u7NxWCa7DCmrMVlQJ",
             .lazy = true,
         },
         .conduit = .{

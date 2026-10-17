@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-17
+
 ### Breaking
 
 - `http.Transport.init` takes `Options`; its `authorization` gives each request its credentials and answers a 401 or 403 (`parley.oauth.Authorizer` is one). A refusal that stands is `Client.RequestError.Unauthorized`, which `Client.connect` returns instead of trying a session.
