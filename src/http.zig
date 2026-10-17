@@ -12,4 +12,5 @@ pub const headers = @import("http/headers.zig");
 // The tests run in this module, against the `parley` module it imports.
 test {
     _ = @import("http/tests.zig");
+    _ = @import("http/property_test.zig");
 }

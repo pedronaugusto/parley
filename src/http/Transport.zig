@@ -61,7 +61,6 @@ pub fn deinit(t: *Transport) void {
 fn free(t: *Transport, m: Marked) void {
     t.gpa.free(m.tool);
     parley.registry.freeHeaderParams(t.gpa, m.params);
-    t.gpa.free(m.params);
 }
 
 pub fn transport(t: *Transport) Client.Transport {

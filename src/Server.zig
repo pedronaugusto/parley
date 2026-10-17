@@ -155,7 +155,6 @@ pub fn deinit(s: *Server) void {
 fn freeEntry(s: *Server, entry: anytype) void {
     if (@TypeOf(entry) == *registry.Tool) {
         registry.freeHeaderParams(s.gpa, entry.headers);
-        s.gpa.free(entry.headers);
     }
     inline for (@typeInfo(@TypeOf(entry.*)).@"struct".field_names) |name| {
         const F = @FieldType(@TypeOf(entry.*), name);
@@ -198,10 +197,7 @@ fn addToolWith(s: *Server, io: Io, spec: registry.ToolSpec, input: []const u8, o
     const listed = try registry.listTool(s.gpa, spec, input, output);
     errdefer s.gpa.free(listed);
     const params = try registry.headerParams(s.gpa, input);
-    errdefer {
-        registry.freeHeaderParams(s.gpa, params);
-        s.gpa.free(params);
-    }
+    errdefer registry.freeHeaderParams(s.gpa, params);
     tool.* = .{ .name = name, .listed = listed, .handler = handler, .headers = params };
     try s.insert(io, .tools, &s.tools, tool, name);
 }

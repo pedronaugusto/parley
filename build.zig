@@ -69,8 +69,16 @@ pub fn dev(b: *std.Build, tools: type) void {
     // The properties alone, every test of the binary a property: what the
     // fuzzer runs over every parser of what a peer sends.
     const properties = suite(b, "parley-properties", target, optimize, &.{"property_test."});
-    b.step("properties", "Run the properties alone").dependOn(&b.addRunArtifact(properties).step);
+    const http_module = package.module("parley.http");
+    if (http_module.import_table.get("shakedown") == null) {
+        http_module.addImport("shakedown", b.dependency("shakedown", .{ .target = target, .optimize = optimize }).module("shakedown"));
+    }
+    const http_properties = b.addTest(.{ .name = "parley-http-properties", .filters = &.{"property_test."}, .root_module = http_module });
+    const properties_step = b.step("properties", "Run the properties alone");
+    properties_step.dependOn(&b.addRunArtifact(properties).step);
+    properties_step.dependOn(&b.addRunArtifact(http_properties).step);
     check.dependOn(&properties.step);
+    check.dependOn(&http_properties.step);
 
     // examples/usage.zig is also README.md's Usage blocks (bay docs --
     // usage), so the code a reader copies is code the tests run.

@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Breaking
+
+- `registry.freeHeaderParams` frees the slice `headerParams` returned too; the caller freed it apart.
+
+### Fixed
+
+- `registry.headerParams` kept the marks it had found when it refused a schema: a client listing a server's tools lost memory with each input schema it refused.
+- stdio: `logging/setLevel`, `resources/subscribe` and `resources/unsubscribe` are answered before the next line is read, so the requests after them find them applied (a tool's log line sent right after `logging/setLevel` could be dropped).
+
+### Added
+
+- Properties, fuzzed, over the header values a peer sends (the Base64 sentinel) and over the `x-mcp-header` marks of any input schema.
+
 ## [0.1.0] - 2026-10-17
 
 ### Added

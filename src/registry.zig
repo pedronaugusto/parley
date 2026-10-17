@@ -84,7 +84,10 @@ pub fn headerParams(gpa: Allocator, schema: []const u8) (Allocator.Error || erro
     defer arena.deinit();
     const root = strand.json.parseLeaky(strand.json.Value, arena.allocator(), schema, .{}) catch return error.InvalidSchema;
     var found: std.ArrayList(HeaderParam) = .empty;
-    errdefer freeHeaderParams(gpa, found.items);
+    errdefer {
+        for (found.items) |p| freeHeaderParam(gpa, p);
+        found.deinit(gpa);
+    }
     try collectHeaders(gpa, &found, root, &.{});
     if (!marksBelowProperties(root, false)) return error.InvalidSchema;
     for (found.items, 0..) |a, i| for (found.items[0..i]) |b| {
@@ -93,12 +96,20 @@ pub fn headerParams(gpa: Allocator, schema: []const u8) (Allocator.Error || erro
     return found.toOwnedSlice(gpa);
 }
 
+/// Frees what `headerParams` returned.
 pub fn freeHeaderParams(gpa: Allocator, params: []const HeaderParam) void {
-    for (params) |p| {
-        gpa.free(p.name);
-        for (p.path) |step| gpa.free(step);
-        gpa.free(p.path);
-    }
+    for (params) |p| freeHeaderParam(gpa, p);
+    gpa.free(params);
+}
+
+fn freeHeaderParam(gpa: Allocator, p: HeaderParam) void {
+    gpa.free(p.name);
+    freePath(gpa, p.path);
+}
+
+fn freePath(gpa: Allocator, path: []const []const u8) void {
+    for (path) |step| gpa.free(step);
+    gpa.free(path);
 }
 
 fn get(object: anytype, key: []const u8) ?strand.json.Value {
@@ -119,9 +130,18 @@ fn collectHeaders(gpa: Allocator, found: *std.ArrayList(HeaderParam), schema: st
             const t = get(p.value.object, "type") orelse return error.InvalidSchema;
             if (t != .string) return error.InvalidSchema;
             const kind = std.meta.stringToEnum(HeaderParam.Kind, t.string) orelse return error.InvalidSchema;
+            try found.ensureUnusedCapacity(gpa, 1);
             const steps = try gpa.alloc([]const u8, here.len);
-            for (steps, here) |*step, name| step.* = try gpa.dupe(u8, name);
-            try found.append(gpa, .{ .name = try gpa.dupe(u8, mark.string), .path = steps, .kind = kind });
+            var filled: usize = 0;
+            errdefer {
+                for (steps[0..filled]) |step| gpa.free(step);
+                gpa.free(steps);
+            }
+            for (steps, here) |*step, name| {
+                step.* = try gpa.dupe(u8, name);
+                filled += 1;
+            }
+            found.appendAssumeCapacity(.{ .name = try gpa.dupe(u8, mark.string), .path = steps, .kind = kind });
         }
         try collectHeaders(gpa, found, p.value, here);
     }

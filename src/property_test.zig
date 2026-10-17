@@ -162,3 +162,34 @@ test "sealed state opens only unchanged, for its own request" {
     defer sealer.deinit();
     try shake.check(std.testing.allocator, &sealer, sealedState, .{ .cases = 300 });
 }
+
+const registry = @import("registry.zig");
+
+const schema_examples = [_][]const u8{
+    "{\"type\":\"object\",\"properties\":{\"region\":{\"type\":\"string\",\"x-mcp-header\":\"Region\"},\"n\":{\"type\":\"integer\",\"x-mcp-header\":\"N\"}}}",
+    "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"object\",\"properties\":{\"b\":{\"type\":\"boolean\",\"x-mcp-header\":\"B\"}}}}}",
+    "{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"string\",\"x-mcp-header\":\"x\"},\"y\":{\"type\":\"string\",\"x-mcp-header\":\"X\"}}}",
+    "{\"type\":\"object\",\"items\":{\"x-mcp-header\":\"I\"},\"properties\":{}}",
+};
+
+/// The `x-mcp-header` marks of any input schema (a client reads them from
+/// any server): found or refused, never more than once a name, each a
+/// token naming a property's place; nothing kept when refused.
+fn anySchema(_: void, c: *shake.Case) !void {
+    var buffer: [600]u8 = undefined;
+    const schema = shake.gen.mutated(c.source, &buffer, &schema_examples);
+    const gpa = std.testing.allocator;
+    const params = registry.headerParams(gpa, schema) catch |err| switch (err) {
+        error.InvalidSchema => return,
+        error.OutOfMemory => return err,
+    };
+    defer registry.freeHeaderParams(gpa, params);
+    for (params, 0..) |p, i| {
+        if (p.name.len == 0 or p.path.len == 0) return error.EmptyMark;
+        for (params[0..i]) |q| if (std.ascii.eqlIgnoreCase(p.name, q.name)) return error.NameTwice;
+    }
+}
+
+test "any input schema's header marks are found or refused" {
+    try shake.check(std.testing.allocator, {}, anySchema, .{ .cases = 2000 });
+}

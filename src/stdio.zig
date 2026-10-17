@@ -146,9 +146,10 @@ const Connection = struct {
                     job.destroy();
                     return c.writeFailure(request.id, .internal_error, "the server is answering as many requests as it takes at once");
                 }
-                // The handshake is answered before the next line is read, so
-                // the requests after it find the session open.
-                if (job.session != null and std.mem.eql(u8, request.method, "initialize")) return Job.run(job);
+                // What sets the session's state (the handshake, the log
+                // level, subscriptions) is answered before the next line is
+                // read, so the requests after it find it set.
+                if (job.session != null and setsSession(request.method)) return Job.run(job);
                 c.group.concurrent(c.io, Job.run, .{job}) catch {
                     // No task to spare: answered here, before the next line
                     // is read (and it cannot be canceled).
@@ -180,6 +181,12 @@ const Connection = struct {
             _ = task.cancel(c.io) catch {};
             c.session_stream = null;
         }
+    }
+
+    fn setsSession(method: []const u8) bool {
+        const methods = [_][]const u8{ "initialize", "logging/setLevel", "resources/subscribe", "resources/unsubscribe" };
+        for (methods) |m| if (std.mem.eql(u8, method, m)) return true;
+        return false;
     }
 
     /// Whether a request belongs to the session: its handshake, or one
