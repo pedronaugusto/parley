@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-17
+
 ### Changed
 
 - Pins conduit 0.8.5 (`Child.memory`, which the benchmarks read a server's memory with) and, for development, shakedown 0.4.10 (latency rows).
