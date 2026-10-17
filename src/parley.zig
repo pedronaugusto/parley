@@ -1,33 +1,35 @@
 //! parley: the Model Context Protocol (MCP) for Zig.
 //!
+//! - `Server`: what a server offers, and one request answered with one
+//!   reply, whatever carries it.
+//! - `stdio`: a server over a process's standard streams (or any byte
+//!   stream), one message a line.
 //! - `wire`: JSON-RPC 2.0 as MCP speaks it, read and written without I/O.
+//! - `types`: MCP's data.
 const std = @import("std");
 
-/// JSON-RPC 2.0 messages: read off their bytes, told apart, and written.
 pub const wire = @import("wire.zig");
-
-/// The protocol revisions parley speaks, newest first. 2026-07-28 is
-/// stateless; the ones before it open a session with `initialize`.
-pub const Revision = enum {
-    @"2026-07-28",
-    @"2025-11-25",
-    @"2025-06-18",
-
-    /// The newest revision.
-    pub const latest: Revision = .@"2026-07-28";
-
-    /// Whether the revision carries version, identity and capabilities on
-    /// every request rather than in an `initialize` handshake.
-    pub fn stateless(r: Revision) bool {
-        return r == .@"2026-07-28";
-    }
-
-    /// The revision a version string names, or null for one parley does not
-    /// speak.
-    pub fn parse(text: []const u8) ?Revision {
-        return std.meta.stringToEnum(Revision, text);
-    }
-};
+pub const types = @import("types.zig");
+pub const Revision = @import("revision.zig").Revision;
+pub const Server = @import("Server.zig");
+pub const stdio = @import("stdio.zig");
+pub const Call = @import("Call.zig");
+pub const Context = @import("context.zig").Context;
+pub const Sink = @import("context.zig").Sink;
+pub const ToolResult = @import("registry.zig").ToolResult;
+pub const ToolSpec = @import("registry.zig").ToolSpec;
+pub const ToolHandler = @import("registry.zig").ToolHandler;
+pub const ResourceSpec = @import("registry.zig").ResourceSpec;
+pub const TemplateSpec = @import("registry.zig").TemplateSpec;
+pub const ReadResult = @import("registry.zig").ReadResult;
+pub const ReadHandler = @import("registry.zig").ReadHandler;
+pub const PromptSpec = @import("registry.zig").PromptSpec;
+pub const PromptResult = @import("registry.zig").PromptResult;
+pub const PromptHandler = @import("registry.zig").PromptHandler;
+/// A request's `_meta`, read.
+pub const meta = @import("meta.zig");
+/// The state a handler keeps across rounds, sealed.
+pub const state = @import("state.zig");
 
 // The tests run in this module, so test support that links parley takes
 // this copy and the test binary holds one parley.

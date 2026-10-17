@@ -152,7 +152,7 @@ fn decodeInto(arena: Allocator, bytes: []const u8, limits: strand.core.Limits, f
     const null_id = if (seen[1]) |raw| std.mem.eql(u8, raw, "null") else false;
     if (seen[1]) |raw| {
         if (!null_id) {
-            id = readId(arena, raw) catch |err| switch (err) {
+            id = idFrom(arena, raw) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Invalid => return refuse(fault, .invalid_request, "the id is not a string or an integer"),
             };
@@ -213,7 +213,8 @@ fn firstByte(bytes: []const u8) u8 {
     return 0;
 }
 
-fn readId(arena: Allocator, raw: []const u8) error{ Invalid, OutOfMemory }!Id {
+/// The id `raw` (one JSON value) is: a string or an integer.
+pub fn idFrom(arena: Allocator, raw: []const u8) error{ Invalid, OutOfMemory }!Id {
     if (raw[0] == '"') return .{ .string = try readString(arena, raw) };
     return .{ .integer = json.intOf(i64, raw) orelse return error.Invalid };
 }
