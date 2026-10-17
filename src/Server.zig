@@ -46,7 +46,9 @@ completer: ?Completer = null,
 generations: std.EnumArray(List, u32) = .initFill(0),
 /// The open change streams.
 hub: subscriptions.Hub = .{},
-/// The tasks held, when the server serves the tasks extension.
+/// The tasks held, when the server serves the tasks extension. Whether it
+/// does is asked of `options.tasks`: reading this optional whole would copy
+/// its group while rounds change it.
 task_table: ?tasks.Table = null,
 
 pub const Options = struct {
@@ -209,7 +211,7 @@ pub fn addDynamicTool(s: *Server, io: Io, spec: registry.ToolSpec, handler: regi
 }
 
 fn addToolWith(s: *Server, io: Io, spec: registry.ToolSpec, input: []const u8, output: ?[]const u8, handler: registry.ToolHandler) AddError!void {
-    if (spec.task != .forbidden and s.task_table == null) return error.TasksNotServed;
+    if (spec.task != .forbidden and s.options.tasks == null) return error.TasksNotServed;
     const tool = try s.gpa.create(registry.Tool);
     errdefer s.gpa.destroy(tool);
     const name = try s.gpa.dupe(u8, spec.name);
@@ -576,7 +578,7 @@ fn discover(s: *Server, arena: Allocator, context: *const Context) HandleError!R
     };
     try r.field("supportedVersions", versions);
     var caps = s.capabilities();
-    if (s.task_table != null) caps.extensions = .{ .bytes = extensions_json };
+    if (s.options.tasks != null) caps.extensions = .{ .bytes = extensions_json };
     try r.field("capabilities", caps);
     if (s.options.instructions) |text| try r.field("instructions", text);
     return .{ .result = try r.end(s, s.options.cache.discover, false) };
@@ -754,7 +756,7 @@ fn callTool(s: *Server, io: Io, arena: Allocator, request: wire.Request, context
         break :found null;
     } orelse return try unknown(arena, "Unknown tool: ", p.name);
     if (!s.admitted(context, .tools, p.name)) return try unknown(arena, "Unknown tool: ", p.name);
-    const tasks_declared = s.task_table != null and context.revision.stateless() and context.client.hasExtension(tasks.extension);
+    const tasks_declared = s.options.tasks != null and context.revision.stateless() and context.client.hasExtension(tasks.extension);
     // A tool that cannot answer but as a task, asked by a client that
     // cannot take one (tasks extension: required capabilities).
     if (task_support == .required and !tasks_declared) return missingTasks();
