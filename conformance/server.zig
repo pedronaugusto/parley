@@ -80,7 +80,7 @@ fn sampling(call: *Call, args: struct { prompt: []const u8 }) Call.Error!ToolRes
     const messages = try call.arena.dupe(types.SamplingMessage, &.{.{ .role = .user, .content = .{ .bytes = message } }});
     const answer = try call.sample("sample", .{ .messages = messages, .max_tokens = 100 }) orelse return error.InputRequired;
     const Text = struct { text: ?[]const u8 = null };
-    const said = strand.json.parseLeaky(Text, call.arena, answer.content.bytes, parley.types.read_options) catch Text{};
+    const said = strand.json.parseLeaky(Text, call.arena, answer.content.bytes, parley.types.readOptions(call.limits)) catch Text{};
     return .ofText(try call.arena.print("LLM response: {s}", .{said.text orelse "No response"}));
 }
 
@@ -143,7 +143,7 @@ fn capitalQuestion(call: *Call) Call.Error!types.CreateMessageParams {
 
 fn sampledText(call: *Call, result: types.CreateMessageResult) []const u8 {
     const Text = struct { text: ?[]const u8 = null };
-    const t = strand.json.parseLeaky(Text, call.arena, result.content.bytes, parley.types.read_options) catch return "no response";
+    const t = strand.json.parseLeaky(Text, call.arena, result.content.bytes, parley.types.readOptions(call.limits)) catch return "no response";
     return t.text orelse "no response";
 }
 
@@ -164,7 +164,7 @@ fn mrtrRequestState(call: *Call) Call.Error!ToolResult {
     } });
     if (confirm) |answer| if (std.mem.eql(u8, call.state() orelse "", "request-state")) {
         const Ok = struct { ok: bool = false };
-        const ok = if (answer.content) |c| strand.json.parseLeaky(Ok, call.arena, c.bytes, parley.types.read_options) catch Ok{} else Ok{};
+        const ok = if (answer.content) |c| strand.json.parseLeaky(Ok, call.arena, c.bytes, parley.types.readOptions(call.limits)) catch Ok{} else Ok{};
         if (ok.ok) return .ofText("state-ok: requestState validated");
     };
     call.pending.clearRetainingCapacity();

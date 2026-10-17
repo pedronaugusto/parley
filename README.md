@@ -213,10 +213,17 @@ it, and to every session's stream. A change never queues: each stream keeps a
 flag per list and a bit per watched resource, so a slow reader costs the same
 however many changes it misses.
 
+**Limits.** One message limit, `Server.Options.limits.message` (16 MiB by
+default; `Client.Options.limits.message` on the client), bounds every message
+either way: what a transport reads (a longer line or body is refused unread),
+every read of a value within it (strand's limits grow with it, so a raised
+limit is never undercut by a default inside it), and every answer written (one
+past it is answered as an internal error instead).
+
 **stdio.** One message a line. Each request is a task of its own: a long tool
 holds up nothing behind it, and `notifications/cancelled` cancels its task,
-after which nothing more is written for it. A line past `max_message` is
-refused and the next one read. At the end of input the requests read are
+after which nothing more is written for it. A line past the message limit
+is refused and the next one read. At the end of input the requests read are
 answered and the streams ended.
 
 **Streamable HTTP.** One endpoint, POST. A request's `Host` and `Origin` must

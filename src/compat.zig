@@ -108,7 +108,7 @@ pub const Session = struct {
         if (std.mem.eql(u8, request.method, "server/discover") or std.mem.eql(u8, request.method, "subscriptions/listen"))
             return failure(.method_not_found, "Method not found");
 
-        const m = meta.read(arena, request.params) catch |err| switch (err) {
+        const m = meta.read(arena, request.params, s.server.jsonLimits()) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Malformed => return failure(.invalid_params, "params or _meta are not what the schema says"),
         };
@@ -139,7 +139,7 @@ pub const Session = struct {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Refused => return failure(.internal_error, "the client did not give the input the request needs"),
             };
-            current.params = try withInput(arena, current.params, responses, ir.state);
+            current.params = try withInput(arena, s.server.jsonLimits(), current.params, responses, ir.state);
         }
     }
 
@@ -186,15 +186,15 @@ pub const Session = struct {
             defer turn.deinit();
             const a = turn.allocator();
             const changed = s.listener.takeLists();
-            if (changed.contains(.tools)) try Server.notify(io, a, sink, "notifications/tools/list_changed", .{}, "");
-            if (changed.contains(.prompts)) try Server.notify(io, a, sink, "notifications/prompts/list_changed", .{}, "");
-            if (changed.contains(.resources)) try Server.notify(io, a, sink, "notifications/resources/list_changed", .{}, "");
+            if (changed.contains(.tools)) try s.server.notify(io, a, sink, "notifications/tools/list_changed", .{}, "");
+            if (changed.contains(.prompts)) try s.server.notify(io, a, sink, "notifications/prompts/list_changed", .{}, "");
+            if (changed.contains(.resources)) try s.server.notify(io, a, sink, "notifications/resources/list_changed", .{}, "");
             if (changed.contains(.resource)) {
                 const uris = s.listener.takeChanged(io, a, .resource) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.Canceled => return error.Canceled,
                 };
-                for (uris) |uri| try Server.notify(io, a, sink, "notifications/resources/updated", .{ .uri = uri }, "");
+                for (uris) |uri| try s.server.notify(io, a, sink, "notifications/resources/updated", .{ .uri = uri }, "");
             }
         }
     }
@@ -218,7 +218,7 @@ pub const Session = struct {
         if (s.lifecycle.current() != .awaiting) return failure(.invalid_request, "the session is initialized already");
         const owned = s.arena.allocator();
         const params = try owned.dupe(u8, request.params orelse return failure(.invalid_params, "initialize has no params"));
-        const p = strand.json.parseLeaky(Params, owned, params, types.read_options) catch |err| switch (err) {
+        const p = strand.json.parseLeaky(Params, owned, params, types.readOptions(s.server.jsonLimits())) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return failure(.invalid_params, "initialize's params are not what the schema says"),
         };
@@ -233,7 +233,7 @@ pub const Session = struct {
         w.print("{{\"protocolVersion\":\"{s}\",\"capabilities\":", .{s.revision.text()}) catch return error.OutOfMemory;
         w.writeAll(try s.server.capabilitiesJson(io, arena)) catch return error.OutOfMemory;
         w.writeAll(",\"serverInfo\":") catch return error.OutOfMemory;
-        strand.json.write(w, s.server.options.info, types.write_options) catch return error.OutOfMemory;
+        strand.json.write(w, s.server.options.info, types.writeOptions(s.server.jsonLimits())) catch return error.OutOfMemory;
         if (s.server.options.instructions) |text| {
             w.writeAll(",\"instructions\":") catch return error.OutOfMemory;
             wire.writeString(w, text) catch return error.OutOfMemory;
@@ -243,7 +243,7 @@ pub const Session = struct {
     }
 
     fn setLevel(s: *Session, io: Io, arena: Allocator, request: wire.Request) Server.HandleError!Server.Reply {
-        const p = strand.json.parseLeaky(struct { level: types.LoggingLevel }, arena, request.params orelse "{}", types.read_options) catch |err| switch (err) {
+        const p = strand.json.parseLeaky(struct { level: types.LoggingLevel }, arena, request.params orelse "{}", types.readOptions(s.server.jsonLimits())) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return failure(.invalid_params, "level is not a logging level"),
         };
@@ -254,7 +254,7 @@ pub const Session = struct {
     }
 
     fn subscribe(s: *Session, io: Io, arena: Allocator, request: wire.Request, on: bool) Server.HandleError!Server.Reply {
-        const p = strand.json.parseLeaky(struct { uri: []const u8 }, arena, request.params orelse "{}", types.read_options) catch |err| switch (err) {
+        const p = strand.json.parseLeaky(struct { uri: []const u8 }, arena, request.params orelse "{}", types.readOptions(s.server.jsonLimits())) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return failure(.invalid_params, "uri is missing"),
         };
@@ -287,7 +287,7 @@ pub const Session = struct {
             var out: Writer.Allocating = .init(arena);
             const w = &out.writer;
             w.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"{s}\",\"params\":", .{ o.id, r.request.method() }) catch return error.OutOfMemory;
-            writeParams(w, r.request) catch return error.OutOfMemory;
+            writeParams(w, r.request, s.server.jsonLimits()) catch return error.OutOfMemory;
             w.writeByte('}') catch return error.OutOfMemory;
             sink.send(io, out.written()) catch |err| return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
@@ -341,12 +341,12 @@ const Outgoing = struct {
 
 /// A request's params as the session sends them: what was asked, without
 /// the method that 2026-07-28 wraps around it.
-fn writeParams(w: *Writer, request: types.InputRequest) !void {
+fn writeParams(w: *Writer, request: types.InputRequest, limits: strand.core.Limits) !void {
     switch (request) {
         .elicit => |e| switch (e) {
             // The form mode is the only one before 2025-11-25, which also
             // reads one without a mode.
-            .form => |f| try strand.json.write(w, f, types.write_options),
+            .form => |f| try strand.json.write(w, f, types.writeOptions(limits)),
             .url => |u| {
                 try w.writeAll("{\"mode\":\"url\",\"message\":");
                 try wire.writeString(w, u.message);
@@ -355,21 +355,21 @@ fn writeParams(w: *Writer, request: types.InputRequest) !void {
                 try w.writeByte('}');
             },
         },
-        .sample => |p| try strand.json.write(w, p, types.write_options),
+        .sample => |p| try strand.json.write(w, p, types.writeOptions(limits)),
         .roots => try w.writeAll("{}"),
     }
 }
 
 /// `params` with `inputResponses` and `requestState` (when there is one)
 /// set, as a 2026-07-28 client's retry carries them.
-fn withInput(arena: Allocator, params: ?[]const u8, responses: []const u8, state: ?[]const u8) Allocator.Error![]const u8 {
+fn withInput(arena: Allocator, limits: strand.core.Limits, params: ?[]const u8, responses: []const u8, state: ?[]const u8) Allocator.Error![]const u8 {
     var out: Writer.Allocating = .init(arena);
     const w = &out.writer;
     w.writeByte('{') catch return error.OutOfMemory;
     var first = true;
     if (params) |object| {
         var members: strand.json.Members = undefined;
-        members.init(object, .{});
+        members.init(object, .{ .limits = limits });
         while (members.next() catch null) |m| {
             if (m.is("inputResponses") or m.is("requestState")) continue;
             if (!first) w.writeByte(',') catch return error.OutOfMemory;

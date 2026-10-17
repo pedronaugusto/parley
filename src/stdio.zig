@@ -24,8 +24,6 @@ const Allocator = std.mem.Allocator;
 pub const Options = struct {
     /// The session an `initialize` opens (2025-11-25 and before).
     session: compat.Options = .{},
-    /// The longest message read; a longer line is refused and passed over.
-    max_message: aegis.units.Bytes(u32) = .literal("16MiB"),
     /// Requests answered at once; one past it is refused as busy.
     max_in_flight: u32 = 64,
 };
@@ -94,7 +92,9 @@ const Connection = struct {
     /// The next line into `job`'s buffer, without its line break.
     fn readLine(c: *Connection, in: *Io.Reader, job: *Job) ServeError!Read {
         var line: Io.Writer.Allocating = .init(job.arena.allocator());
-        const limit = c.options.max_message.raw();
+        // A longer line is refused and passed over; the line break is
+        // looked for one byte past it.
+        const limit = @as(usize, c.server.options.limits.message.raw()) + 1;
         const n = in.streamDelimiterLimit(&line.writer, '\n', .limited(limit)) catch |err| switch (err) {
             error.ReadFailed => return error.ReadFailed,
             error.WriteFailed => return error.OutOfMemory,
@@ -125,7 +125,7 @@ const Connection = struct {
 
     fn dispatch(c: *Connection, job: *Job) ServeError!void {
         var fault: wire.Fault = .{};
-        const message = wire.decode(job.arena.allocator(), job.line, .{ .fault = &fault }) catch |err| {
+        const message = wire.decode(job.arena.allocator(), job.line, .{ .fault = &fault, .limits = c.server.jsonLimits() }) catch |err| {
             job.destroy();
             return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
@@ -192,7 +192,7 @@ const Connection = struct {
     /// Whether a request belongs to the session: its handshake, or one
     /// without the version a 2026-07-28 request carries in its `_meta`.
     fn sessionEra(job: *Job) bool {
-        const m = meta.read(job.arena.allocator(), job.request.params) catch return true;
+        const m = meta.read(job.arena.allocator(), job.request.params, job.conn.server.jsonLimits()) catch return true;
         return m.version == null;
     }
 
@@ -249,8 +249,9 @@ const Connection = struct {
     /// is canceled. One it does not name, or one already answered, is
     /// passed over (cancellation §error handling).
     fn cancel(c: *Connection, arena: Allocator, params: ?[]const u8) ServeError!void {
-        const p = strand.json.parseLeaky(types.CancelledParams, arena, params orelse return, types.read_options) catch return;
-        const id = wire.idFrom(arena, p.request_id.bytes) catch return;
+        const limits = c.server.jsonLimits();
+        const p = strand.json.parseLeaky(types.CancelledParams, arena, params orelse return, types.readOptions(limits)) catch return;
+        const id = wire.idFrom(arena, p.request_id.bytes, limits) catch return;
         try c.jobs_mutex.lock(c.io);
         defer c.jobs_mutex.unlock(c.io);
         for (c.jobs.items) |j| if (j.request.id.eql(id)) {
@@ -402,7 +403,6 @@ pub const Channel = struct {
     gpa: Allocator,
     in: *Io.Reader,
     out: *Io.Writer,
-    options: ChannelOptions,
     /// Private: one message at a time on `out`.
     write_mutex: Io.Mutex = .init,
     /// Private: the requests waiting for their answers.
@@ -415,10 +415,6 @@ pub const Channel = struct {
     /// Private, under `write_mutex`: set by `end`, nothing more is written.
     ended: bool = false,
 
-    pub const ChannelOptions = struct {
-        max_message: aegis.units.Bytes(u32) = .literal("16MiB"),
-    };
-
     const Waiter = struct {
         id: wire.Id,
         event: Io.Event = .unset,
@@ -426,11 +422,12 @@ pub const Channel = struct {
         answer: ?[]u8 = null,
     };
 
-    pub fn init(gpa: Allocator, in: *Io.Reader, out: *Io.Writer, options: ChannelOptions) Channel {
-        return .{ .gpa = gpa, .in = in, .out = out, .options = options };
+    pub fn init(gpa: Allocator, in: *Io.Reader, out: *Io.Writer) Channel {
+        return .{ .gpa = gpa, .in = in, .out = out };
     }
 
-    /// Starts reading the server's output, for `client`'s requests.
+    /// Starts reading the server's output, for `client`'s requests, each
+    /// message within the client's message limit.
     pub fn start(ch: *Channel, io: Io, client: *Client) Io.ConcurrentError!void {
         ch.client = client;
         ch.reading = try io.concurrent(readLoop, .{ ch, io });
@@ -527,7 +524,7 @@ pub const Channel = struct {
         defer line_buffer.deinit();
         while (true) {
             line_buffer.clearRetainingCapacity();
-            _ = ch.in.streamDelimiterLimit(&line_buffer.writer, '\n', .limited(ch.options.max_message.raw())) catch |err| switch (err) {
+            _ = ch.in.streamDelimiterLimit(&line_buffer.writer, '\n', .limited(@as(usize, ch.client.?.options.limits.message.raw()) + 1)) catch |err| switch (err) {
                 error.StreamTooLong => {
                     _ = ch.in.discardDelimiterInclusive('\n') catch return;
                     continue;
@@ -548,7 +545,7 @@ pub const Channel = struct {
     fn handle(ch: *Channel, io: Io, bytes: []const u8) void {
         var arena: std.heap.ArenaAllocator = .init(ch.gpa);
         defer arena.deinit();
-        const message = wire.decode(arena.allocator(), bytes, .{}) catch return;
+        const message = wire.decode(arena.allocator(), bytes, .{ .limits = ch.client.?.jsonLimits() }) catch return;
         switch (message) {
             .result, .failure => {
                 const id = switch (message) {

@@ -83,7 +83,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn serve(gpa: std.mem.Allocator, io: Io, arguments: Arguments) !void {
-    var server = try parley.Server.init(gpa, io, .{ .info = .{ .name = "parley-fixture", .version = "1.0.0" } });
+    var server = try parley.Server.init(gpa, io, .{ .info = .{ .name = "parley-fixture", .version = "1.0.0" }, .limits = .{ .message = .literal("128MiB") } });
     defer server.deinit();
     try server.addTool(io, .{ .name = "echo", .description = "Echoes the text it is given" }, echo);
     try server.addTool(io, .{ .name = "sleep", .description = "Answers after ms milliseconds" }, sleep);
@@ -119,6 +119,6 @@ fn serve(gpa: std.mem.Allocator, io: Io, arguments: Arguments) !void {
     try stderr.interface.writeAll("ready\n");
     try stderr.interface.flush();
     // The benchmarks echo a 64 MiB message.
-    try parley.stdio.serve(io, gpa, &server, &stdin.interface, &stdout.interface, .{ .max_message = .literal("128MiB") });
+    try parley.stdio.serve(io, gpa, &server, &stdin.interface, &stdout.interface, .{});
     if (arguments.linger) try io.sleep(.fromSeconds(3600), .awake);
 }

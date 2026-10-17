@@ -66,7 +66,21 @@ pub const Options = struct {
     /// runs as a task is polled to its end, its input given as it asks,
     /// and answers as if it had been answered at once.
     tasks: bool = true,
+    limits: Limits = .{},
 };
+
+pub const Limits = struct {
+    /// The longest message, either way: what the transport reads of the
+    /// server (a longer one is passed over unread), and what every read of
+    /// a message and of a value within it allows (`wire.limitsFor`).
+    message: aegis.units.Bytes(u32) = wire.default_message,
+};
+
+/// strand's limits for every read and write of a message and of the values
+/// within it: those of `options.limits.message`.
+pub fn jsonLimits(c: *const Client) strand.core.Limits {
+    return wire.limitsFor(c.options.limits.message);
+}
 
 /// The application's answers to a server's requests for input. Each takes
 /// the request's params as JSON and returns its answer.
@@ -102,7 +116,7 @@ pub const Transport = struct {
         /// A `tools/list` answer, as the application should see it: a
         /// transport that mirrors arguments into headers learns the tools'
         /// marks, and leaves out a tool whose marks it cannot honour.
-        listed: ?*const fn (context: *anyopaque, io: Io, arena: Allocator, result: []const u8) Allocator.Error![]const u8 = null,
+        listed: ?*const fn (context: *anyopaque, io: Io, client: *const Client, arena: Allocator, result: []const u8) Allocator.Error![]const u8 = null,
     };
 
     pub fn request(t: Transport, io: Io, arena: Allocator, exchange: *Exchange) RequestError![]const u8 {
@@ -184,7 +198,7 @@ pub fn connect(c: *Client, io: Io) ConnectError!void {
             },
             .failure => |f| switch (f.code) {
                 .unsupported_protocol_version => {
-                    const chosen = chooseVersion(arena, c.options.revisions, f.data) orelse return error.Unsupported;
+                    const chosen = chooseVersion(arena, c.jsonLimits(), c.options.revisions, f.data) orelse return error.Unsupported;
                     if (!chosen.stateless()) return c.openSession(io, arena);
                     c.revision = chosen;
                 },
@@ -199,9 +213,9 @@ pub fn connect(c: *Client, io: Io) ConnectError!void {
 }
 
 /// The newest version the server names that this client speaks.
-fn chooseVersion(arena: Allocator, spoken: []const Revision, data: ?[]const u8) ?Revision {
+fn chooseVersion(arena: Allocator, limits: strand.core.Limits, spoken: []const Revision, data: ?[]const u8) ?Revision {
     const Data = struct { supported: []const []const u8 = &.{} };
-    const d = strand.json.parseLeaky(Data, arena, data orelse return null, types.read_options) catch return null;
+    const d = strand.json.parseLeaky(Data, arena, data orelse return null, types.readOptions(limits)) catch return null;
     var best: ?Revision = null;
     for (d.supported) |name| if (Revision.named(name)) |r| {
         for (spoken) |known| if (known == r) {
@@ -217,7 +231,7 @@ fn keepDiscovery(c: *Client, result: []const u8) ConnectError!void {
     } = null };
     const kept = c.arena.allocator();
     const bytes = try kept.dupe(u8, result);
-    const d = strand.json.parseLeaky(Discovery, kept, bytes, types.read_options) catch return error.Protocol;
+    const d = strand.json.parseLeaky(Discovery, kept, bytes, types.readOptions(c.jsonLimits())) catch return error.Protocol;
     c.server_capabilities = d.capabilities.bytes;
     c.instructions = d.instructions;
     if (d._meta) |m| c.server_info = m.@"io.modelcontextprotocol/serverInfo";
@@ -234,7 +248,7 @@ fn openSession(c: *Client, io: Io, arena: Allocator) ConnectError!void {
     w.print("{{\"protocolVersion\":\"{s}\",\"capabilities\":", .{c.revision.text()}) catch return error.OutOfMemory;
     c.writeCapabilities(w) catch return error.OutOfMemory;
     w.writeAll(",\"clientInfo\":") catch return error.OutOfMemory;
-    strand.json.write(w, c.options.info, types.write_options) catch return error.OutOfMemory;
+    strand.json.write(w, c.options.info, types.writeOptions(c.jsonLimits())) catch return error.OutOfMemory;
     w.writeByte('}') catch return error.OutOfMemory;
     const answer = try c.send(io, arena, "initialize", params.written(), null, null, .session, c.options.timeout.toIoDuration());
     const result = switch (answer) {
@@ -250,7 +264,7 @@ fn openSession(c: *Client, io: Io, arena: Allocator) ConnectError!void {
     };
     const kept = c.arena.allocator();
     const bytes = try kept.dupe(u8, result);
-    const r = strand.json.parseLeaky(Initialized, kept, bytes, types.read_options) catch return error.Protocol;
+    const r = strand.json.parseLeaky(Initialized, kept, bytes, types.readOptions(c.jsonLimits())) catch return error.Protocol;
     const revision = Revision.named(r.protocolVersion) orelse return error.Unsupported;
     if (revision.stateless()) return error.Protocol;
     for (c.options.revisions) |spoken| {
@@ -271,7 +285,7 @@ fn writeCapabilities(c: *const Client, w: *Writer) Writer.Error!void {
     if (h.sample != null) caps.sampling = .{};
     if (h.elicit != null) caps.elicitation = .{ .form = .{ .bytes = "{}" } };
     if (c.options.tasks and c.revision.stateless()) caps.extensions = .{ .bytes = "{\"" ++ tasks_extension ++ "\":{}}" };
-    strand.json.write(w, caps, types.write_options) catch return error.WriteFailed;
+    strand.json.write(w, caps, types.writeOptions(c.jsonLimits())) catch return error.WriteFailed;
 }
 
 /// Sends `method` with `params` (one JSON object) and returns the answer.
@@ -300,7 +314,7 @@ fn send(c: *Client, io: Io, arena: Allocator, method: []const u8, params: []cons
         .client = c,
     };
     const bytes = try c.transport.request(io, arena, &exchange);
-    return wire.decode(arena, bytes, .{}) catch error.Refused;
+    return wire.decode(arena, bytes, .{ .limits = c.jsonLimits() }) catch error.Refused;
 }
 
 /// `params` with the `_meta` of a 2026-07-28 request merged in.
@@ -308,13 +322,13 @@ fn writeWithMeta(c: *const Client, w: *Writer, params: []const u8) Writer.Error!
     try w.writeAll("{\"_meta\":{\"" ++ meta.protocol_version ++ "\":\"");
     try w.writeAll(c.revision.text());
     try w.writeAll("\",\"" ++ meta.client_info ++ "\":");
-    strand.json.write(w, c.options.info, types.write_options) catch return error.WriteFailed;
+    strand.json.write(w, c.options.info, types.writeOptions(c.jsonLimits())) catch return error.WriteFailed;
     try w.writeAll(",\"" ++ meta.client_capabilities ++ "\":");
     try c.writeCapabilities(w);
     try w.writeByte('}');
     // The rest of the params' members, but a `_meta` of their own.
     var members: strand.json.Members = undefined;
-    members.init(params, .{});
+    members.init(params, .{ .limits = c.jsonLimits() });
     while (members.next() catch null) |m| {
         if (m.is("_meta")) continue;
         try w.writeByte(',');
@@ -332,16 +346,16 @@ pub fn serveRequest(c: *Client, io: Io, arena: Allocator, request: wire.Request)
         if (std.mem.eql(u8, request.method, "elicitation/create")) {
             const f = c.options.handlers.elicit orelse break :blk error.MethodNotFound;
             var answer = f(c.options.handlers.context, io, arena, params) catch |err| break :blk err;
-            if (answer.action == .accept) answer.content = .{ .bytes = withDefaults(arena, params, if (answer.content) |r| r.bytes else "{}") catch |err| break :blk err };
-            break :blk encode(arena, answer);
+            if (answer.action == .accept) answer.content = .{ .bytes = withDefaults(arena, c.jsonLimits(), params, if (answer.content) |r| r.bytes else "{}") catch |err| break :blk err };
+            break :blk encode(arena, c.jsonLimits(), answer);
         }
         if (std.mem.eql(u8, request.method, "sampling/createMessage")) {
             const f = c.options.handlers.sample orelse break :blk error.MethodNotFound;
-            break :blk encode(arena, f(c.options.handlers.context, io, arena, params) catch |err| break :blk err);
+            break :blk encode(arena, c.jsonLimits(), f(c.options.handlers.context, io, arena, params) catch |err| break :blk err);
         }
         if (std.mem.eql(u8, request.method, "roots/list")) {
             const f = c.options.handlers.roots orelse break :blk error.MethodNotFound;
-            break :blk encode(arena, f(c.options.handlers.context, io, arena) catch |err| break :blk err);
+            break :blk encode(arena, c.jsonLimits(), f(c.options.handlers.context, io, arena) catch |err| break :blk err);
         }
         break :blk error.MethodNotFound;
     };
@@ -357,9 +371,9 @@ pub fn serveRequest(c: *Client, io: Io, arena: Allocator, request: wire.Request)
 /// An accepted form's content, with each field the user left out that the
 /// form's schema gives a default for set to that default (2025-11-25,
 /// SEP-1034).
-fn withDefaults(arena: Allocator, params: []const u8, content: []const u8) error{OutOfMemory}![]const u8 {
+fn withDefaults(arena: Allocator, limits: strand.core.Limits, params: []const u8, content: []const u8) error{OutOfMemory}![]const u8 {
     const Form = struct { requestedSchema: struct { properties: ?Raw = null } = .{} };
-    const form = strand.json.parseLeaky(Form, arena, params, types.read_options) catch return content;
+    const form = strand.json.parseLeaky(Form, arena, params, types.readOptions(limits)) catch return content;
     const properties = form.requestedSchema.properties orelse return content;
     var out: Writer.Allocating = .init(arena);
     const w = &out.writer;
@@ -368,13 +382,13 @@ fn withDefaults(arena: Allocator, params: []const u8, content: []const u8) error
     w.writeAll(body[0 .. body.len - 1]) catch return error.OutOfMemory;
     var first = std.mem.trim(u8, body[1 .. body.len - 1], " \t\r\n").len == 0;
     var each: strand.json.Members = undefined;
-    each.init(properties.bytes, .{});
+    each.init(properties.bytes, .{ .limits = limits });
     while (each.next() catch null) |p| {
         var name_buffer: [256]u8 = undefined;
         const name = p.nameInto(&name_buffer) catch continue;
-        if (hasMember(content, name)) continue;
+        if (hasMember(content, limits, name)) continue;
         var fields: strand.json.Members = undefined;
-        fields.init(p.value, .{});
+        fields.init(p.value, .{ .limits = limits });
         while (fields.next() catch null) |f| if (f.is("default")) {
             if (!first) w.writeByte(',') catch return error.OutOfMemory;
             first = false;
@@ -387,16 +401,16 @@ fn withDefaults(arena: Allocator, params: []const u8, content: []const u8) error
     return out.written();
 }
 
-fn hasMember(object: []const u8, name: []const u8) bool {
+fn hasMember(object: []const u8, limits: strand.core.Limits, name: []const u8) bool {
     var members: strand.json.Members = undefined;
-    members.init(object, .{});
+    members.init(object, .{ .limits = limits });
     while (members.next() catch return false) |m| if (m.is(name)) return true;
     return false;
 }
 
-fn encode(arena: Allocator, value: anytype) error{WriteFailed}![]const u8 {
+fn encode(arena: Allocator, limits: strand.core.Limits, value: anytype) error{WriteFailed}![]const u8 {
     var out: Writer.Allocating = .init(arena);
-    strand.json.write(&out.writer, value, types.write_options) catch return error.WriteFailed;
+    strand.json.write(&out.writer, value, types.writeOptions(limits)) catch return error.WriteFailed;
     return out.written();
 }
 
@@ -423,7 +437,7 @@ fn call(c: *Client, io: Io, arena: Allocator, method: []const u8, params: []cons
         const answer = try c.send(io, arena, method, current, name, arguments, c.era, c.options.timeout.toIoDuration());
         switch (answer) {
             .result => |r| {
-                const kind = resultType(r.result);
+                const kind = resultType(r.result, c.jsonLimits());
                 if (std.mem.eql(u8, kind, "complete")) return r.result;
                 if (std.mem.eql(u8, kind, "task") and std.mem.eql(u8, method, "tools/call") and c.options.tasks) return c.followTask(io, arena, r.result, diagnostics);
                 if (!std.mem.eql(u8, kind, "input_required")) return error.Protocol;
@@ -442,9 +456,9 @@ fn call(c: *Client, io: Io, arena: Allocator, method: []const u8, params: []cons
 
 /// A result's `resultType`, `complete` when it has none (2025-11-25 and
 /// before).
-fn resultType(result: []const u8) []const u8 {
+fn resultType(result: []const u8, limits: strand.core.Limits) []const u8 {
     var members: strand.json.Members = undefined;
-    members.init(result, .{});
+    members.init(result, .{ .limits = limits });
     while (members.next() catch null) |m| if (m.is("resultType")) {
         if (m.value.len >= 2 and m.value[0] == '"') return m.value[1 .. m.value.len - 1];
     };
@@ -457,7 +471,7 @@ fn answerInput(c: *Client, io: Io, arena: Allocator, params: []const u8, result:
     var requests: ?[]const u8 = null;
     var state: ?[]const u8 = null;
     var members: strand.json.Members = undefined;
-    members.init(result, .{});
+    members.init(result, .{ .limits = c.jsonLimits() });
     while (members.next() catch return error.Protocol) |m| {
         if (m.is("inputRequests")) requests = m.value;
         if (m.is("requestState")) state = m.value;
@@ -467,7 +481,7 @@ fn answerInput(c: *Client, io: Io, arena: Allocator, params: []const u8, result:
     w.writeByte('{') catch return error.OutOfMemory;
     var first = true;
     var own: strand.json.Members = undefined;
-    own.init(params, .{});
+    own.init(params, .{ .limits = c.jsonLimits() });
     while (own.next() catch return error.Protocol) |m| {
         if (m.is("inputResponses") or m.is("requestState")) continue;
         if (!first) w.writeByte(',') catch return error.OutOfMemory;
@@ -497,11 +511,11 @@ fn inputResponses(c: *Client, io: Io, arena: Allocator, object: []const u8, give
     const w = &out.writer;
     w.writeByte('{') catch return error.OutOfMemory;
     var each: strand.json.Members = undefined;
-    each.init(object, .{});
+    each.init(object, .{ .limits = c.jsonLimits() });
     var n: usize = 0;
     while (each.next() catch return error.Protocol) |m| {
         if (given) |keys| {
-            const key = strand.json.parseLeaky([]const u8, arena, object[m.start .. m.value_start - 1], .{}) catch return error.Protocol;
+            const key = strand.json.parseLeaky([]const u8, arena, object[m.start .. m.value_start - 1], .{ .limits = c.jsonLimits() }) catch return error.Protocol;
             const seen = for (keys.items) |k| {
                 if (std.mem.eql(u8, k, key)) break true;
             } else false;
@@ -509,15 +523,15 @@ fn inputResponses(c: *Client, io: Io, arena: Allocator, object: []const u8, give
             try keys.append(c.gpa, try c.gpa.dupe(u8, key));
         }
         const Request = struct { method: []const u8, params: Raw = .{ .bytes = "{}" } };
-        const r = strand.json.parseLeaky(Request, arena, m.value, types.read_options) catch return error.Protocol;
+        const r = strand.json.parseLeaky(Request, arena, m.value, types.readOptions(c.jsonLimits())) catch return error.Protocol;
         const message = try arena.print("{{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"{s}\",\"params\":{s}}}", .{ r.method, r.params.bytes });
-        const asked = wire.decode(arena, message, .{}) catch return error.Protocol;
+        const asked = wire.decode(arena, message, .{ .limits = c.jsonLimits() }) catch return error.Protocol;
         const answer = c.serveRequest(io, arena, asked.request);
         const bytes = switch (answer) {
             .message => |b| b,
             .none => return error.Protocol,
         };
-        const reply = wire.decode(arena, bytes, .{}) catch return error.Protocol;
+        const reply = wire.decode(arena, bytes, .{ .limits = c.jsonLimits() }) catch return error.Protocol;
         const value = switch (reply) {
             .result => |x| x.result,
             // The application did not answer: the server learns it
@@ -538,7 +552,7 @@ fn inputResponses(c: *Client, io: Io, arena: Allocator, object: []const u8, give
 /// asks for along the way: the call's result, as JSON on `arena`.
 fn followTask(c: *Client, io: Io, arena: Allocator, created: []const u8, diagnostics: ?*Diagnostics) CallError![]const u8 {
     const Created = struct { taskId: []const u8, pollIntervalMs: ?u32 = null };
-    const task = strand.json.parseLeaky(Created, arena, created, types.read_options) catch return error.Protocol;
+    const task = strand.json.parseLeaky(Created, arena, created, types.readOptions(c.jsonLimits())) catch return error.Protocol;
     var interval: u32 = task.pollIntervalMs orelse 1000;
     var id_out: Writer.Allocating = .init(arena);
     wire.writeString(&id_out.writer, task.taskId) catch return error.OutOfMemory;
@@ -570,7 +584,7 @@ fn followTask(c: *Client, io: Io, arena: Allocator, created: []const u8, diagnos
             result: ?Raw = null,
             @"error": ?Raw = null,
         };
-        const p = strand.json.parseLeaky(Polled, a, polled, types.read_options) catch return error.Protocol;
+        const p = strand.json.parseLeaky(Polled, a, polled, types.readOptions(c.jsonLimits())) catch return error.Protocol;
         if (p.pollIntervalMs) |next| interval = next;
         switch (p.status) {
             .working => {},
@@ -589,7 +603,7 @@ fn followTask(c: *Client, io: Io, arena: Allocator, created: []const u8, diagnos
             .completed => return try arena.dupe(u8, (p.result orelse return error.Protocol).bytes),
             .failed => {
                 const Fault = struct { code: i64, message: []const u8 = "", data: ?Raw = null };
-                const f = strand.json.parseLeaky(Fault, a, (p.@"error" orelse return error.Protocol).bytes, types.read_options) catch return error.Protocol;
+                const f = strand.json.parseLeaky(Fault, a, (p.@"error" orelse return error.Protocol).bytes, types.readOptions(c.jsonLimits())) catch return error.Protocol;
                 const code: wire.Code = @fromBackingInt(@intCast(f.code)); // safe: the codes are open, any integer is one
                 return failed(arena, diagnostics, code, f.message, if (f.data) |d| d.bytes else null);
             },
@@ -623,17 +637,17 @@ pub fn list(c: *Client, io: Io, arena: Allocator, method: []const u8, cursor: ?[
     }
     out.writer.writeByte('}') catch return error.OutOfMemory;
     const result = try c.call(io, arena, method, out.written(), null, null, diagnostics);
-    if (std.mem.eql(u8, method, "tools/list")) if (c.transport.vtable.listed) |f| return f(c.transport.context, io, arena, result);
+    if (std.mem.eql(u8, method, "tools/list")) if (c.transport.vtable.listed) |f| return f(c.transport.context, io, c, arena, result);
     return result;
 }
 
 /// Arguments as the object a request carries: a `Raw` as it is, an empty
 /// literal (`.{}`) as `{}`, anything else as strand writes it.
-fn argumentsJson(arena: Allocator, arguments: anytype) error{OutOfMemory}![]const u8 {
+fn argumentsJson(arena: Allocator, limits: strand.core.Limits, arguments: anytype) error{OutOfMemory}![]const u8 {
     const T = @TypeOf(arguments);
     if (T == Raw) return arguments.bytes;
     if (@typeInfo(T) == .@"struct" and @typeInfo(T).@"struct".field_names.len == 0) return "{}";
-    return encode(arena, arguments) catch error.OutOfMemory;
+    return encode(arena, limits, arguments) catch error.OutOfMemory;
 }
 
 /// What a tool call returned.
@@ -646,7 +660,7 @@ pub const ToolOutcome = struct {
 /// Calls the tool `name` with `arguments` (any value strand writes, or a
 /// `strand.json.Raw` object), after as many rounds of input as it asks for.
 pub fn callTool(c: *Client, io: Io, arena: Allocator, name: []const u8, arguments: anytype, diagnostics: ?*Diagnostics) CallError!ToolOutcome {
-    const args = try argumentsJson(arena, arguments);
+    const args = try argumentsJson(arena, c.jsonLimits(), arguments);
     var out: Writer.Allocating = .init(arena);
     const w = &out.writer;
     w.writeAll("{\"name\":") catch return error.OutOfMemory;
@@ -660,7 +674,7 @@ pub fn callTool(c: *Client, io: Io, arena: Allocator, name: []const u8, argument
         structuredContent: ?Raw = null,
         isError: bool = false,
     };
-    const o = strand.json.parseLeaky(Outcome, arena, result, types.read_options) catch return error.Protocol;
+    const o = strand.json.parseLeaky(Outcome, arena, result, types.readOptions(c.jsonLimits())) catch return error.Protocol;
     return .{ .content = o.content, .structured = o.structuredContent, .is_error = o.isError };
 }
 
@@ -672,14 +686,14 @@ pub fn readResource(c: *Client, io: Io, arena: Allocator, uri: []const u8, diagn
     out.writer.writeByte('}') catch return error.OutOfMemory;
     const result = try c.call(io, arena, "resources/read", out.written(), uri, null, diagnostics);
     const Read = struct { contents: []const types.ResourceContents = &.{} };
-    const r = strand.json.parseLeaky(Read, arena, result, types.read_options) catch return error.Protocol;
+    const r = strand.json.parseLeaky(Read, arena, result, types.readOptions(c.jsonLimits())) catch return error.Protocol;
     return r.contents;
 }
 
 /// Gets the prompt `name` with `arguments` (names to strings, as a struct
 /// strand writes, or a `Raw` object): its messages.
 pub fn getPrompt(c: *Client, io: Io, arena: Allocator, name: []const u8, arguments: anytype, diagnostics: ?*Diagnostics) CallError![]const types.PromptMessage {
-    const args = try argumentsJson(arena, arguments);
+    const args = try argumentsJson(arena, c.jsonLimits(), arguments);
     var out: Writer.Allocating = .init(arena);
     const w = &out.writer;
     w.writeAll("{\"name\":") catch return error.OutOfMemory;
@@ -689,6 +703,6 @@ pub fn getPrompt(c: *Client, io: Io, arena: Allocator, name: []const u8, argumen
     w.writeByte('}') catch return error.OutOfMemory;
     const result = try c.call(io, arena, "prompts/get", out.written(), name, null, diagnostics);
     const Got = struct { messages: []const types.PromptMessage = &.{} };
-    const g = strand.json.parseLeaky(Got, arena, result, types.read_options) catch return error.Protocol;
+    const g = strand.json.parseLeaky(Got, arena, result, types.readOptions(c.jsonLimits())) catch return error.Protocol;
     return g.messages;
 }

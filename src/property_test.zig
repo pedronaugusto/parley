@@ -3,6 +3,7 @@
 const std = @import("std");
 const shake = @import("shakedown");
 const wire = @import("wire.zig");
+const wire_limits = wire.limitsFor(wire.default_message);
 
 const examples = [_][]const u8{
     "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"text\":\"hi\"},\"_meta\":{\"progressToken\":4}}}",
@@ -19,7 +20,7 @@ fn anyBytes(_: void, c: *shake.Case) !void {
     var buffer: [512]u8 = undefined;
     const input = shake.gen.mutated(c.source, &buffer, &examples);
     var fault: wire.Fault = .{};
-    const message = wire.decode(c.gpa, input, .{ .fault = &fault }) catch |err| {
+    const message = wire.decode(c.gpa, input, .{ .fault = &fault, .limits = wire_limits }) catch |err| {
         switch (err) {
             error.Malformed => if (fault.code != .parse_error) return error.FaultDisagrees,
             error.Invalid => if (fault.code != .invalid_request) return error.FaultDisagrees,
@@ -54,7 +55,7 @@ fn roundTrip(_: void, c: *shake.Case) !void {
     var out: std.Io.Writer.Allocating = .init(c.gpa);
     const notification = shake.gen.boolean(c.source);
     if (notification) try wire.writeNotification(&out.writer, method, params) else try wire.writeRequest(&out.writer, id, method, params);
-    const message = try wire.decode(c.gpa, out.written(), .{});
+    const message = try wire.decode(c.gpa, out.written(), .{ .limits = wire_limits });
     if (notification) {
         if (!std.mem.eql(u8, message.notification.method, method)) return error.MethodChanged;
         if ((message.notification.params == null) != (params == null)) return error.ParamsChanged;
@@ -127,7 +128,7 @@ fn anyLines(_: void, c: *shake.Case) !void {
     var it = std.mem.splitScalar(u8, out.written(), '\n');
     while (it.next()) |line| {
         if (line.len == 0) continue;
-        _ = wire.decode(c.gpa, line, .{}) catch return error.ServerWroteWhatIsNotAMessage;
+        _ = wire.decode(c.gpa, line, .{ .limits = wire_limits }) catch return error.ServerWroteWhatIsNotAMessage;
     }
 }
 
@@ -179,7 +180,7 @@ fn anySchema(_: void, c: *shake.Case) !void {
     var buffer: [600]u8 = undefined;
     const schema = shake.gen.mutated(c.source, &buffer, &schema_examples);
     const gpa = std.testing.allocator;
-    const params = registry.headerParams(gpa, schema) catch |err| switch (err) {
+    const params = registry.headerParams(gpa, schema, wire_limits) catch |err| switch (err) {
         error.InvalidSchema => return,
         error.OutOfMemory => return err,
     };

@@ -2,18 +2,19 @@
 //! which code, and what the two clients that matter today send.
 const std = @import("std");
 const wire = @import("wire.zig");
+const wire_limits = wire.limitsFor(wire.default_message);
 
 const testing = std.testing;
 
 fn decode(bytes: []const u8, fault: *wire.Fault) wire.DecodeError!wire.Message {
-    return wire.decode(testing.allocator, bytes, .{ .fault = fault });
+    return wire.decode(testing.allocator, bytes, .{ .fault = fault, .limits = wire_limits });
 }
 
 fn expectRefused(bytes: []const u8, code: wire.Code, id: ?wire.Id) !void {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var fault: wire.Fault = .{};
-    if (wire.decode(arena.allocator(), bytes, .{ .fault = &fault })) |m| {
+    if (wire.decode(arena.allocator(), bytes, .{ .fault = &fault, .limits = wire_limits })) |m| {
         std.debug.print("accepted {s} as {t}\n", .{ bytes, m });
         return error.TestExpectedError;
     } else |err| {
@@ -45,7 +46,7 @@ test "members in any order and any spacing; unknown members passed over" {
 test "an escaped method and string id are unescaped, and equal their plain spelling" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const m = try wire.decode(arena.allocator(), "{\"jsonrpc\":\"2.0\",\"id\":\"l\\u0069sten:0\",\"method\":\"tools\\/call\"}", .{});
+    const m = try wire.decode(arena.allocator(), "{\"jsonrpc\":\"2.0\",\"id\":\"l\\u0069sten:0\",\"method\":\"tools\\/call\"}", .{ .limits = wire_limits });
     try testing.expectEqualStrings("tools/call", m.request.method);
     try testing.expect(m.request.id.eql(.{ .string = "listen:0" }));
 }
@@ -103,7 +104,7 @@ test "what Claude Code 2.1.302 and Codex 0.160.0 send is read" {
         var it = std.mem.splitScalar(u8, file, '\n');
         while (it.next()) |line| {
             if (line.len == 0) continue;
-            const m = try wire.decode(arena.allocator(), line, .{});
+            const m = try wire.decode(arena.allocator(), line, .{ .limits = wire_limits });
             switch (m) {
                 .request, .notification => read += 1,
                 else => return error.TestUnexpectedMessage,
@@ -120,14 +121,14 @@ test "written messages read back as what was written" {
     var fault: wire.Fault = .{};
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const request = try wire.decode(arena.allocator(), w.buffered(), .{ .fault = &fault });
+    const request = try wire.decode(arena.allocator(), w.buffered(), .{ .fault = &fault, .limits = wire_limits });
     try testing.expectEqualStrings("a\"b", request.request.id.string);
     try testing.expectEqualStrings("{\"name\":\"x\"}", request.request.params.?);
 
     w = .fixed(&buffer);
     try wire.writeFailure(&w, null, .invalid_request, "bad\nline", null);
     try testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"bad\\nline\"}}", w.buffered());
-    const failure = try wire.decode(arena.allocator(), w.buffered(), .{});
+    const failure = try wire.decode(arena.allocator(), w.buffered(), .{ .limits = wire_limits });
     try testing.expectEqualStrings("bad\nline", failure.failure.message);
 
     w = .fixed(&buffer);
@@ -144,4 +145,28 @@ test "a string written is JSON whatever its bytes: controls escaped, broken UTF-
     var w: std.Io.Writer = .fixed(&buffer);
     try wire.writeString(&w, "a\x01\tz\xffé\xe2\x82");
     try testing.expectEqualStrings("\"a\\u0001\\tz\u{FFFD}é\u{FFFD}\u{FFFD}\"", w.buffered());
+}
+
+test "every limit grows with the message limit: a value past strand's defaults is read within a larger one" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text = try a.alloc(u8, 20 << 20);
+    @memset(text, 'x');
+    const bytes = try a.print("{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"text\":\"{s}\"}}}}", .{text});
+    var fault: wire.Fault = .{};
+    try testing.expectError(error.Invalid, wire.decode(a, bytes, .{ .fault = &fault, .limits = wire_limits }));
+    try testing.expectEqualStrings("the message is past a limit", fault.reason);
+    const m = try wire.decode(a, bytes, .{ .limits = wire.limitsFor(.literal("32MiB")) });
+    try testing.expectEqual(bytes.len - 2 - "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":".len + 1, m.request.params.?.len);
+}
+
+test "the limits of a small message bound nothing its bytes admit" {
+    const l = wire.limitsFor(.fromRaw(64));
+    try testing.expectEqual(@as(usize, 64), l.input_bytes);
+    try testing.expectEqual(@as(usize, 32), l.items);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const dense = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"m\",\"params\":[1,2,3,4,5,6,7]}";
+    _ = try wire.decode(arena.allocator(), dense, .{ .limits = wire.limitsFor(.fromRaw(dense.len)) });
 }

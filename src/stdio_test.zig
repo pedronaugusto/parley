@@ -69,15 +69,31 @@ test "a line a message: answers, refusals naming their request, blank lines pass
 test "a line past the limit is refused and the next one read" {
     var server = try newServer(testing.io);
     defer server.deinit();
-    const input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{\"padding\":\"" ++ @as([200]u8, @splat('x')) ++ "\"}}\n" ++
+    server.options.limits.message = .literal("1KiB");
+    const input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{\"padding\":\"" ++ @as([1100]u8, @splat('x')) ++ "\"}}\n" ++
         "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{" ++ meta ++ "}}\n";
     var in: std.Io.Reader = .fixed(input);
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try stdio.serve(testing.io, testing.allocator, &server, &in, &out.writer, .{ .max_message = .fromRaw(180) });
+    try stdio.serve(testing.io, testing.allocator, &server, &in, &out.writer, .{});
     const lines = out.written();
     try testing.expect(std.mem.find(u8, lines, "longer than the server reads") != null);
-    try testing.expect(answerTo(lines, "\"id\":2,") != null);
+    try testing.expect(std.mem.find(u8, answerTo(lines, "\"id\":2,").?, "\"tools\":[") != null);
+}
+
+test "an answer past the limit is refused, not written" {
+    var server = try newServer(testing.io);
+    defer server.deinit();
+    const request = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{" ++ meta ++ "}}";
+    server.options.limits.message = .fromRaw(request.len);
+    var in: std.Io.Reader = .fixed(request ++ "\n");
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try stdio.serve(testing.io, testing.allocator, &server, &in, &out.writer, .{});
+    const answer = answerTo(out.written(), "\"id\":1,").?;
+    try testing.expect(std.mem.find(u8, answer, "-32603") != null);
+    try testing.expect(std.mem.find(u8, answer, "message limit") != null);
+    try testing.expect(std.mem.find(u8, answer, "\"tools\"") == null);
 }
 
 fn serveTask(io: std.Io, server: *parley.Server, in: *Pipe, out: *Pipe) void {
@@ -117,4 +133,23 @@ test "a long request holds up nothing behind it, and is canceled without an answ
     if (out.reader.takeDelimiter('\n')) |line| {
         try testing.expect(line == null);
     } else |err| return err;
+}
+
+test "a message past strand's defaults, within the message limit, is read and answered" {
+    var server = try newServer(testing.io);
+    defer server.deinit();
+    server.options.limits.message = .literal("48MiB");
+    const text = try testing.allocator.alloc(u8, 20 << 20);
+    defer testing.allocator.free(text);
+    @memset(text, 'x');
+    var input: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer input.deinit();
+    try input.writer.print("{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"echo\",\"arguments\":{{\"text\":\"{s}\"}},{s}}}}}\n", .{ text, meta });
+    var in: std.Io.Reader = .fixed(input.written());
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try stdio.serve(testing.io, testing.allocator, &server, &in, &out.writer, .{});
+    const answer = answerTo(out.written(), "\"id\":1,").?;
+    try testing.expect(std.mem.find(u8, answer, "\"isError\"") == null);
+    try testing.expect(std.mem.find(u8, answer, text) != null);
 }

@@ -28,6 +28,7 @@
 //! footprint on macOS).
 const std = @import("std");
 const parley = @import("parley");
+const wire_limits = parley.wire.limitsFor(parley.wire.default_message);
 const conduit = @import("conduit");
 const uplink = @import("uplink");
 const shakedown = @import("shakedown");
@@ -412,7 +413,7 @@ const Bench = struct {
 
     fn decodeCall(b: *Bench, units: u64) WorkloadError!void {
         for (0..units) |_| {
-            const message = try parley.wire.decode(b.arena.allocator(), call, .{});
+            const message = try parley.wire.decode(b.arena.allocator(), call, .{ .limits = wire_limits });
             b.sink +%= message.request.method.len;
         }
     }

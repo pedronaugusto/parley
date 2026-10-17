@@ -64,7 +64,7 @@ test "a 2026-07-28 server: discovered, listed, called, input given across rounds
 
     var writer_buffer: [4096]u8 = undefined;
     var out = PipeWriter.init(&wiring.to_server, &writer_buffer);
-    var channel: stdio.Channel = .init(testing.allocator, &wiring.from_server.reader, &out.writer, .{});
+    var channel: stdio.Channel = .init(testing.allocator, &wiring.from_server.reader, &out.writer);
     var client: Client = .init(testing.allocator, channel.transport(), .{
         .info = .{ .name = "c", .version = "1" },
         .handlers = .{ .elicit = answerName },
@@ -125,7 +125,7 @@ test "a call the server runs as a task: polled, its input given, answered as if 
     defer task.cancel(io);
     var writer_buffer: [4096]u8 = undefined;
     var out = PipeWriter.init(&wiring.to_server, &writer_buffer);
-    var channel: stdio.Channel = .init(testing.allocator, &wiring.from_server.reader, &out.writer, .{});
+    var channel: stdio.Channel = .init(testing.allocator, &wiring.from_server.reader, &out.writer);
     var client: Client = .init(testing.allocator, channel.transport(), .{
         .info = .{ .name = "c", .version = "1" },
         .handlers = .{ .elicit = answerName },
@@ -202,7 +202,7 @@ test "a session server: discover not understood, so initialize, then requests wi
     defer task.cancel(io);
     var writer_buffer: [4096]u8 = undefined;
     var out = PipeWriter.init(&wiring.to_server, &writer_buffer);
-    var channel: stdio.Channel = .init(testing.allocator, &wiring.from_server.reader, &out.writer, .{});
+    var channel: stdio.Channel = .init(testing.allocator, &wiring.from_server.reader, &out.writer);
     var client: Client = .init(testing.allocator, channel.transport(), .{ .info = .{ .name = "c", .version = "1" } });
     defer client.deinit();
     try channel.start(io, &client);

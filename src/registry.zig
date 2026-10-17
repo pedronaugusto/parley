@@ -94,10 +94,10 @@ pub const HeaderParam = struct {
 /// `error.InvalidSchema` for a mark 2026-07-28 does not allow: not a token,
 /// two that differ only in case, on a property that is not a string, an
 /// integer or a boolean, or reached other than through `properties`.
-pub fn headerParams(gpa: Allocator, schema: []const u8) (Allocator.Error || error{InvalidSchema})![]const HeaderParam {
+pub fn headerParams(gpa: Allocator, schema: []const u8, limits: strand.core.Limits) (Allocator.Error || error{InvalidSchema})![]const HeaderParam {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
-    const root = strand.json.parseLeaky(strand.json.Value, arena.allocator(), schema, .{}) catch return error.InvalidSchema;
+    const root = strand.json.parseLeaky(strand.json.Value, arena.allocator(), schema, .{ .limits = limits }) catch return error.InvalidSchema;
     var found: std.ArrayList(HeaderParam) = .empty;
     errdefer {
         for (found.items) |p| freeHeaderParam(gpa, p);
@@ -273,9 +273,9 @@ pub const Prompt = struct {
 };
 
 /// `Tool` JSON for `spec`, on `gpa`.
-pub fn listTool(gpa: Allocator, spec: ToolSpec, input_schema: []const u8, output_schema: ?[]const u8) (Allocator.Error || error{InvalidSchema})![]const u8 {
-    try checkObject(input_schema);
-    if (output_schema) |s| try checkObject(s);
+pub fn listTool(gpa: Allocator, limits: strand.core.Limits, spec: ToolSpec, input_schema: []const u8, output_schema: ?[]const u8) (Allocator.Error || error{InvalidSchema})![]const u8 {
+    try checkObject(input_schema, limits);
+    if (output_schema) |s| try checkObject(s, limits);
     const Listed = struct {
         name: []const u8,
         title: ?[]const u8,
@@ -286,7 +286,7 @@ pub fn listTool(gpa: Allocator, spec: ToolSpec, input_schema: []const u8, output
         icons: ?[]const types.Icon,
         _meta: ?Raw,
     };
-    return encode(gpa, Listed{
+    return encode(gpa, limits, Listed{
         .name = spec.name,
         .title = spec.title,
         .description = spec.description,
@@ -298,8 +298,8 @@ pub fn listTool(gpa: Allocator, spec: ToolSpec, input_schema: []const u8, output
     });
 }
 
-pub fn listResource(gpa: Allocator, spec: ResourceSpec) (Allocator.Error || error{InvalidSchema})![]const u8 {
-    return encode(gpa, types.Resource{
+pub fn listResource(gpa: Allocator, limits: strand.core.Limits, spec: ResourceSpec) (Allocator.Error || error{InvalidSchema})![]const u8 {
+    return encode(gpa, limits, types.Resource{
         .uri = spec.uri,
         .name = spec.name,
         .title = spec.title,
@@ -312,8 +312,8 @@ pub fn listResource(gpa: Allocator, spec: ResourceSpec) (Allocator.Error || erro
     });
 }
 
-pub fn listTemplate(gpa: Allocator, spec: TemplateSpec) (Allocator.Error || error{InvalidSchema})![]const u8 {
-    return encode(gpa, types.ResourceTemplate{
+pub fn listTemplate(gpa: Allocator, limits: strand.core.Limits, spec: TemplateSpec) (Allocator.Error || error{InvalidSchema})![]const u8 {
+    return encode(gpa, limits, types.ResourceTemplate{
         .uri_template = spec.uri_template,
         .name = spec.name,
         .title = spec.title,
@@ -325,8 +325,8 @@ pub fn listTemplate(gpa: Allocator, spec: TemplateSpec) (Allocator.Error || erro
     });
 }
 
-pub fn listPrompt(gpa: Allocator, spec: PromptSpec, arguments: []const types.PromptArgument) (Allocator.Error || error{InvalidSchema})![]const u8 {
-    return encode(gpa, types.Prompt{
+pub fn listPrompt(gpa: Allocator, limits: strand.core.Limits, spec: PromptSpec, arguments: []const types.PromptArgument) (Allocator.Error || error{InvalidSchema})![]const u8 {
+    return encode(gpa, limits, types.Prompt{
         .name = spec.name,
         .title = spec.title,
         .description = spec.description,
@@ -336,10 +336,10 @@ pub fn listPrompt(gpa: Allocator, spec: PromptSpec, arguments: []const types.Pro
     });
 }
 
-fn encode(gpa: Allocator, value: anytype) (Allocator.Error || error{InvalidSchema})![]const u8 {
+fn encode(gpa: Allocator, limits: strand.core.Limits, value: anytype) (Allocator.Error || error{InvalidSchema})![]const u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    strand.json.write(&out.writer, value, types.write_options) catch |err| return switch (err) {
+    strand.json.write(&out.writer, value, types.writeOptions(limits)) catch |err| return switch (err) {
         error.WriteFailed, error.OutOfMemory => error.OutOfMemory,
         // A `_meta` or schema given that is not JSON.
         else => error.InvalidSchema,
@@ -348,9 +348,9 @@ fn encode(gpa: Allocator, value: anytype) (Allocator.Error || error{InvalidSchem
 }
 
 /// A schema given as JSON must be one object.
-fn checkObject(bytes: []const u8) error{InvalidSchema}!void {
+fn checkObject(bytes: []const u8, limits: strand.core.Limits) error{InvalidSchema}!void {
     var members: strand.json.Members = undefined;
-    members.init(bytes, .{});
+    members.init(bytes, .{ .limits = limits });
     _ = members.finish() catch return error.InvalidSchema;
 }
 
@@ -400,7 +400,7 @@ pub fn typedTool(comptime handler: anytype) ToolHandler {
                 handler(c)
             else blk: {
                 var diagnostics: strand.core.Diagnostics = .{};
-                var options = types.read_options;
+                var options = types.readOptions(c.limits);
                 options.ignore_unknown_fields = false;
                 options.diagnostics = &diagnostics;
                 const args = strand.json.parseLeaky(S.Args, c.arena, arguments orelse "{}", options) catch |err| switch (err) {
@@ -410,7 +410,7 @@ pub fn typedTool(comptime handler: anytype) ToolHandler {
                 break :blk handler(c, args);
             };
             const value = out catch |err| return handlerError(err);
-            return toolResult(c.arena, value);
+            return toolResult(c.arena, c.limits, value);
         }
     };
     return .{ .call = Erased.call };
@@ -438,7 +438,7 @@ fn handlerError(err: anyerror) Call.Error!ToolResult {
     return .failure(@errorName(err));
 }
 
-fn toolResult(arena: Allocator, value: anytype) Call.Error!ToolResult {
+fn toolResult(arena: Allocator, limits: strand.core.Limits, value: anytype) Call.Error!ToolResult {
     const Out = @TypeOf(value);
     if (Out == ToolResult) return value;
     if (Out == void) return .{};
@@ -446,7 +446,7 @@ fn toolResult(arena: Allocator, value: anytype) Call.Error!ToolResult {
     // Structured: the value, and the same JSON as text for a client that
     // reads only content (2025-06-18 tools: SHOULD).
     var out: std.Io.Writer.Allocating = .init(arena);
-    strand.json.write(&out.writer, value, types.write_options) catch |err| return switch (err) {
+    strand.json.write(&out.writer, value, types.writeOptions(limits)) catch |err| return switch (err) {
         error.WriteFailed, error.OutOfMemory => error.OutOfMemory,
         else => .failure(@errorName(err)),
     };
@@ -475,7 +475,7 @@ pub fn typedPrompt(comptime handler: anytype) PromptHandler {
     const Erased = struct {
         fn get(_: ?*anyopaque, c: *Call, arguments: ?[]const u8) Call.Error!PromptResult {
             const out = if (S.Args == void) handler(c) else blk: {
-                const args = strand.json.parseLeaky(S.Args, c.arena, arguments orelse "{}", types.read_options) catch |err| switch (err) {
+                const args = strand.json.parseLeaky(S.Args, c.arena, arguments orelse "{}", types.readOptions(c.limits)) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => return error.InvalidInput,
                 };

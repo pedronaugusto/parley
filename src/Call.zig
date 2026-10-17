@@ -35,6 +35,9 @@ context: *const Context,
 id: wire.Id,
 /// Private: where the request's notifications go.
 sink: Sink,
+/// strand's limits for what the call reads and writes: the server's
+/// (`Server.jsonLimits`), for a handler that reads a value it is given.
+limits: strand.core.Limits,
 /// Private: the `inputResponses` object of the retry, if it carried one.
 responses: ?[]const u8 = null,
 /// Private: the handler's state from the round before, opened.
@@ -88,7 +91,7 @@ pub fn input(call: *Call, key: []const u8, request: types.InputRequest) Error!?R
         call.missing = request.kind();
         return error.MissingCapability;
     }
-    if (call.responses) |object| if (try member(object, key)) |value| return .{ .bytes = value };
+    if (call.responses) |object| if (try member(object, key, call.limits)) |value| return .{ .bytes = value };
     for (call.pending.items) |p| if (std.mem.eql(u8, p.key, key)) return error.InvalidInput;
     try call.pending.append(call.arena, .{ .key = key, .request = request });
     return null;
@@ -97,19 +100,19 @@ pub fn input(call: *Call, key: []const u8, request: types.InputRequest) Error!?R
 /// Asks the user, through the client, to fill a form or open a URL.
 pub fn elicit(call: *Call, key: []const u8, request: types.Elicit) Error!?types.ElicitResult {
     const raw = try call.input(key, .{ .elicit = request }) orelse return null;
-    return try parseAnswer(types.ElicitResult, call.arena, raw);
+    return try parseAnswer(types.ElicitResult, call.arena, raw, call.limits);
 }
 
 /// Asks the client's model for a completion.
 pub fn sample(call: *Call, key: []const u8, request: types.CreateMessageParams) Error!?types.CreateMessageResult {
     const raw = try call.input(key, .{ .sample = request }) orelse return null;
-    return try parseAnswer(types.CreateMessageResult, call.arena, raw);
+    return try parseAnswer(types.CreateMessageResult, call.arena, raw, call.limits);
 }
 
 /// Asks the client for its roots.
 pub fn roots(call: *Call, key: []const u8) Error!?types.ListRootsResult {
     const raw = try call.input(key, .roots) orelse return null;
-    return try parseAnswer(types.ListRootsResult, call.arena, raw);
+    return try parseAnswer(types.ListRootsResult, call.arena, raw, call.limits);
 }
 
 /// Answers the request with a task (the tasks extension) and goes on as
@@ -147,7 +150,7 @@ pub fn progress(call: *Call, done: f64, total: ?f64, message: ?[]const u8) Error
     call.progress_sent = done;
     var out: std.Io.Writer.Allocating = .init(call.arena);
     const Params = struct { progressToken: types.Token, progress: f64, total: ?f64, message: ?[]const u8 };
-    writeNotification(&out.writer, "notifications/progress", Params{ .progressToken = token, .progress = done, .total = total, .message = message }) catch return error.OutOfMemory;
+    writeNotification(&out.writer, call.limits, "notifications/progress", Params{ .progressToken = token, .progress = done, .total = total, .message = message }) catch return error.OutOfMemory;
     call.sink.send(call.io, out.written()) catch |err| return sent(err);
 }
 
@@ -158,7 +161,7 @@ pub fn log(call: *Call, level: types.LoggingLevel, logger: ?[]const u8, data: an
     if (!level.reaches(minimum)) return;
     var out: std.Io.Writer.Allocating = .init(call.arena);
     const Params = struct { level: types.LoggingLevel, logger: ?[]const u8, data: @TypeOf(data) };
-    writeNotification(&out.writer, "notifications/message", Params{ .level = level, .logger = logger, .data = data }) catch return error.OutOfMemory;
+    writeNotification(&out.writer, call.limits, "notifications/message", Params{ .level = level, .logger = logger, .data = data }) catch return error.OutOfMemory;
     call.sink.send(call.io, out.written()) catch |err| return sent(err);
 }
 
@@ -171,23 +174,23 @@ fn sent(err: Sink.SendError) Error {
     };
 }
 
-fn writeNotification(w: *std.Io.Writer, method: []const u8, params: anytype) !void {
+fn writeNotification(w: *std.Io.Writer, limits: strand.core.Limits, method: []const u8, params: anytype) !void {
     try w.writeAll("{\"jsonrpc\":\"2.0\",\"method\":");
     try wire.writeString(w, method);
     try w.writeAll(",\"params\":");
-    try strand.json.write(w, params, types.write_options);
+    try strand.json.write(w, params, types.writeOptions(limits));
     try w.writeByte('}');
 }
 
-fn member(object: []const u8, key: []const u8) Error!?[]const u8 {
+fn member(object: []const u8, key: []const u8, limits: strand.core.Limits) Error!?[]const u8 {
     var members: strand.json.Members = undefined;
-    members.init(object, .{});
+    members.init(object, .{ .limits = limits });
     while (members.next() catch return error.InvalidInput) |m| if (m.is(key)) return m.value;
     return null;
 }
 
-fn parseAnswer(comptime T: type, arena: Allocator, raw: Raw) Error!T {
-    return strand.json.parseLeaky(T, arena, raw.bytes, types.read_options) catch |err| switch (err) {
+fn parseAnswer(comptime T: type, arena: Allocator, raw: Raw, limits: strand.core.Limits) Error!T {
+    return strand.json.parseLeaky(T, arena, raw.bytes, types.readOptions(limits)) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.InvalidInput,
     };

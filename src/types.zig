@@ -8,12 +8,17 @@ const strand = @import("strand");
 const Raw = strand.json.Raw;
 
 /// How every MCP value is written: absent optionals left out, as the schema
-/// has no null for them.
-pub const write_options: strand.json.WriteOptions = .{ .nulls = .omit };
+/// has no null for them, within `limits` (`wire.limitsFor` the message limit).
+pub fn writeOptions(limits: strand.core.Limits) strand.json.WriteOptions {
+    return .{ .nulls = .omit, .limits = limits };
+}
 
 /// How every MCP value is read: members a type does not name are passed
-/// over, so a newer peer's additions do not break an older reader.
-pub const read_options: strand.json.ParseOptions = .{ .ignore_unknown_fields = true };
+/// over, so a newer peer's additions do not break an older reader, within
+/// `limits` (`wire.limitsFor` the message limit).
+pub fn readOptions(limits: strand.core.Limits) strand.json.ParseOptions {
+    return .{ .ignore_unknown_fields = true, .limits = limits };
+}
 
 /// An icon for a tool, a resource, a prompt or an implementation.
 pub const Icon = struct {
@@ -67,11 +72,12 @@ pub const ClientCapabilities = struct {
         };
     }
 
-    /// Whether `name` is among the client's extensions.
-    pub fn hasExtension(c: ClientCapabilities, name: []const u8) bool {
+    /// Whether `name` is among the client's extensions, read within
+    /// `limits` (those the capabilities were read with).
+    pub fn hasExtension(c: ClientCapabilities, name: []const u8, limits: strand.core.Limits) bool {
         const raw = c.extensions orelse return false;
         var members: strand.json.Members = undefined;
-        members.init(raw.bytes, .{});
+        members.init(raw.bytes, .{ .limits = limits });
         while (members.next() catch return false) |m| if (m.is(name)) return true;
         return false;
     }

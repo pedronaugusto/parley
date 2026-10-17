@@ -12,9 +12,9 @@
 const Endpoint = @This();
 
 const std = @import("std");
-const aegis = @import("aegis");
 const parley = @import("parley");
 const uplink = @import("uplink");
+const strand = @import("strand");
 const headers = @import("headers.zig");
 
 const Io = std.Io;
@@ -58,8 +58,6 @@ pub const Options = struct {
     hosts: []const []const u8 = &.{},
     /// `Origin` values served besides loopback ones (`https://app.example`).
     origins: []const []const u8 = &.{},
-    /// The longest body read.
-    max_body: aegis.units.Bytes(u32) = .literal("16MiB"),
     /// How often a quiet event stream is kept open with a comment.
     keep_alive: parley.Server.Duration = .literal("15s"),
     /// Who sent a request, from its headers (an authorization the caller
@@ -113,14 +111,15 @@ fn handle(e: *Endpoint, io: Io, request: *Request, response: *Response) anyerror
         return refuse(io, response, .not_acceptable, null, .invalid_request, "Accept must list application/json and text/event-stream");
     if (!isJson(request.headers.get("Content-Type")))
         return refuse(io, response, .unsupported_media_type, null, .invalid_request, "The body is application/json");
-    const body = request.collect(arena, io, .limited(e.options.max_body.raw())) catch |err| switch (err) {
+    // The server's message limit bounds the body.
+    const body = request.collect(arena, io, .limited(e.server.options.limits.message.raw())) catch |err| switch (err) {
         error.StreamTooLong, error.BodyTooLarge => return refuse(io, response, .payload_too_large, null, .invalid_request, "The message is longer than the server reads"),
         error.OutOfMemory => return err,
         else => return err,
     };
 
     var fault: wire.Fault = .{};
-    const message = wire.decode(arena, body, .{ .fault = &fault }) catch |err| switch (err) {
+    const message = wire.decode(arena, body, .{ .fault = &fault, .limits = e.server.jsonLimits() }) catch |err| switch (err) {
         error.OutOfMemory => return err,
         error.Malformed, error.Invalid => return refuse(io, response, .bad_request, fault.id, fault.code, fault.reason),
     };
@@ -134,7 +133,7 @@ fn handle(e: *Endpoint, io: Io, request: *Request, response: *Response) anyerror
     // `initialize` opens a session, unless it carries a 2026-07-28 `_meta`:
     // a modern request is served statelessly, and that revision has no
     // `initialize`.
-    if (message == .request and std.mem.eql(u8, message.request.method, "initialize") and !try modern(arena, message.request))
+    if (message == .request and std.mem.eql(u8, message.request.method, "initialize") and !try modern(arena, message.request, e.server.jsonLimits()))
         return e.openSession(io, arena, response, message.request);
 
     const req = switch (message) {
@@ -213,8 +212,8 @@ fn answer(e: *Endpoint, io: Io, arena: Allocator, response: *Response, stream: *
 
 /// Whether a request carries the version a 2026-07-28 request carries in
 /// its `_meta`.
-fn modern(arena: Allocator, req: wire.Request) Allocator.Error!bool {
-    const m = parley.meta.read(arena, req.params) catch |err| switch (err) {
+fn modern(arena: Allocator, req: wire.Request, limits: strand.core.Limits) Allocator.Error!bool {
+    const m = parley.meta.read(arena, req.params, limits) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Malformed => return false,
     };
@@ -361,7 +360,8 @@ fn statusOf(f: parley.Server.Failure) std.http.Status {
 
 /// Why the headers disagree with the body, or null when they agree.
 fn mismatch(e: *Endpoint, io: Io, arena: Allocator, request: *const Request, req: wire.Request) Allocator.Error!?[]const u8 {
-    const m = parley.meta.read(arena, req.params) catch |err| switch (err) {
+    const limits = e.server.jsonLimits();
+    const m = parley.meta.read(arena, req.params, limits) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         // The core refuses params that are not what the schema says.
         error.Malformed => return null,
@@ -371,12 +371,12 @@ fn mismatch(e: *Endpoint, io: Io, arena: Allocator, request: *const Request, req
     const method = request.headers.get(headers.method) orelse return "Mcp-Method is missing";
     if (!std.mem.eql(u8, method, req.method)) return "Mcp-Method does not match the body's method";
     const subject: ?[]const u8 = if (std.mem.eql(u8, req.method, "tools/call") or std.mem.eql(u8, req.method, "prompts/get"))
-        member(arena, req.params, "name")
+        member(arena, req.params, "name", limits)
     else if (std.mem.eql(u8, req.method, "resources/read"))
-        member(arena, req.params, "uri")
+        member(arena, req.params, "uri", limits)
     else if (taskMethod(req.method))
         // The tasks extension: a task's requests name it, for routing.
-        member(arena, req.params, "taskId")
+        member(arena, req.params, "taskId", limits)
     else
         null;
     if (subject) |expected| {
@@ -398,11 +398,12 @@ fn paramMismatch(e: *Endpoint, io: Io, arena: Allocator, request: *const Request
         error.OutOfMemory => return error.OutOfMemory,
         error.Canceled => return null,
     } orelse return null;
-    const arguments = rawMember(req.params, "arguments");
+    const limits = e.server.jsonLimits();
+    const arguments = rawMember(req.params, "arguments", limits);
     for (params) |p| {
         const header_name = try std.mem.concat(arena, u8, &.{ headers.param_prefix, p.name });
         const header = request.headers.get(header_name);
-        const value = if (arguments) |a| at(a, p.path) else null;
+        const value = if (arguments) |a| at(a, p.path, limits) else null;
         const present = if (value) |v| !std.mem.eql(u8, v, "null") else false;
         if (!present) continue;
         const raw = header orelse return try arena.print("{s} is missing", .{header_name});
@@ -412,7 +413,7 @@ fn paramMismatch(e: *Endpoint, io: Io, arena: Allocator, request: *const Request
         };
         const v = value.?;
         const same = switch (p.kind) {
-            .string => if (@import("strand").json.parseLeaky([]const u8, arena, v, .{})) |text| std.mem.eql(u8, text, given) else |_| false,
+            .string => if (strand.json.parseLeaky([]const u8, arena, v, .{ .limits = limits })) |text| std.mem.eql(u8, text, given) else |_| false,
             .boolean => std.mem.eql(u8, v, given),
             .integer => numericallyEqual(v, given),
         };
@@ -429,16 +430,16 @@ fn numericallyEqual(a: []const u8, b: []const u8) bool {
 }
 
 /// The value at `path` (property names) in the JSON object `object`.
-fn at(object: []const u8, path: []const []const u8) ?[]const u8 {
+fn at(object: []const u8, path: []const []const u8, limits: strand.core.Limits) ?[]const u8 {
     var current = object;
-    for (path) |step| current = rawMember(current, step) orelse return null;
+    for (path) |step| current = rawMember(current, step, limits) orelse return null;
     return current;
 }
 
-fn rawMember(object: ?[]const u8, name: []const u8) ?[]const u8 {
+fn rawMember(object: ?[]const u8, name: []const u8, limits: strand.core.Limits) ?[]const u8 {
     const bytes = object orelse return null;
-    var members: @import("strand").json.Members = undefined;
-    members.init(bytes, .{});
+    var members: strand.json.Members = undefined;
+    members.init(bytes, .{ .limits = limits });
     while (members.next() catch return null) |m| if (m.is(name)) return m.value;
     return null;
 }
@@ -451,12 +452,12 @@ fn taskMethod(method: []const u8) bool {
     return false;
 }
 
-fn member(arena: Allocator, params: ?[]const u8, name: []const u8) ?[]const u8 {
+fn member(arena: Allocator, params: ?[]const u8, name: []const u8, limits: strand.core.Limits) ?[]const u8 {
     const bytes = params orelse return null;
-    var members: @import("strand").json.Members = undefined;
-    members.init(bytes, .{});
+    var members: strand.json.Members = undefined;
+    members.init(bytes, .{ .limits = limits });
     while (members.next() catch return null) |m| if (m.is(name)) {
-        return @import("strand").json.parseLeaky([]const u8, arena, m.value, .{}) catch null;
+        return strand.json.parseLeaky([]const u8, arena, m.value, .{ .limits = limits }) catch null;
     };
     return null;
 }

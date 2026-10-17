@@ -67,9 +67,9 @@ pub fn transport(t: *Transport) Client.Transport {
     return .{ .context = t, .vtable = &.{ .request = request, .notify = notify, .opened = opened, .listed = listedFn } };
 }
 
-fn listedFn(context: *anyopaque, io: Io, arena: Allocator, result: []const u8) Allocator.Error![]const u8 {
+fn listedFn(context: *anyopaque, io: Io, client: *const Client, arena: Allocator, result: []const u8) Allocator.Error![]const u8 {
     const t: *Transport = @ptrCast(@alignCast(context)); // safe: the transport was made from this one
-    return t.listed(io, arena, result);
+    return t.listed(io, client.jsonLimits(), arena, result);
 }
 
 /// Opens the session's GET stream, where a session server sends what
@@ -97,12 +97,12 @@ fn sessionStream(t: *Transport, io: Io) Io.Cancelable!void {
     };
     defer response.deinit(io);
     if (response.status != .ok) return;
-    const data = arena.alloc(u8, 16 << 20) catch return;
+    const data = arena.alloc(u8, client.options.limits.message.raw()) catch return;
     var reader: uplink.wire.sse.Reader = .init(response.reader(io), data);
     while (reader.next() catch return) |event| {
         var turn: std.heap.ArenaAllocator = .init(t.gpa);
         defer turn.deinit();
-        const message = wire.decode(turn.allocator(), event.data, .{}) catch continue;
+        const message = wire.decode(turn.allocator(), event.data, .{ .limits = client.jsonLimits() }) catch continue;
         switch (message) {
             .request => |r| switch (client.serveRequest(io, turn.allocator(), r)) {
                 // glint-ignore: Z026 -- an answer the server cannot take leaves its request unanswered, which it times out
@@ -116,18 +116,18 @@ fn sessionStream(t: *Transport, io: Io) Io.Cancelable!void {
 
 /// Learns the marks of the tools a `tools/list` answer lists, and leaves
 /// out a tool whose marks break the rules (2026-07-28: MUST): the answer
-/// as the application sees it.
-pub fn listed(t: *Transport, io: Io, arena: Allocator, result: []const u8) Allocator.Error![]const u8 {
+/// as the application sees it. `limits`: the client's (`Client.jsonLimits`).
+pub fn listed(t: *Transport, io: Io, limits: strand.core.Limits, arena: Allocator, result: []const u8) Allocator.Error![]const u8 {
     const Listed = struct { tools: []const strand.json.Raw = &.{} };
-    const l = strand.json.parseLeaky(Listed, arena, result, parley.types.read_options) catch return result;
+    const l = strand.json.parseLeaky(Listed, arena, result, parley.types.readOptions(limits)) catch return result;
     var kept: std.ArrayList([]const u8) = .empty;
     var dropped = false;
     t.marks_mutex.lockUncancelable(io);
     defer t.marks_mutex.unlock(io);
     for (l.tools) |tool| {
         const Tool = struct { name: []const u8, inputSchema: strand.json.Raw = .{ .bytes = "{}" } };
-        const parsed = strand.json.parseLeaky(Tool, arena, tool.bytes, parley.types.read_options) catch continue;
-        const marks = parley.registry.headerParams(t.gpa, parsed.inputSchema.bytes) catch |err| switch (err) {
+        const parsed = strand.json.parseLeaky(Tool, arena, tool.bytes, parley.types.readOptions(limits)) catch continue;
+        const marks = parley.registry.headerParams(t.gpa, parsed.inputSchema.bytes, limits) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidSchema => {
                 std.log.warn("tool {s} left out: its x-mcp-header marks break the rules", .{parsed.name});
@@ -148,7 +148,7 @@ pub fn listed(t: *Transport, io: Io, arena: Allocator, result: []const u8) Alloc
     const w = &out.writer;
     w.writeByte('{') catch return error.OutOfMemory;
     var members: strand.json.Members = undefined;
-    members.init(result, .{});
+    members.init(result, .{ .limits = limits });
     var first = true;
     while (members.next() catch null) |m| {
         if (!first) w.writeByte(',') catch return error.OutOfMemory;
@@ -195,7 +195,7 @@ fn request(context: *anyopaque, io: Io, arena: Allocator, exchange: *Client.Exch
     };
     const content_type = response.headers.get("Content-Type") orelse "";
     if (std.mem.startsWith(u8, content_type, "text/event-stream")) return t.events(io, arena, exchange, &response);
-    const body = response.collect(arena, io, .limited(64 << 20)) catch |err| return switch (err) {
+    const body = response.collect(arena, io, .limited(exchange.client.options.limits.message.raw())) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.Canceled => error.Canceled,
         else => error.Closed,
@@ -221,13 +221,13 @@ fn events(t: *Transport, io: Io, arena: Allocator, exchange: *Client.Exchange, f
     var retry: ?u64 = null;
     var attempts: u8 = 0;
     while (true) {
-        const data = try arena.alloc(u8, 16 << 20);
+        const data = try arena.alloc(u8, exchange.client.options.limits.message.raw());
         var reader: uplink.wire.sse.Reader = .init(response.reader(io), data);
         while (reader.next() catch return error.Closed) |event| {
             if (event.id.len != 0) last_id = try arena.dupe(u8, event.id);
             if (event.retry) |r| retry = r;
             if (event.data.len == 0) continue;
-            const message = wire.decode(arena, event.data, .{}) catch continue;
+            const message = wire.decode(arena, event.data, .{ .limits = exchange.client.jsonLimits() }) catch continue;
             switch (message) {
                 .result => |r| if (r.id.eql(exchange.id)) return arena.dupe(u8, event.data),
                 .failure => |f| if (f.id) |id| if (id.eql(exchange.id)) return arena.dupe(u8, event.data),
@@ -297,12 +297,13 @@ fn mirror(t: *Transport, io: Io, arena: Allocator, exchange: *const Client.Excha
     const marked = for (t.marks.items) |m| {
         if (std.mem.eql(u8, m.tool, tool)) break m;
     } else return;
+    const limits = exchange.client.jsonLimits();
     for (marked.params) |p| {
         var value: []const u8 = arguments;
-        for (p.path) |step| value = member(value, step) orelse break else {
+        for (p.path) |step| value = member(value, step, limits) orelse break else {
             if (std.mem.eql(u8, value, "null")) continue;
             const text = switch (p.kind) {
-                .string => strand.json.parseLeaky([]const u8, arena, value, .{}) catch continue,
+                .string => strand.json.parseLeaky([]const u8, arena, value, .{ .limits = limits }) catch continue,
                 .integer, .boolean => value,
             };
             try fields.append(arena, .{
@@ -313,9 +314,9 @@ fn mirror(t: *Transport, io: Io, arena: Allocator, exchange: *const Client.Excha
     }
 }
 
-fn member(object: []const u8, name: []const u8) ?[]const u8 {
+fn member(object: []const u8, name: []const u8, limits: strand.core.Limits) ?[]const u8 {
     var members: strand.json.Members = undefined;
-    members.init(object, .{});
+    members.init(object, .{ .limits = limits });
     while (members.next() catch return null) |m| if (m.is(name)) return m.value;
     return null;
 }

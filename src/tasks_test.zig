@@ -81,7 +81,7 @@ fn ask(s: *Server, arena: std.mem.Allocator, method: []const u8, params: []const
     const m = if (declared) with_tasks else without_tasks;
     const sep: []const u8 = if (params.len == 0) "" else ",";
     const message = try arena.print("{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"{s}\",\"params\":{{{s}{s}{s}}}}}", .{ method, params, sep, m });
-    const request = (try parley.wire.decode(arena, message, .{})).request;
+    const request = (try parley.wire.decode(arena, message, .{ .limits = parley.wire.limitsFor(parley.wire.default_message) })).request;
     const reply = try s.serve(testing.io, arena, request, null, .none);
     return switch (reply) {
         .result => |r| r,

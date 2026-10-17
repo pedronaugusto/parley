@@ -14,6 +14,9 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const types = parley.types;
 const Raw = strand.json.Raw;
+/// How the program reads what it is given: the client's limits, its message
+/// limit the default.
+const read_options = types.readOptions(parley.wire.limitsFor(parley.wire.default_message));
 
 /// Accepts every form, filling each field the schema gives no default with
 /// a value of its type (the client fills the defaults itself).
@@ -22,7 +25,7 @@ fn elicit(context: ?*anyopaque, _: Io, arena: Allocator, params: []const u8) par
     // Defaults are the client's to apply: the user answered nothing.
     if (std.mem.find(u8, scenario.*, "defaults") != null) return .{ .action = .accept, .content = .{ .bytes = "{}" } };
     const Form = struct { requestedSchema: struct { properties: ?Raw = null } = .{} };
-    const form = strand.json.parseLeaky(Form, arena, params, types.read_options) catch return .{ .action = .accept, .content = .{ .bytes = "{}" } };
+    const form = strand.json.parseLeaky(Form, arena, params, read_options) catch return .{ .action = .accept, .content = .{ .bytes = "{}" } };
     var out: Io.Writer.Allocating = .init(arena);
     const w = &out.writer;
     w.writeByte('{') catch return error.OutOfMemory;
@@ -32,7 +35,7 @@ fn elicit(context: ?*anyopaque, _: Io, arena: Allocator, params: []const u8) par
         var first = true;
         while (members.next() catch null) |p| {
             const Field = struct { type: []const u8 = "string", default: ?Raw = null };
-            const f = strand.json.parseLeaky(Field, arena, p.value, types.read_options) catch continue;
+            const f = strand.json.parseLeaky(Field, arena, p.value, read_options) catch continue;
             if (f.default != null) continue;
             if (!first) w.writeByte(',') catch return error.OutOfMemory;
             first = false;
@@ -83,7 +86,7 @@ pub fn main(init: std.process.Init) !void {
     const listed = try client.list(io, arena, "tools/list", null, null);
     const Context = struct { toolCalls: []const struct { name: []const u8, arguments: Raw = .{ .bytes = "{}" } } = &.{} };
     const context: Context = if (init.environ_map.get("MCP_CONFORMANCE_CONTEXT")) |raw|
-        strand.json.parseLeaky(Context, arena, raw, types.read_options) catch .{}
+        strand.json.parseLeaky(Context, arena, raw, read_options) catch .{}
     else
         .{};
     if (context.toolCalls.len != 0) {
@@ -91,7 +94,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     const Listed = struct { tools: []const struct { name: []const u8 } = &.{} };
-    const tools = (strand.json.parseLeaky(Listed, arena, listed, types.read_options) catch Listed{}).tools;
+    const tools = (strand.json.parseLeaky(Listed, arena, listed, read_options) catch Listed{}).tools;
     if (std.mem.eql(u8, scenario, "initialize") or std.mem.eql(u8, scenario, "tools_call") or std.mem.eql(u8, scenario, "tools-call")) {
         if (tools.len != 0) _ = try client.callTool(io, arena, tools[0].name, .{ .a = 2, .b = 3 }, null);
         return;
@@ -101,7 +104,7 @@ pub fn main(init: std.process.Init) !void {
         // The focal tool's input schema goes back as the client received
         // it, byte for byte, as the echo tool's `schema` argument.
         const Schemas = struct { tools: []const struct { name: []const u8, inputSchema: ?Raw = null } = &.{} };
-        const listed_schemas = (strand.json.parseLeaky(Schemas, arena, listed, types.read_options) catch Schemas{}).tools;
+        const listed_schemas = (strand.json.parseLeaky(Schemas, arena, listed, read_options) catch Schemas{}).tools;
         for (listed_schemas) |tool| if (std.mem.eql(u8, tool.name, "json_schema_2020_12_tool")) {
             const schema = tool.inputSchema orelse return error.NoSchema;
             const arguments: Raw = .{ .bytes = try std.mem.concat(arena, u8, &.{ "{\"schema\":", schema.bytes, "}" }) };

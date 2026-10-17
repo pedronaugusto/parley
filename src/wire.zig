@@ -9,6 +9,7 @@
 //! message whose method and string id have no escapes in them; one that has
 //! them is unescaped onto the arena.
 const std = @import("std");
+const aegis = @import("aegis");
 const strand = @import("strand");
 
 const json = strand.json;
@@ -111,11 +112,40 @@ pub const Fault = struct {
     reason: []const u8 = "",
 };
 
+/// The bytes one message may hold, by default: strand's own input limit.
+pub const default_message: aegis.units.Bytes(u32) = .literal("16MiB");
+
+/// strand's limits for a message of at most `message` bytes, and for every
+/// read or write of a value within it: the message limit is the one a peer
+/// sets, and no count inside it refuses what its bytes admit. Input, output
+/// and strings are the message itself; items and a container's items are
+/// as many as its bytes can hold (two bytes each, `1,`); what a decode may
+/// allocate and the work it may do grow with it in strand's own
+/// proportions (twice and eight times its input); depth and the sizes of
+/// keys and numbers stay strand's, as no larger message needs more of them.
+pub fn limitsFor(message: aegis.units.Bytes(u32)) strand.core.Limits {
+    const m: usize = message.raw();
+    const base: strand.core.Limits = .{};
+    return .{
+        .input_bytes = m,
+        .output_bytes = m,
+        .string_bytes = m,
+        .items = @max(1, m / 2),
+        .container_items = @max(1, m / 2),
+        .allocation_bytes = std.math.mul(usize, m, base.allocation_bytes / base.input_bytes) catch std.math.maxInt(usize),
+        .work = std.math.mul(usize, m, base.work / base.input_bytes) catch std.math.maxInt(usize),
+        .depth = base.depth,
+        .key_bytes = base.key_bytes,
+        .numeric_bytes = base.numeric_bytes,
+    };
+}
+
 pub const DecodeOptions = struct {
     /// Filled when decoding fails.
     fault: ?*Fault = null,
-    /// strand's limits for the envelope and every value passed over.
-    limits: strand.core.Limits = .{},
+    /// strand's limits for the envelope and every value passed over: those
+    /// of the message limit the reader set (`limitsFor`).
+    limits: strand.core.Limits,
 };
 
 /// `Malformed`: the bytes are not one JSON value (answered `parse_error`).
@@ -152,7 +182,7 @@ fn decodeInto(arena: Allocator, bytes: []const u8, limits: strand.core.Limits, f
     const null_id = if (seen[1]) |raw| std.mem.eql(u8, raw, "null") else false;
     if (seen[1]) |raw| {
         if (!null_id) {
-            id = idFrom(arena, raw) catch |err| switch (err) {
+            id = idFrom(arena, raw, limits) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Invalid => return refuse(fault, .invalid_request, "the id is not a string or an integer"),
             };
@@ -164,7 +194,7 @@ fn decodeInto(arena: Allocator, bytes: []const u8, limits: strand.core.Limits, f
 
     if (seen[2]) |raw_method| {
         if (seen[4] != null or seen[5] != null) return refuse(fault, .invalid_request, "a request has a result or an error");
-        const method = readString(arena, raw_method) catch |err| switch (err) {
+        const method = readString(arena, raw_method, limits) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Invalid => return refuse(fault, .invalid_request, "the method is not a string"),
         };
@@ -182,7 +212,7 @@ fn decodeInto(arena: Allocator, bytes: []const u8, limits: strand.core.Limits, f
     if (seen[5]) |raw_error| {
         // An error may answer a request whose id could not be read: null.
         if (seen[1] == null) return refuse(fault, .invalid_request, "an error without an id");
-        return .{ .failure = readFailure(arena, id, raw_error) catch |err| switch (err) {
+        return .{ .failure = readFailure(arena, id, raw_error, limits) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Invalid => return refuse(fault, .invalid_request, "the error is not an object with a code and a message"),
         } };
@@ -214,32 +244,32 @@ fn firstByte(bytes: []const u8) u8 {
 }
 
 /// The id `raw` (one JSON value) is: a string or an integer.
-pub fn idFrom(arena: Allocator, raw: []const u8) error{ Invalid, OutOfMemory }!Id {
-    if (raw[0] == '"') return .{ .string = try readString(arena, raw) };
+pub fn idFrom(arena: Allocator, raw: []const u8, json_limits: strand.core.Limits) error{ Invalid, OutOfMemory }!Id {
+    if (raw[0] == '"') return .{ .string = try readString(arena, raw, json_limits) };
     return .{ .integer = json.intOf(i64, raw) orelse return error.Invalid };
 }
 
 /// A JSON string value, unescaped: a view into `raw` when it has no escape.
-fn readString(arena: Allocator, raw: []const u8) error{ Invalid, OutOfMemory }![]const u8 {
+fn readString(arena: Allocator, raw: []const u8, json_limits: strand.core.Limits) error{ Invalid, OutOfMemory }![]const u8 {
     if (raw.len < 2 or raw[0] != '"') return error.Invalid;
     const body = raw[1 .. raw.len - 1];
     if (std.mem.findScalar(u8, body, '\\') == null) return body;
-    return json.parseLeaky([]const u8, arena, raw, .{}) catch |err| switch (err) {
+    return json.parseLeaky([]const u8, arena, raw, .{ .limits = json_limits }) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.Invalid,
     };
 }
 
-fn readFailure(arena: Allocator, id: ?Id, raw: []const u8) error{ Invalid, OutOfMemory }!Failure {
+fn readFailure(arena: Allocator, id: ?Id, raw: []const u8, json_limits: strand.core.Limits) error{ Invalid, OutOfMemory }!Failure {
     var code: ?i64 = null;
     var message: ?[]const u8 = null;
     var data: ?[]const u8 = null;
     var members: json.Members = undefined;
-    members.init(raw, .{});
+    members.init(raw, .{ .limits = json_limits });
     while (members.next() catch return error.Invalid) |m| {
         switch (m.which(&.{ "code", "message", "data" }) orelse continue) {
             0 => code = json.intOf(i64, m.value) orelse return error.Invalid,
-            1 => message = try readString(arena, m.value),
+            1 => message = try readString(arena, m.value, json_limits),
             2 => data = m.value,
             else => unreachable,
         }

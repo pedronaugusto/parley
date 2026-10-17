@@ -233,11 +233,12 @@ pub const Table = struct {
     /// Takes the answers in `responses` (an `inputResponses` object) to
     /// what the task waits for; others are passed over. Once every request
     /// is answered the task works again, and the answers are returned as
-    /// one `inputResponses` object for its next round, on `arena`.
-    pub fn answer(t: *Table, task: *Task, now: i64, arena: Allocator, responses: []const u8) error{ OutOfMemory, Invalid }!?[]const u8 {
+    /// one `inputResponses` object for its next round, on `arena`; `responses`
+    /// is read within `limits` (the server's).
+    pub fn answer(t: *Table, task: *Task, now: i64, arena: Allocator, responses: []const u8, limits: strand.core.Limits) error{ OutOfMemory, Invalid }!?[]const u8 {
         if (task.status() != .input_required) return null;
         var members: strand.json.Members = undefined;
-        members.init(responses, .{});
+        members.init(responses, .{ .limits = limits });
         while (members.next() catch return error.Invalid) |m| {
             const at = for (task.asked.items, 0..) |a, i| {
                 if (m.is(a.key)) break i;

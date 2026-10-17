@@ -53,7 +53,6 @@ pub const Options = struct {
     stderr: Stderr = .inherit,
     /// The client on the server's streams.
     client: parley.Client.Options,
-    channel: parley.stdio.Channel.ChannelOptions = .{},
     /// How long the server has to exit once its input is closed, and again
     /// once it is asked to stop, before it is killed.
     grace: Duration = .literal("2s"),
@@ -115,7 +114,7 @@ pub const Child = struct {
         // unreachable: both pipes were asked for, and spawn made them
         c.reader = c.process.stdoutReader(io, &c.read_buffer) orelse unreachable;
         c.writer = c.process.stdinWriter(io, &c.write_buffer) orelse unreachable;
-        c.channel = .init(gpa, &c.reader.interface, &c.writer.interface, options.channel);
+        c.channel = .init(gpa, &c.reader.interface, &c.writer.interface);
         c.client = .init(gpa, c.channel.transport(), options.client);
         errdefer c.client.deinit();
         c.kept = switch (options.stderr) {

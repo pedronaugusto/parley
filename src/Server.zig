@@ -97,6 +97,11 @@ pub const RequestState = struct {
 };
 
 pub const Limits = struct {
+    /// The longest message, either way: what a transport reads (a longer
+    /// one is refused unread), and what every read of a message and of a
+    /// value within it allows (`wire.limitsFor`). A result past it is not
+    /// written.
+    message: aegis.units.Bytes(u32) = wire.default_message,
     /// Open `subscriptions/listen` streams and legacy session streams.
     listeners: u32 = 64,
     /// Resources one stream watches.
@@ -109,6 +114,12 @@ pub const Limits = struct {
     /// asking for nothing.
     quiet_rounds: u8 = 8,
 };
+
+/// strand's limits for every read and write of a message and of the values
+/// within it: those of `options.limits.message`.
+pub fn jsonLimits(s: *const Server) strand.core.Limits {
+    return wire.limitsFor(s.options.limits.message);
+}
 
 pub const Offers = struct {
     tools: ?bool = null,
@@ -141,7 +152,7 @@ pub fn init(gpa: Allocator, io: Io, options: Options) InitError!Server {
     var out: Writer.Allocating = .init(gpa);
     defer out.deinit();
     out.writer.writeAll("\"" ++ meta.server_info ++ "\":") catch return error.OutOfMemory;
-    strand.json.write(&out.writer, options.info, types.write_options) catch return error.OutOfMemory;
+    strand.json.write(&out.writer, options.info, types.writeOptions(wire.limitsFor(options.limits.message))) catch return error.OutOfMemory;
     return .{
         .gpa = gpa,
         .options = options,
@@ -216,9 +227,9 @@ fn addToolWith(s: *Server, io: Io, spec: registry.ToolSpec, input: []const u8, o
     errdefer s.gpa.destroy(tool);
     const name = try s.gpa.dupe(u8, spec.name);
     errdefer s.gpa.free(name);
-    const listed = try registry.listTool(s.gpa, spec, input, output);
+    const listed = try registry.listTool(s.gpa, s.jsonLimits(), spec, input, output);
     errdefer s.gpa.free(listed);
-    const params = try registry.headerParams(s.gpa, input);
+    const params = try registry.headerParams(s.gpa, input, s.jsonLimits());
     errdefer registry.freeHeaderParams(s.gpa, params);
     tool.* = .{ .name = name, .listed = listed, .handler = handler, .headers = params, .task = spec.task };
     try s.insert(io, .tools, &s.tools, tool, name);
@@ -252,7 +263,7 @@ pub fn addResource(s: *Server, io: Io, spec: registry.ResourceSpec, handler: reg
     errdefer s.gpa.destroy(resource);
     const uri = try s.gpa.dupe(u8, spec.uri);
     errdefer s.gpa.free(uri);
-    const listed = try registry.listResource(s.gpa, spec);
+    const listed = try registry.listResource(s.gpa, s.jsonLimits(), spec);
     errdefer s.gpa.free(listed);
     resource.* = .{ .uri = uri, .listed = listed, .handler = handler };
     try s.insert(io, .resources, &s.resources, resource, uri);
@@ -269,7 +280,7 @@ pub fn addTemplate(s: *Server, io: Io, spec: registry.TemplateSpec, handler: reg
     errdefer s.gpa.destroy(template);
     const pattern = try s.gpa.dupe(u8, spec.uri_template);
     errdefer s.gpa.free(pattern);
-    const listed = try registry.listTemplate(s.gpa, spec);
+    const listed = try registry.listTemplate(s.gpa, s.jsonLimits(), spec);
     errdefer s.gpa.free(listed);
     template.* = .{ .uri_template = pattern, .listed = listed, .handler = handler };
     try s.insert(io, .templates, &s.templates, template, pattern);
@@ -292,7 +303,7 @@ fn addPromptWith(s: *Server, io: Io, spec: registry.PromptSpec, arguments: []con
     errdefer s.gpa.destroy(prompt);
     const name = try s.gpa.dupe(u8, spec.name);
     errdefer s.gpa.free(name);
-    const listed = try registry.listPrompt(s.gpa, spec, arguments);
+    const listed = try registry.listPrompt(s.gpa, s.jsonLimits(), spec, arguments);
     errdefer s.gpa.free(listed);
     var required: std.ArrayList([]const u8) = .empty;
     errdefer {
@@ -395,12 +406,18 @@ pub const Failure = struct {
 /// `Canceled`: the request was canceled, and nothing is answered.
 pub const HandleError = error{ Canceled, OutOfMemory };
 
+/// Building an answer: `TooLong` when it is past the message limit, which
+/// `handle` answers as an internal error rather than write it.
+const BuildError = HandleError || error{TooLong};
+
+const too_long = "the answer is longer than the server's message limit";
+
 /// Answers a 2026-07-28 request: its context is read from its `_meta`, and
 /// one that lacks what every request must carry, or names a version this
 /// server does not speak, is refused. `principal` is who sent it, as the
 /// transport authenticated them.
 pub fn serve(s: *Server, io: Io, arena: Allocator, request: wire.Request, principal: ?[]const u8, sink: Sink) HandleError!Reply {
-    const m = meta.read(arena, request.params) catch |err| switch (err) {
+    const m = meta.read(arena, request.params, s.jsonLimits()) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Malformed => return malformed("params or _meta are not what the schema says"),
     };
@@ -446,6 +463,13 @@ fn failure(code: wire.Code, message: []const u8) Reply {
 /// Answers `request` in `context`. The session layer calls it for a request
 /// under an earlier revision, with the context its handshake gave.
 pub fn handle(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink) HandleError!Reply {
+    return s.route(io, arena, request, context, sink) catch |err| switch (err) {
+        error.TooLong => failure(.internal_error, too_long),
+        error.Canceled, error.OutOfMemory => |e| e,
+    };
+}
+
+fn route(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink) BuildError!Reply {
     const methods = [_][]const u8{
         "server/discover", "tools/list",   "tools/call",   "resources/list",      "resources/templates/list",
         "resources/read",  "prompts/list", "prompts/get",  "completion/complete", "subscriptions/listen",
@@ -477,9 +501,11 @@ pub fn handle(s: *Server, io: Io, arena: Allocator, request: wire.Request, conte
 const Result = struct {
     out: Writer.Allocating,
     revision: Revision,
+    /// The server's: no answer is longer than its message limit.
+    limits: strand.core.Limits,
 
-    fn begin(arena: Allocator, revision: Revision) Result {
-        return .{ .out = .init(arena), .revision = revision };
+    fn begin(s: *const Server, arena: Allocator, revision: Revision) Result {
+        return .{ .out = .init(arena), .revision = revision, .limits = s.jsonLimits() };
     }
 
     fn w(r: *Result) *Writer {
@@ -487,12 +513,13 @@ const Result = struct {
     }
 
     /// `"name":` and `value` as strand writes it, after the members before it.
-    fn field(r: *Result, name: []const u8, value: anytype) HandleError!void {
+    fn field(r: *Result, name: []const u8, value: anytype) BuildError!void {
         r.separate() catch return error.OutOfMemory;
         wire.writeString(r.w(), name) catch return error.OutOfMemory;
         r.w().writeByte(':') catch return error.OutOfMemory;
-        strand.json.write(r.w(), value, types.write_options) catch |err| return switch (err) {
+        strand.json.write(r.w(), value, types.writeOptions(r.limits)) catch |err| return switch (err) {
             error.OutOfMemory, error.WriteFailed => error.OutOfMemory,
+            error.OutputLimit => error.TooLong,
             // A value a handler built that is not JSON (text that is not
             // UTF-8): the result cannot be written.
             else => error.OutOfMemory,
@@ -500,11 +527,12 @@ const Result = struct {
     }
 
     /// `"name":` and `json`, one value as written.
-    fn raw(r: *Result, name: []const u8, json: []const u8) HandleError!void {
+    fn raw(r: *Result, name: []const u8, json: []const u8) BuildError!void {
         r.separate() catch return error.OutOfMemory;
         wire.writeString(r.w(), name) catch return error.OutOfMemory;
         r.w().writeByte(':') catch return error.OutOfMemory;
         r.w().writeAll(json) catch return error.OutOfMemory;
+        if (r.out.written().len > r.limits.output_bytes) return error.TooLong;
     }
 
     fn separate(r: *Result) Writer.Error!void {
@@ -515,15 +543,16 @@ const Result = struct {
     }
 
     /// Ends the object as it is: a result inside another.
-    fn endPlain(r: *Result) HandleError![]const u8 {
+    fn endPlain(r: *Result) BuildError![]const u8 {
         if (r.out.written().len == 0) r.separate() catch return error.OutOfMemory;
         r.w().writeByte('}') catch return error.OutOfMemory;
+        if (r.out.written().len > r.limits.output_bytes) return error.TooLong;
         return r.out.written();
     }
 
     /// Ends the object: caching hints when `hint` is given (2026-07-28),
     /// the server's identity when it names itself.
-    fn end(r: *Result, s: *const Server, hint: ?Cache.Hint, private: bool) HandleError![]const u8 {
+    fn end(r: *Result, s: *const Server, hint: ?Cache.Hint, private: bool) BuildError![]const u8 {
         if (r.revision.stateless()) {
             if (hint) |h| {
                 try r.field("ttlMs", h.ttl.raw());
@@ -538,6 +567,7 @@ const Result = struct {
             r.separate() catch return error.OutOfMemory;
         }
         r.w().writeByte('}') catch return error.OutOfMemory;
+        if (r.out.written().len > r.limits.output_bytes) return error.TooLong;
         return r.out.written();
     }
 };
@@ -565,12 +595,12 @@ pub fn capabilitiesJson(s: *Server, io: Io, arena: Allocator) HandleError![]cons
     s.lock.lockShared(io) catch return error.Canceled;
     defer s.lock.unlockShared(io);
     var out: Writer.Allocating = .init(arena);
-    strand.json.write(&out.writer, s.capabilities(), types.write_options) catch return error.OutOfMemory;
+    strand.json.write(&out.writer, s.capabilities(), types.writeOptions(s.jsonLimits())) catch return error.OutOfMemory;
     return out.written();
 }
 
-fn discover(s: *Server, arena: Allocator, context: *const Context) HandleError!Reply {
-    var r: Result = .begin(arena, context.revision);
+fn discover(s: *Server, arena: Allocator, context: *const Context) BuildError!Reply {
+    var r: Result = .begin(s, arena, context.revision);
     const versions = comptime blk: {
         var names: []const []const u8 = &.{};
         for (@typeInfo(Revision).@"enum".field_names) |name| names = names ++ .{name};
@@ -589,8 +619,8 @@ fn admitted(s: *const Server, context: *const Context, which: List, name: []cons
     return f.admit(f.context, context, which, name);
 }
 
-fn parseParams(comptime T: type, arena: Allocator, params: ?[]const u8) HandleError!?T {
-    return strand.json.parseLeaky(T, arena, params orelse "{}", types.read_options) catch |err| switch (err) {
+fn parseParams(s: *const Server, comptime T: type, arena: Allocator, params: ?[]const u8) HandleError!?T {
+    return strand.json.parseLeaky(T, arena, params orelse "{}", types.readOptions(s.jsonLimits())) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => null,
     };
@@ -598,8 +628,8 @@ fn parseParams(comptime T: type, arena: Allocator, params: ?[]const u8) HandleEr
 
 /// One page of a list. A cursor names the list's generation and an offset:
 /// a cursor into a list that changed since is refused.
-fn listPage(s: *Server, io: Io, arena: Allocator, comptime which: List, params: ?[]const u8, context: *const Context) HandleError!Reply {
-    const p = try parseParams(types.PaginatedParams, arena, params) orelse return failure(.invalid_params, "params are not what the schema says");
+fn listPage(s: *Server, io: Io, arena: Allocator, comptime which: List, params: ?[]const u8, context: *const Context) BuildError!Reply {
+    const p = try s.parseParams(types.PaginatedParams, arena, params) orelse return failure(.invalid_params, "params are not what the schema says");
     s.lock.lockShared(io) catch return error.Canceled;
     defer s.lock.unlockShared(io);
     const generation = s.generations.get(which);
@@ -621,7 +651,7 @@ fn listPage(s: *Server, io: Io, arena: Allocator, comptime which: List, params: 
         .templates => .{ "resourceTemplates", s.options.cache.templates },
         .prompts => .{ "prompts", s.options.cache.prompts },
     };
-    var r: Result = .begin(arena, context.revision);
+    var r: Result = .begin(s, arena, context.revision);
     r.separate() catch return error.OutOfMemory;
     r.w().print("\"{s}\":[", .{name}) catch return error.OutOfMemory;
     const size = s.options.page_size orelse std.math.maxInt(u32);
@@ -660,7 +690,7 @@ const Round = struct {
 
 /// Reads a retry's `inputResponses` and opens its `requestState`, bound to
 /// what the request names.
-fn round(s: *Server, io: Io, arena: Allocator, context: *const Context, method: []const u8, subject: []const u8, responses: ?Raw, sealed: ?[]const u8) HandleError!union(enum) { ok: Round, refused: Reply } {
+fn round(s: *Server, io: Io, arena: Allocator, context: *const Context, method: []const u8, subject: []const u8, responses: ?Raw, sealed: ?[]const u8) BuildError!union(enum) { ok: Round, refused: Reply } {
     var result: Round = .{ .responses = null, .state = null };
     if (responses) |raw| {
         if (raw.bytes.len == 0 or raw.bytes[0] != '{') return .{ .refused = failure(.invalid_params, "inputResponses is not an object") };
@@ -676,12 +706,12 @@ fn round(s: *Server, io: Io, arena: Allocator, context: *const Context, method: 
     return .{ .ok = result };
 }
 
-fn newCall(io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink, r: Round) Call {
-    return .{ .io = io, .arena = arena, .context = context, .id = request.id, .sink = sink, .responses = r.responses, .state_in = r.state };
+fn newCall(s: *const Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink, r: Round) Call {
+    return .{ .io = io, .arena = arena, .context = context, .id = request.id, .sink = sink, .limits = s.jsonLimits(), .responses = r.responses, .state_in = r.state };
 }
 
 /// What a handler's failure is answered with, or the input it asked for.
-fn outcome(s: *Server, io: Io, arena: Allocator, call: *Call, err: Call.Error, method: []const u8, subject: []const u8) HandleError!Reply {
+fn outcome(s: *Server, io: Io, arena: Allocator, call: *Call, err: Call.Error, method: []const u8, subject: []const u8) BuildError!Reply {
     return switch (err) {
         error.Canceled => error.Canceled,
         error.OutOfMemory => error.OutOfMemory,
@@ -693,7 +723,7 @@ fn outcome(s: *Server, io: Io, arena: Allocator, call: *Call, err: Call.Error, m
     };
 }
 
-fn inputRequired(s: *Server, io: Io, arena: Allocator, call: *Call, method: []const u8, subject: []const u8) HandleError!Reply {
+fn inputRequired(s: *Server, io: Io, arena: Allocator, call: *Call, method: []const u8, subject: []const u8) BuildError!Reply {
     if (call.pending.items.len == 0 and call.state_out == null)
         return failure(.internal_error, "the handler asked for input without asking for any");
     if (call.pending.items.len > s.options.limits.input_requests) return failure(.internal_error, "the handler asked for more input than the server allows at once");
@@ -711,7 +741,7 @@ fn inputRequired(s: *Server, io: Io, arena: Allocator, call: *Call, method: []co
 }
 
 /// `-32021`, naming the capability as a `ClientCapabilities` object.
-fn missing(arena: Allocator, kind: types.InputKind) HandleError!Reply {
+fn missing(arena: Allocator, kind: types.InputKind) BuildError!Reply {
     const data = switch (kind) {
         .elicit_form => "{\"requiredCapabilities\":{\"elicitation\":{\"form\":{}}}}",
         .elicit_url => "{\"requiredCapabilities\":{\"elicitation\":{\"url\":{}}}}",
@@ -733,7 +763,7 @@ pub fn inputRequiredJson(s: *const Server, arena: Allocator, ir: InputRequired) 
             if (i != 0) w.writeByte(',') catch return error.OutOfMemory;
             wire.writeString(w, p.key) catch return error.OutOfMemory;
             w.writeByte(':') catch return error.OutOfMemory;
-            strand.json.write(w, p.request, types.write_options) catch return error.OutOfMemory;
+            strand.json.write(w, p.request, types.writeOptions(s.jsonLimits())) catch return error.OutOfMemory;
         }
         w.writeByte('}') catch return error.OutOfMemory;
     }
@@ -746,8 +776,8 @@ pub fn inputRequiredJson(s: *const Server, arena: Allocator, ir: InputRequired) 
     return out.written();
 }
 
-fn callTool(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink) HandleError!Reply {
-    const p = try parseParams(types.CallToolParams, arena, request.params) orelse return failure(.invalid_params, "params are not what the schema says");
+fn callTool(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink) BuildError!Reply {
+    const p = try s.parseParams(types.CallToolParams, arena, request.params) orelse return failure(.invalid_params, "params are not what the schema says");
     if (p.arguments) |a| if (a.bytes[0] != '{') return failure(.invalid_params, "arguments is not an object");
     const handler, const task_support = found: {
         s.lock.lockShared(io) catch return error.Canceled;
@@ -756,7 +786,7 @@ fn callTool(s: *Server, io: Io, arena: Allocator, request: wire.Request, context
         break :found null;
     } orelse return try unknown(arena, "Unknown tool: ", p.name);
     if (!s.admitted(context, .tools, p.name)) return try unknown(arena, "Unknown tool: ", p.name);
-    const tasks_declared = s.options.tasks != null and context.revision.stateless() and context.client.hasExtension(tasks.extension);
+    const tasks_declared = s.options.tasks != null and context.revision.stateless() and context.client.hasExtension(tasks.extension, s.jsonLimits());
     // A tool that cannot answer but as a task, asked by a client that
     // cannot take one (tasks extension: required capabilities).
     if (task_support == .required and !tasks_declared) return missingTasks();
@@ -765,20 +795,20 @@ fn callTool(s: *Server, io: Io, arena: Allocator, request: wire.Request, context
         .refused => |reply| return reply,
     };
     if (task_support != .forbidden and tasks_declared) return s.callAsTask(io, arena, request, context, sink, handler, p.name, r);
-    var call = newCall(io, arena, request, context, sink, r);
+    var call = s.newCall(io, arena, request, context, sink, r);
     const returned = handler.call(handler.context, &call, if (p.arguments) |a| a.bytes else null);
     return s.answerTool(io, arena, &call, returned, request.method, p.name, context.revision);
 }
 
 /// A tool call's answer: its result, the input it asks for, or its failure.
-fn answerTool(s: *Server, io: Io, arena: Allocator, call: *Call, returned: Call.Error!registry.ToolResult, method: []const u8, name: []const u8, revision: Revision) HandleError!Reply {
+fn answerTool(s: *Server, io: Io, arena: Allocator, call: *Call, returned: Call.Error!registry.ToolResult, method: []const u8, name: []const u8, revision: Revision) BuildError!Reply {
     const result = returned catch |err| return s.outcome(io, arena, call, err, method, name);
     return .{ .result = try s.toolResultJson(arena, revision, result, true) };
 }
 
 /// A tool's result object; with the server's identity when `identify`.
-fn toolResultJson(s: *const Server, arena: Allocator, revision: Revision, result: registry.ToolResult, identify: bool) HandleError![]const u8 {
-    var out: Result = .begin(arena, revision);
+fn toolResultJson(s: *const Server, arena: Allocator, revision: Revision, result: registry.ToolResult, identify: bool) BuildError![]const u8 {
+    var out: Result = .begin(s, arena, revision);
     if (result.text) |text| {
         const content = try arena.alloc(types.ContentBlock, result.content.len + 1);
         content[0] = .ofText(text);
@@ -846,11 +876,11 @@ const Run = struct {
         errdefer run.arena.deinit();
         const a = run.arena.allocator();
         // The params were read once already, when the call came.
-        const m = meta.read(a, task.params) catch |err| switch (err) {
+        const m = meta.read(a, task.params, s.jsonLimits()) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Malformed => unreachable, // unreachable: `serve` read these params before the task was made
         };
-        const p = parseParams(types.CallToolParams, a, task.params) catch |err| switch (err) {
+        const p = s.parseParams(types.CallToolParams, a, task.params) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Canceled => unreachable, // unreachable: parsing does not wait
         } orelse unreachable; // unreachable: `callTool` parsed these params before the task was made
@@ -875,6 +905,7 @@ const Run = struct {
             .context = &run.context,
             .id = owned_id,
             .sink = sink,
+            .limits = s.jsonLimits(),
             .responses = if (responses) |r| try a.dupe(u8, r) else null,
             .state_in = if (state_in) |st| try a.dupe(u8, st) else null,
             .task = .{ .context = run, .become = become },
@@ -891,7 +922,7 @@ const Run = struct {
     }
 };
 
-fn callAsTask(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink, handler: registry.ToolHandler, name: []const u8, r: Round) HandleError!Reply {
+fn callAsTask(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink, handler: registry.ToolHandler, name: []const u8, r: Round) BuildError!Reply {
     const table = &s.task_table.?;
     const task = table.create(context.principal, request.params orelse "{}", now(io)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -1082,7 +1113,7 @@ fn recordOutcome(s: *Server, table: *tasks.Table, run: *Run, returned: Call.Erro
             const asked = try a.alloc(tasks.Asked, call.pending.items.len);
             for (asked, call.pending.items) |*x, pending| {
                 var out: Writer.Allocating = .init(a);
-                strand.json.write(&out.writer, pending.request, types.write_options) catch return error.OutOfMemory;
+                strand.json.write(&out.writer, pending.request, types.writeOptions(s.jsonLimits())) catch return error.OutOfMemory;
                 x.* = .{ .key = pending.key, .request = out.written() };
             }
             try table.ask(task, at, asked, call.state_out);
@@ -1091,6 +1122,7 @@ fn recordOutcome(s: *Server, table: *tasks.Table, run: *Run, returned: Call.Erro
         else => |e| {
             const reply = s.outcome(table.io, a, &run.call, e, "tools/call", "") catch |failed| switch (failed) {
                 error.OutOfMemory => return error.OutOfMemory,
+                error.TooLong => failure(.internal_error, too_long),
                 error.Canceled => unreachable, // unreachable: only `error.InputRequired` waits, handled above
             };
             const f = reply.failure;
@@ -1128,13 +1160,13 @@ const TaskMethod = enum { get, update, cancel };
 
 /// `tasks/get`, `tasks/update` and `tasks/cancel`, for a client that
 /// declared the extension.
-fn taskRequest(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, method: TaskMethod) HandleError!Reply {
+fn taskRequest(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, method: TaskMethod) BuildError!Reply {
     const table = if (s.task_table) |*t| t else return failure(.method_not_found, "Method not found");
     if (!context.revision.stateless()) return failure(.method_not_found, "Method not found");
-    if (!context.client.hasExtension(tasks.extension)) return missingTasks();
+    if (!context.client.hasExtension(tasks.extension, s.jsonLimits())) return missingTasks();
     const task_id = switch (method) {
-        .get, .cancel => (try parseParams(types.TaskParams, arena, request.params) orelse return failure(.invalid_params, "params are not what the schema says")).task_id,
-        .update => (try parseParams(types.UpdateTaskParams, arena, request.params) orelse return failure(.invalid_params, "params are not what the schema says")).task_id,
+        .get, .cancel => (try s.parseParams(types.TaskParams, arena, request.params) orelse return failure(.invalid_params, "params are not what the schema says")).task_id,
+        .update => (try s.parseParams(types.UpdateTaskParams, arena, request.params) orelse return failure(.invalid_params, "params are not what the schema says")).task_id,
     };
     var next: ?[]const u8 = null;
     var changed = false;
@@ -1154,9 +1186,9 @@ fn taskRequest(s: *Server, io: Io, arena: Allocator, request: wire.Request, cont
                 return .{ .result = out.written() };
             },
             .update => {
-                const p = (try parseParams(types.UpdateTaskParams, arena, request.params)).?;
+                const p = (try s.parseParams(types.UpdateTaskParams, arena, request.params)).?;
                 if (p.input_responses.bytes[0] != '{') return failure(.invalid_params, "inputResponses is not an object");
-                next = table.answer(task, now(io), arena, p.input_responses.bytes) catch |err| switch (err) {
+                next = table.answer(task, now(io), arena, p.input_responses.bytes, s.jsonLimits()) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.Invalid => return failure(.invalid_params, "inputResponses is not an object"),
                 };
@@ -1185,12 +1217,12 @@ fn taskRequest(s: *Server, io: Io, arena: Allocator, request: wire.Request, cont
     }
     if (changed) s.hub.changed(io, .task, &id);
     if (next) |responses| s.startRound(task, handler.?, responses, task.state);
-    var out: Result = .begin(arena, context.revision);
+    var out: Result = .begin(s, arena, context.revision);
     return .{ .result = try out.end(s, null, false) };
 }
 
 /// The task `id` as `form` writes it, or null when it is not held.
-fn taskJson(s: *Server, io: Io, arena: Allocator, id: []const u8, principal: ?[]const u8, form: tasks.Form) HandleError!?[]const u8 {
+fn taskJson(s: *Server, io: Io, arena: Allocator, id: []const u8, principal: ?[]const u8, form: tasks.Form) BuildError!?[]const u8 {
     const table = &s.task_table.?;
     table.mutex.lockUncancelable(table.io);
     defer table.mutex.unlock(table.io);
@@ -1204,7 +1236,7 @@ fn taskJson(s: *Server, io: Io, arena: Allocator, id: []const u8, principal: ?[]
 fn toolOf(s: *Server, io: Io, task: *const tasks.Task) (Allocator.Error || Io.Cancelable)!?registry.ToolHandler {
     var scratch: std.heap.ArenaAllocator = .init(s.gpa);
     defer scratch.deinit();
-    const p = (parseParams(types.CallToolParams, scratch.allocator(), task.params) catch |err| switch (err) {
+    const p = (s.parseParams(types.CallToolParams, scratch.allocator(), task.params) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Canceled => return error.Canceled,
     }) orelse return null;
@@ -1218,8 +1250,8 @@ fn unknown(arena: Allocator, comptime what: []const u8, name: []const u8) Alloca
     return failure(.invalid_params, try std.mem.concat(arena, u8, &.{ what, name }));
 }
 
-fn readResource(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink) HandleError!Reply {
-    const p = try parseParams(types.ReadResourceParams, arena, request.params) orelse return failure(.invalid_params, "params are not what the schema says");
+fn readResource(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink) BuildError!Reply {
+    const p = try s.parseParams(types.ReadResourceParams, arena, request.params) orelse return failure(.invalid_params, "params are not what the schema says");
     const handler = found: {
         s.lock.lockShared(io) catch return error.Canceled;
         defer s.lock.unlockShared(io);
@@ -1237,7 +1269,7 @@ fn readResource(s: *Server, io: Io, arena: Allocator, request: wire.Request, con
         .ok => |r| r,
         .refused => |reply| return reply,
     };
-    var call = newCall(io, arena, request, context, sink, r);
+    var call = s.newCall(io, arena, request, context, sink, r);
     const result = handler.read(handler.context, &call, p.uri) catch |err| switch (err) {
         error.NotFound => return try notFound(arena, context.revision, p.uri),
         else => |e| return s.outcome(io, arena, &call, e, request.method, p.uri),
@@ -1245,7 +1277,7 @@ fn readResource(s: *Server, io: Io, arena: Allocator, request: wire.Request, con
     // An empty list would read as a resource with nothing in it (2026-07-28
     // resources: MUST NOT for one that does not exist).
     if (result.contents.len == 0) return try notFound(arena, context.revision, p.uri);
-    var out: Result = .begin(arena, context.revision);
+    var out: Result = .begin(s, arena, context.revision);
     try out.field("contents", result.contents);
     return .{ .result = try out.end(s, s.options.cache.read, s.options.filter != null) };
 }
@@ -1292,8 +1324,8 @@ pub fn matches(pattern: []const u8, uri: []const u8) bool {
     return u == uri.len;
 }
 
-fn getPrompt(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink) HandleError!Reply {
-    const p = try parseParams(types.GetPromptParams, arena, request.params) orelse return failure(.invalid_params, "params are not what the schema says");
+fn getPrompt(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink) BuildError!Reply {
+    const p = try s.parseParams(types.GetPromptParams, arena, request.params) orelse return failure(.invalid_params, "params are not what the schema says");
     const prompt = found: {
         s.lock.lockShared(io) catch return error.Canceled;
         defer s.lock.unlockShared(io);
@@ -1308,38 +1340,38 @@ fn getPrompt(s: *Server, io: Io, arena: Allocator, request: wire.Request, contex
     if (!s.admitted(context, .prompts, p.name)) return try unknown(arena, "Unknown prompt: ", p.name);
     const handler, const required = prompt;
     for (required) |name| {
-        const given = if (p.arguments) |a| has(a.bytes, name) else false;
+        const given = if (p.arguments) |a| has(a.bytes, name, s.jsonLimits()) else false;
         if (!given) return failure(.invalid_params, try std.mem.concat(arena, u8, &.{ "Missing required argument: ", name }));
     }
     const r = switch (try s.round(io, arena, context, request.method, p.name, p.input_responses, p.request_state)) {
         .ok => |r| r,
         .refused => |reply| return reply,
     };
-    var call = newCall(io, arena, request, context, sink, r);
+    var call = s.newCall(io, arena, request, context, sink, r);
     const result = handler.get(handler.context, &call, if (p.arguments) |a| a.bytes else null) catch |err|
         return s.outcome(io, arena, &call, err, request.method, p.name);
-    var out: Result = .begin(arena, context.revision);
+    var out: Result = .begin(s, arena, context.revision);
     if (result.description) |d| try out.field("description", d);
     try out.field("messages", result.messages);
     return .{ .result = try out.end(s, null, false) };
 }
 
-fn has(object: []const u8, name: []const u8) bool {
+fn has(object: []const u8, name: []const u8, limits: strand.core.Limits) bool {
     var members: strand.json.Members = undefined;
-    members.init(object, .{});
+    members.init(object, .{ .limits = limits });
     while (members.next() catch return false) |m| if (m.is(name)) return !std.mem.eql(u8, m.value, "null");
     return false;
 }
 
-fn complete(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink) HandleError!Reply {
+fn complete(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink) BuildError!Reply {
     const completer = s.completer orelse return failure(.method_not_found, "Method not found");
-    const p = try parseParams(types.CompleteParams, arena, request.params) orelse return failure(.invalid_params, "params are not what the schema says");
-    var call = newCall(io, arena, request, context, sink, .{ .responses = null, .state = null });
+    const p = try s.parseParams(types.CompleteParams, arena, request.params) orelse return failure(.invalid_params, "params are not what the schema says");
+    var call = s.newCall(io, arena, request, context, sink, .{ .responses = null, .state = null });
     const completion: types.Completion = completer.complete(completer.context, &call, p) catch |err| switch (err) {
         error.NotFound => return failure(.invalid_params, "nothing to complete there"),
         else => |e| return s.outcome(io, arena, &call, e, request.method, ""),
     };
-    var out: Result = .begin(arena, context.revision);
+    var out: Result = .begin(s, arena, context.revision);
     // At most 100 values in one answer (2025-11-25 completion: MUST NOT exceed).
     const capped = completion.values.len > 100;
     try out.field("completion", types.Completion{
@@ -1353,8 +1385,8 @@ fn complete(s: *Server, io: Io, arena: Allocator, request: wire.Request, context
 /// `subscriptions/listen`: acknowledges what it will send, then sends each
 /// change as it comes, until the stream is canceled (nothing is answered) or
 /// the server closes (answered `complete`).
-fn listen(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink) HandleError!Reply {
-    const p = try parseParams(types.ListenParams, arena, request.params) orelse return failure(.invalid_params, "params are not what the schema says");
+fn listen(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink) BuildError!Reply {
+    const p = try s.parseParams(types.ListenParams, arena, request.params) orelse return failure(.invalid_params, "params are not what the schema says");
     const caps = s.capabilities();
     var listener: subscriptions.Listener = .{ .id = request.id, .lists = .empty };
     defer listener.deinit(s.gpa);
@@ -1382,7 +1414,7 @@ fn listen(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: 
     if (p.notifications.task_ids) |ids| if (s.task_table) |*table| {
         // Task statuses go only to a client that declared the extension
         // (tasks extension: status notifications).
-        if (!context.client.hasExtension(tasks.extension)) return missingTasks();
+        if (!context.client.hasExtension(tasks.extension, s.jsonLimits())) return missingTasks();
         var held: std.ArrayList([]const u8) = .empty;
         for (ids) |id| {
             const known = known: {
@@ -1408,7 +1440,7 @@ fn listen(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: 
     defer s.hub.remove(io, &listener);
 
     const tag = try subscriptionMeta(arena, request.id);
-    try notify(io, arena, sink, "notifications/subscriptions/acknowledged", .{ .notifications = agreed }, tag);
+    try s.notify(io, arena, sink, "notifications/subscriptions/acknowledged", .{ .notifications = agreed }, tag);
     var seen: u32 = 0;
     while (true) {
         const timeout: Io.Timeout = if (sink.keep_alive) |every| .{ .duration = .{ .raw = every, .clock = .awake } } else .none;
@@ -1421,15 +1453,15 @@ fn listen(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: 
         var turn: std.heap.ArenaAllocator = .init(s.gpa);
         defer turn.deinit();
         const changed = listener.takeLists();
-        if (changed.contains(.tools)) try notify(io, turn.allocator(), sink, "notifications/tools/list_changed", .{}, tag);
-        if (changed.contains(.prompts)) try notify(io, turn.allocator(), sink, "notifications/prompts/list_changed", .{}, tag);
-        if (changed.contains(.resources)) try notify(io, turn.allocator(), sink, "notifications/resources/list_changed", .{}, tag);
+        if (changed.contains(.tools)) try s.notify(io, turn.allocator(), sink, "notifications/tools/list_changed", .{}, tag);
+        if (changed.contains(.prompts)) try s.notify(io, turn.allocator(), sink, "notifications/prompts/list_changed", .{}, tag);
+        if (changed.contains(.resources)) try s.notify(io, turn.allocator(), sink, "notifications/resources/list_changed", .{}, tag);
         if (changed.contains(.resource)) {
             const uris = listener.takeChanged(io, turn.allocator(), .resource) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Canceled => return error.Canceled,
             };
-            for (uris) |uri| try notify(io, turn.allocator(), sink, "notifications/resources/updated", .{ .uri = uri }, tag);
+            for (uris) |uri| try s.notify(io, turn.allocator(), sink, "notifications/resources/updated", .{ .uri = uri }, tag);
         }
         if (changed.contains(.task)) {
             const ids = listener.takeChanged(io, turn.allocator(), .task) catch |err| switch (err) {
@@ -1437,7 +1469,7 @@ fn listen(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: 
                 error.Canceled => return error.Canceled,
             };
             for (ids) |id| if (try s.taskJson(io, turn.allocator(), id, context.principal, .notified)) |json| {
-                try notify(io, turn.allocator(), sink, "notifications/tasks", Raw{ .bytes = json }, tag);
+                try s.notify(io, turn.allocator(), sink, "notifications/tasks", Raw{ .bytes = json }, tag);
             };
         }
         if (s.hub.closed.load(.acquire)) break;
@@ -1457,14 +1489,14 @@ fn subscriptionMeta(arena: Allocator, id: wire.Id) Allocator.Error![]const u8 {
 
 /// Sends a notification whose params are `params` plus `_meta` holding
 /// `tag` (members, without braces) when it is not empty.
-pub fn notify(io: Io, arena: Allocator, sink: Sink, method: []const u8, params: anytype, tag: []const u8) HandleError!void {
+pub fn notify(s: *const Server, io: Io, arena: Allocator, sink: Sink, method: []const u8, params: anytype, tag: []const u8) HandleError!void {
     var out: Writer.Allocating = .init(arena);
     const w = &out.writer;
     w.writeAll("{\"jsonrpc\":\"2.0\",\"method\":") catch return error.OutOfMemory;
     wire.writeString(w, method) catch return error.OutOfMemory;
     w.writeAll(",\"params\":") catch return error.OutOfMemory;
     const at = out.written().len;
-    strand.json.write(w, params, types.write_options) catch return error.OutOfMemory;
+    strand.json.write(w, params, types.writeOptions(s.jsonLimits())) catch return error.OutOfMemory;
     if (tag.len != 0) {
         // Into the params object, before its closing brace.
         const empty = out.written().len - at == 2;
