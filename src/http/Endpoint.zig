@@ -261,7 +261,7 @@ const Stream = struct {
     fn event(s: *Stream, message: []const u8) anyerror!void {
         const w = try s.begin();
         try uplink.wire.sse.writeEvent(w, .{ .type = "message", .data = message });
-        try w.flush();
+        try s.response.flush(s.io);
     }
 
     fn send(context: *anyopaque, io: Io, message: []const u8) parley.Sink.SendError!void {
@@ -282,6 +282,9 @@ const Stream = struct {
             else => error.Closed,
         };
         w.writeAll(":\n\n") catch return error.Closed;
-        w.flush() catch return error.Closed;
+        s.response.flush(s.io) catch |err| return switch (err) {
+            error.Canceled => error.Canceled,
+            else => error.Closed,
+        };
     }
 };

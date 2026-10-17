@@ -13,12 +13,16 @@ const strand = @import("strand");
 const wire = @import("wire.zig");
 const types = @import("types.zig");
 const Server = @import("Server.zig");
+const compat = @import("compat.zig");
+const meta = @import("meta.zig");
 const Sink = @import("context.zig").Sink;
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 pub const Options = struct {
+    /// The session an `initialize` opens (2025-11-25 and before).
+    session: compat.Options = .{},
     /// The longest message read; a longer line is refused and passed over.
     max_message: aegis.units.Bytes(u32) = .literal("16MiB"),
     /// Requests answered at once; one past it is refused as busy.
@@ -35,7 +39,12 @@ pub const ServeError = error{ ReadFailed, WriteFailed, Canceled, OutOfMemory };
 pub fn serve(io: Io, gpa: Allocator, server: *Server, in: *Io.Reader, out: *Io.Writer, options: Options) ServeError!void {
     var conn: Connection = .{ .io = io, .gpa = gpa, .server = server, .out = out, .options = options };
     defer conn.jobs.deinit(gpa);
+    defer if (conn.session) |session| {
+        session.deinit();
+        gpa.destroy(session);
+    };
     defer conn.group.cancel(io);
+    defer conn.endSession();
     while (true) {
         const job = try Job.create(&conn);
         const read = conn.readLine(in, job) catch |err| {
@@ -48,6 +57,7 @@ pub fn serve(io: Io, gpa: Allocator, server: *Server, in: *Io.Reader, out: *Io.W
                 // The requests read are answered; the streams that would
                 // never end are ended.
                 conn.endStreams();
+                conn.endSession();
                 conn.group.await(io) catch |err| return err;
                 return;
             },
@@ -73,6 +83,10 @@ const Connection = struct {
     jobs_mutex: Io.Mutex = .init,
     jobs: std.ArrayList(*Job) = .empty,
     group: Io.Group = .init,
+    /// The process's session, once a client opens one with `initialize`.
+    session: ?*compat.Session = null,
+    /// The task writing the session's list changes.
+    session_stream: ?Io.Future(Io.Cancelable!void) = null,
 
     const Read = enum { line, empty, too_long, end };
 
@@ -120,10 +134,18 @@ const Connection = struct {
         switch (message) {
             .request => |request| {
                 job.request = request;
+                if (std.mem.eql(u8, request.method, "initialize") and c.session == null) {
+                    const session = try c.gpa.create(compat.Session);
+                    session.* = .init(c.gpa, c.server, c.options.session);
+                    c.session = session;
+                }
                 if (!try c.admit(job)) {
                     job.destroy();
                     return c.writeFailure(request.id, .internal_error, "the server is answering as many requests as it takes at once");
                 }
+                // The handshake is answered before the next line is read, so
+                // the requests after it find the session open.
+                if (std.mem.eql(u8, request.method, "initialize")) return Job.run(job);
                 c.group.concurrent(c.io, Job.run, .{job}) catch {
                     // No task to spare: answered here, before the next line
                     // is read (and it cannot be canceled).
@@ -133,11 +155,48 @@ const Connection = struct {
             .notification => |n| {
                 defer job.destroy();
                 if (std.mem.eql(u8, n.method, "notifications/cancelled")) try c.cancel(job.arena.allocator(), n.params);
+                if (std.mem.eql(u8, n.method, "notifications/initialized")) if (c.session) |session| {
+                    if (session.lifecycle.current() == .initializing) {
+                        session.initialized(c.io);
+                        // The session's list changes go out on stdout from here.
+                        c.session_stream = c.io.concurrent(streamSession, .{ c, session }) catch null;
+                    }
+                };
             },
-            // Answers to requests this server sends (2025-11-25 and before),
-            // which the session layer reads.
-            .result, .failure => job.destroy(),
+            // Answers to requests the session sent (2025-11-25 and before).
+            .result, .failure => {
+                defer job.destroy();
+                if (c.session) |session| session.deliver(c.io, message);
+            },
         }
+    }
+
+    fn endSession(c: *Connection) void {
+        if (c.session_stream) |*task| {
+            _ = task.cancel(c.io) catch {};
+            c.session_stream = null;
+        }
+    }
+
+    fn streamSession(c: *Connection, session: *compat.Session) Io.Cancelable!void {
+        session.stream(c.io, c.sink()) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.OutOfMemory => {},
+        };
+    }
+
+    /// Lines that belong to no request.
+    fn sink(c: *Connection) Sink {
+        return .{ .context = c, .sendFn = sendLine };
+    }
+
+    fn sendLine(context: *anyopaque, io: Io, message: []const u8) Sink.SendError!void {
+        _ = io;
+        const c: *Connection = @ptrCast(@alignCast(context));
+        c.send(message) catch |err| return switch (err) {
+            error.Canceled => error.Canceled,
+            error.WriteFailed => error.Closed,
+        };
     }
 
     /// Adds `job` to the requests in flight, unless they are at the bound.
@@ -269,7 +328,18 @@ const Job = struct {
     }
 
     fn answer(job: *Job) Server.HandleError!Server.Reply {
-        return job.conn.server.serve(job.conn.io, job.arena.allocator(), job.request, null, job.sink());
+        const c = job.conn;
+        if (c.session) |session| if (sessionEra(session, job)) return session.handle(c.io, job.arena.allocator(), job.request, job.sink());
+        return c.server.serve(c.io, job.arena.allocator(), job.request, null, job.sink());
+    }
+
+    /// Whether the request belongs to the session: its handshake, or one
+    /// without the version a 2026-07-28 request carries in its `_meta`.
+    fn sessionEra(session: *compat.Session, job: *Job) bool {
+        _ = session;
+        if (std.mem.eql(u8, job.request.method, "initialize")) return true;
+        const m = meta.read(job.arena.allocator(), job.request.params) catch return true;
+        return m.version == null;
     }
 
     fn waitCancel(event: *Io.Event, io: Io) Io.Cancelable!void {

@@ -3,5 +3,6 @@ test {
     _ = @import("wire_test.zig");
     _ = @import("server_test.zig");
     _ = @import("stdio_test.zig");
+    _ = @import("compat_test.zig");
     _ = @import("property_test.zig");
 }
