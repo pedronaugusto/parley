@@ -75,7 +75,7 @@ pub fn main(init: std.process.Init) !void {
     var client: parley.Client = .init(gpa, remote.transport(), .{
         .info = .{ .name = "parley-conformance-client", .version = "1.0.0" },
         .revisions = if (asked != null) &only else &.{ .@"2026-07-28", .@"2025-11-25", .@"2025-06-18" },
-        .handlers = .{ .context = @ptrCast(@constCast(&scenario)), .elicit = elicit, .sample = sample, .roots = roots },
+        .handlers = .{ .context = @ptrCast(@constCast(&scenario)), .elicit = elicit, .sample = sample, .roots = roots }, // safe: elicit casts it back to this type
     });
     defer client.deinit();
     try client.connect(io);

@@ -17,12 +17,18 @@ pub const layers: []const gantry.rules.Layer = &.{
         "src/subscriptions.zig",
     } },
     .{ .name = "what a server offers", .patterns = &.{"src/registry.zig"} },
-    .{ .name = "the core", .patterns = &.{"src/Server.zig"} },
+    .{ .name = "the core and the client", .patterns = &.{
+        "src/Server.zig",
+        "src/Client.zig",
+    } },
     .{ .name = "sessions", .patterns = &.{"src/compat.zig"} },
     .{ .name = "stdio", .patterns = &.{"src/stdio.zig"} },
     .{ .name = "public", .patterns = &.{"src/parley.zig"} },
     .{ .name = "HTTP headers", .patterns = &.{"src/http/headers.zig"} },
-    .{ .name = "HTTP endpoint", .patterns = &.{"src/http/Endpoint.zig"} },
+    .{ .name = "HTTP ends", .patterns = &.{
+        "src/http/Endpoint.zig",
+        "src/http/Transport.zig",
+    } },
     .{ .name = "HTTP public", .patterns = &.{"src/http.zig"} },
 };
 
