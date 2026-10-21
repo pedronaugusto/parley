@@ -175,10 +175,14 @@ test "a stream ends by its client's cancellation, and by the end of input, unans
     try in.write("{\"jsonrpc\":\"2.0\",\"id\":\"one\"," ++ listen);
     try testing.expect(std.mem.find(u8, try readLine(&out), "subscriptions/acknowledged") != null);
     try in.write("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":\"one\"}}\n");
-    // Ended: a change goes to no stream, and the next answer is the next request's.
-    try server.addTool(io, .{ .name = "another" }, echo);
+    // Input is read in order: once the next request is answered, the
+    // cancellation has been read, whichever task the change below runs on.
     try in.write("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{" ++ meta ++ "}}\n");
     try testing.expect(std.mem.find(u8, try readLine(&out), "\"id\":2,") != null);
+    // Ended: a change goes to no stream, and the next answer is the next request's.
+    try server.addTool(io, .{ .name = "another" }, echo);
+    try in.write("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\",\"params\":{" ++ meta ++ "}}\n");
+    try testing.expect(std.mem.find(u8, try readLine(&out), "\"id\":3,") != null);
     try in.write("{\"jsonrpc\":\"2.0\",\"id\":\"two\"," ++ listen);
     try testing.expect(std.mem.find(u8, try readLine(&out), "subscriptions/acknowledged") != null);
     in.close();

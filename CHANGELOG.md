@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Breaking
+
+- Pins clearance 0.4.0, uplink 0.8.7, conduit 0.10.1 and aegis 0.1.14 (were 0.3.0, 0.8.2, 0.8.5 and 0.1.11): a build with parley moves to cloak 0.19's line through them, and `parley.oauth`'s signers take cloak 0.19's `PrivateKey`. A private JWK now signs a client's assertion (`clearance.jws.Signer.fromJwk`).
+
+### Fixed
+
+- The process tests failed on every macOS and Windows leg (`FileNotFound`): they were given the fixture server's path in the building runner's cache, which a runner replaying them has not. The fixture is named through preflight 0.13.0's `addTestProgram`, by its path from the package root, and replays with the tests; the benchmarks' fixture likewise, under its own name.
+- The stdio test of a stream ended by its client's cancellation changed the tools before the server had read the cancellation, so the still open stream was told of the change first (6 of 15 runs in ReleaseFast under load): it now waits for the next request's answer, which follows the cancellation in reading order.
+
 ## [0.5.2] - 2026-10-17
 
 ### Added
