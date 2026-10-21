@@ -6,7 +6,6 @@ const process = @import("process.zig");
 const options = @import("test_options");
 
 const testing = std.testing;
-const Io = std.Io;
 
 const client_options: parley.Client.Options = .{ .info = .{ .name = "c", .version = "1" } };
 
