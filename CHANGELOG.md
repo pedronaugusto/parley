@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-21
+
 ### Breaking
 
 - Pins clearance 0.4.0, uplink 0.8.7, conduit 0.10.1 and aegis 0.1.14 (were 0.3.0, 0.8.2, 0.8.5 and 0.1.11): a build with parley moves to cloak 0.19's line through them, and `parley.oauth`'s signers take cloak 0.19's `PrivateKey`. A private JWK now signs a client's assertion (`clearance.jws.Signer.fromJwk`).
