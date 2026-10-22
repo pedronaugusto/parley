@@ -1,0 +1,3 @@
+# Two changes that add lines under one group of CHANGELOG.md both keep them, with no
+# conflict to resolve; `bay release` orders the section.
+CHANGELOG.md merge=union
