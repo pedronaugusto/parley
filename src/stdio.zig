@@ -30,8 +30,10 @@ pub const Options = struct {
 };
 
 /// `ReadFailed`, `WriteFailed`: the stream broke. `Canceled`: the task
-/// serving it was canceled.
-pub const ServeError = error{ ReadFailed, WriteFailed, Canceled, OutOfMemory };
+/// serving it was canceled. `ConcurrencyUnavailable`: a session opened and
+/// the `Io` gave no task to send its list changes on, which the client
+/// would otherwise never be told of.
+pub const ServeError = error{ ReadFailed, WriteFailed, Canceled, OutOfMemory, ConcurrencyUnavailable };
 
 /// Serves `server` over `in` and `out` until `in` ends (the client closed
 /// it: the server's cue to exit) or the task is canceled. Requests still
@@ -170,7 +172,7 @@ const Connection = struct {
                     if (session.lifecycle.current() == .initializing) {
                         session.initialized(c.io);
                         // The session's list changes go out on stdout from here.
-                        c.session_stream = c.io.concurrent(streamSession, .{ c, session }) catch null;
+                        c.session_stream = try c.io.concurrent(streamSession, .{ c, session });
                     }
                 };
             },
@@ -547,7 +549,7 @@ pub const Channel = struct {
         return ch.write(io, message);
     }
 
-    fn opened(_: *anyopaque, _: Io, _: *Client) void {}
+    fn opened(_: *anyopaque, _: Io, _: *Client) Io.ConcurrentError!void {}
 
     fn retire(ch: *Channel, io: Io, waiter: *Waiter) void {
         ch.mutex.lockUncancelable(io);

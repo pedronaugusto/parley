@@ -6,6 +6,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Breaking
+
+- `Client.Transport.VTable.opened` returns `Io.ConcurrentError!void`, and `Client.connect` returns its `ConcurrencyUnavailable`: an HTTP session whose `Io` gave no task for its GET stream connected without it, and missed every request and notification the server sent outside a request.
+- `stdio.serve` returns `ConcurrencyUnavailable` when a session opens and the `Io` gives no task to send its list changes on, where it served on and the client never heard of them. Requests are still answered inline when no task is to be had.
+
 ## [0.6.0] - 2026-10-21
 
 ### Breaking

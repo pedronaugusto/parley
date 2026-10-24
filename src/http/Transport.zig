@@ -146,10 +146,10 @@ fn listedFn(context: *anyopaque, io: Io, client: *const Client, arena: Allocator
 
 /// Opens the session's GET stream, where a session server sends what
 /// belongs to no request; a server that has none answers 405.
-fn opened(context: *anyopaque, io: Io, client: *Client) void {
+fn opened(context: *anyopaque, io: Io, client: *Client) Io.ConcurrentError!void {
     const t: *Transport = @ptrCast(@alignCast(context)); // safe: the transport was made from this one
     t.client = client;
-    t.stream = io.concurrent(sessionStream, .{ t, io }) catch null;
+    t.stream = try io.concurrent(sessionStream, .{ t, io });
 }
 
 fn sessionStream(t: *Transport, io: Io) Io.Cancelable!void {

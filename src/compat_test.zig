@@ -5,6 +5,7 @@ const std = @import("std");
 const parley = @import("parley.zig");
 const stdio = @import("stdio.zig");
 const Pipe = @import("testing/Pipe.zig");
+const shakedown = @import("shakedown");
 
 const testing = std.testing;
 const Call = parley.Call;
@@ -124,6 +125,38 @@ test "the session's own methods: ping, the log level, subscriptions; requests be
     try expectContains(answerTo(lines, "\"id\":6,").?, "\"result\":{}");
     try expectContains(answerTo(lines, "\"id\":7,").?, "-32600");
     try expectContains(answerTo(lines, "\"id\":8,").?, "\"resultType\":\"complete\"");
+}
+
+/// An `Io` with no task to spare.
+const Serial = shakedown.Layer(u8, .{
+    .concurrent = struct {
+        fn concurrent(_: ?*anyopaque, _: usize, _: std.mem.Alignment, _: []const u8, _: std.mem.Alignment, _: *const fn (*const anyopaque, *anyopaque) void) std.Io.ConcurrentError!*std.Io.AnyFuture {
+            return error.ConcurrencyUnavailable;
+        }
+    }.concurrent,
+    .groupConcurrent = struct {
+        fn groupConcurrent(_: ?*anyopaque, _: *std.Io.Group, _: []const u8, _: std.mem.Alignment, _: *const fn (*const anyopaque) void) std.Io.ConcurrentError!void {
+            return error.ConcurrencyUnavailable;
+        }
+    }.groupConcurrent,
+});
+
+test "a session whose list changes have no task to go out on is refused, where its client would never hear of them" {
+    var server = try newServer(testing.io);
+    defer server.deinit();
+    var serial: Serial = .init(testing.io, 0);
+    const input =
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}
+        \\{"jsonrpc":"2.0","method":"notifications/initialized"}
+        \\{"jsonrpc":"2.0","id":2,"method":"ping"}
+        \\
+    ;
+    var in: std.Io.Reader = .fixed(input);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try testing.expectError(error.ConcurrencyUnavailable, stdio.serve(serial.io(), testing.allocator, &server, &in, &out.writer, .{}));
+    // The handshake itself was answered, inline: requests need no task.
+    try expectContains(answerTo(out.written(), "\"id\":1,").?, "\"protocolVersion\":\"2025-11-25\"");
 }
 
 fn serveTask(io: std.Io, server: *parley.Server, in: *Pipe, out: *Pipe) void {

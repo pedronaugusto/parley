@@ -1,6 +1,7 @@
 //! The endpoint over a real loopback connection: uplink's server in front
 //! of the core, uplink's client asking.
 const std = @import("std");
+const shakedown = @import("shakedown");
 const parley = @import("parley");
 const uplink = @import("uplink");
 const Endpoint = @import("Endpoint.zig");
@@ -265,6 +266,39 @@ test "the client over HTTP: modern, and a session whose input comes as the serve
     try h.core.addTool(io, .{ .name = "greet" }, greet);
     try clientRound(io, &h, &.{.@"2026-07-28"}, .modern);
     try clientRound(io, &h, &.{.@"2025-11-25"}, .session);
+}
+
+/// An `Io` with no task to spare.
+const Serial = shakedown.Layer(u8, .{
+    .concurrent = struct {
+        fn concurrent(_: ?*anyopaque, _: usize, _: std.mem.Alignment, _: []const u8, _: std.mem.Alignment, _: *const fn (*const anyopaque, *anyopaque) void) Io.ConcurrentError!*Io.AnyFuture {
+            return error.ConcurrencyUnavailable;
+        }
+    }.concurrent,
+    .groupConcurrent = struct {
+        fn groupConcurrent(_: ?*anyopaque, _: *Io.Group, _: []const u8, _: std.mem.Alignment, _: *const fn (*const anyopaque) void) Io.ConcurrentError!void {
+            return error.ConcurrencyUnavailable;
+        }
+    }.groupConcurrent,
+});
+
+test "a session client with no task for the session's stream is refused at connect, where it would miss what the server sends" {
+    const io = testing.io;
+    var h: Harness = undefined;
+    try h.start(io);
+    defer h.stop(io);
+    var serial: Serial = .init(io, 0);
+    var url_buffer: [64]u8 = undefined;
+    const url = try std.mem.print(&url_buffer, "http://127.0.0.1:{d}/mcp", .{h.port});
+    var remote: Transport = .init(testing.allocator, &h.client, url, .{});
+    defer remote.deinit();
+    defer remote.close(io);
+    var client: parley.Client = .init(testing.allocator, remote.transport(), .{
+        .info = .{ .name = "c", .version = "1" },
+        .revisions = &.{.@"2025-11-25"},
+    });
+    defer client.deinit();
+    try testing.expectError(error.ConcurrencyUnavailable, client.connect(serial.io()));
 }
 
 test "a session's stream ends when the session is deleted" {

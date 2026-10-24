@@ -111,8 +111,10 @@ pub const Transport = struct {
         /// The session was opened (`initialize` answered at
         /// `client.revision`): a transport with a stream of the session's
         /// own (an HTTP GET) opens it, for the server's requests and
-        /// notifications that belong to no request.
-        opened: *const fn (context: *anyopaque, io: Io, client: *Client) void,
+        /// notifications that belong to no request. `ConcurrencyUnavailable`
+        /// when the `Io` gives no task to read it on: `connect` returns it,
+        /// where a session without it would miss what the server sends.
+        opened: *const fn (context: *anyopaque, io: Io, client: *Client) Io.ConcurrentError!void,
         /// A `tools/list` answer, as the application should see it: a
         /// transport that mirrors arguments into headers learns the tools'
         /// marks, and leaves out a tool whose marks it cannot honour.
@@ -167,7 +169,9 @@ pub const Answer = union(enum) { none, message: []const u8 };
 
 /// `Unsupported`: the server speaks no version this client does.
 /// `Protocol`: the server's answer is not what the protocol says.
-pub const ConnectError = RequestError || error{ Unsupported, Protocol };
+/// `ConcurrencyUnavailable`: the transport's session stream had no task
+/// to run on (`Transport.VTable.opened`).
+pub const ConnectError = RequestError || Io.ConcurrentError || error{ Unsupported, Protocol };
 
 pub fn init(gpa: Allocator, transport: Transport, options: Options) Client {
     return .{ .gpa = gpa, .options = options, .transport = transport, .arena = .init(gpa) };
@@ -276,7 +280,7 @@ fn openSession(c: *Client, io: Io, arena: Allocator) ConnectError!void {
     c.server_capabilities = r.capabilities.bytes;
     c.server_info = r.serverInfo;
     c.instructions = r.instructions;
-    c.transport.vtable.opened(c.transport.context, io, c);
+    try c.transport.vtable.opened(c.transport.context, io, c);
     try c.transport.notify(io, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
 }
 
