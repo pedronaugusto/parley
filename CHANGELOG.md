@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-25
+
 ### Breaking
 
 - `Client.Transport.VTable.opened` returns `Io.ConcurrentError!void`, and `Client.connect` returns its `ConcurrencyUnavailable`: an HTTP session whose `Io` gave no task for its GET stream connected without it, and missed every request and notification the server sent outside a request.
@@ -131,7 +133,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `wire`: JSON-RPC 2.0 as MCP speaks it. `decode` reads a message's envelope and tells a request, a notification, a result and an error apart, leaving `params` and `result` as their bytes; a refusal names its code and, when it could be read, the id. `writeRequest`, `writeNotification`, `writeResult` (and `beginResult`/`endResult` around a result written in place) and `writeFailure`.
 - `Revision`: the protocol revisions parley speaks.
 
-[Unreleased]: https://github.com/pedronaugusto/parley/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/pedronaugusto/parley/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/pedronaugusto/parley/compare/v0.5.1...v0.7.0
 [0.5.1]: https://github.com/pedronaugusto/parley/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/pedronaugusto/parley/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/pedronaugusto/parley/compare/v0.3.1...v0.4.0
