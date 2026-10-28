@@ -16,37 +16,42 @@
     },
     .dependencies = .{
         .aegis = .{
-            .url = "git+https://github.com/pedronaugusto/aegis?ref=v0.1.14#5852ab956e97a47926af73abbb7dced5361f9267",
-            .hash = "aegis-0.1.14-rsxouiwFCACpt6FVOECFUhpjUaetlNneWpaDTj95q514",
+            .url = "git+https://github.com/pedronaugusto/aegis?ref=v0.2.3#b3ac31e78d8215f6852f848ddb473faa604161d4",
+            .hash = "aegis-0.2.3-rsxoukEHCQDqAUV05fUDmUQPv7l6XABkCp-gW5kGM2H5",
         },
+
         .strand = .{
-            .url = "git+https://github.com/pedronaugusto/strand?ref=v0.11.1#b344241da8d6611fd00202250633bc0b97b1e0f6",
-            .hash = "strand-0.11.1-8LNWVtZJJgDujColV9BwoK1duuRMWp4bfuV2Gc2iLTEI",
+            .url = "git+https://github.com/pedronaugusto/strand?ref=v0.15.0#64209ed2ff5fde9d23e3717f51291dfbbb593805",
+            .hash = "strand-0.15.0-8LNWVqrSMAA0T4vcRJsjcbRPbwT5A_yFgzJgBqBoHXVU",
         },
+
         .uplink = .{
-            .url = "git+https://github.com/pedronaugusto/uplink?ref=v0.8.7#d225d809c81f03bceed13f2a3c701d323238ecba",
-            .hash = "uplink-0.8.7-0eVSJkcWFgAnxHgRJ1doYRx0XDWlfg6t8lKlMESTd9V9",
+            .url = "git+https://github.com/pedronaugusto/uplink#33900d2400990aa01e669d27eeafb5268a6362cb",
+            .hash = "uplink-0.10.1-0eVSJm0nGQB6n46eowFdL_K7g7UYaeAPx6epz_jQg7nE",
             .lazy = true,
         },
+
         .clearance = .{
-            .url = "git+https://github.com/pedronaugusto/clearance?ref=v0.4.0#2900dd160a5948c8270670c0b3a8339bdef368c9",
-            .hash = "clearance-0.4.0--QKm-KoXDAD0khlG_Xylan-iYV8zphEM8q2GmH1bzm2i",
+            .url = "git+https://github.com/pedronaugusto/clearance#e50c880d4eb3e16fb47b3a2e9b22d14774ddedaf",
+            .hash = "clearance-0.4.0--QKm-MDRFQDsuSjvebbVwgc4md_l2pPbWPpw42wXfQpE",
             .lazy = true,
         },
+
         .conduit = .{
-            .url = "git+https://github.com/pedronaugusto/conduit?ref=v0.10.1#e5ca7806d272dda60fc3f16821f00ebb6c4149c9",
-            .hash = "conduit-0.10.1-4rIA7zYPFQD_olleG3lEGQkaHTXW3uQewXyV-BtnifPv",
+            .url = "git+https://github.com/pedronaugusto/conduit#38d5488f0858a7422114c81122c65b7d758ba743",
+            .hash = "conduit-0.10.6-4rIA7_qxFQCUHvVtfnVaVKuU28UfAoCqepAKAe3VpwOb",
             .lazy = true,
         },
     },
     .dev_dependencies = .{
         .preflight = .{
-            .url = "git+https://github.com/pedronaugusto/preflight?ref=v0.13.0#b8e79dfc9455698887f21993d8fc0dccfb9cbb5d",
-            .hash = "preflight-0.13.0-LX1ZwofIEwA4lYSuQGT33XsTSQJC-GUO4jrd-N0mBV90",
+            .url = "git+https://github.com/pedronaugusto/preflight?ref=v0.18.5#a0eb6ad53b498f49ab636be27af10efd6f190b66",
+            .hash = "preflight-0.18.5-LX1ZwjAMFAAq6oVhY_x6-BnuKHsn3lPAG4HQrFOjVCMo",
         },
+
         .shakedown = .{
-            .url = "git+https://github.com/pedronaugusto/shakedown?ref=v0.4.12#428e0dbd96de5c756a043faa9182d05a3cb2f464",
-            .hash = "shakedown-0.4.12-BR8U44J2FgBfyquarVAevu8cpc9Ct41EH82Gxj_184hY",
+            .url = "git+https://github.com/pedronaugusto/shakedown?ref=v0.6.0#778a399a2e0800e410e6b95269bb7f533b6947e2",
+            .hash = "shakedown-0.6.0-BR8U48Z0FwD9owc-v_cfmrajSGSLOjFoJB71L3I7TvYt",
         },
     },
 }
