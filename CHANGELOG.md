@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-28
+
 ### Breaking
 
 - 2025-03-26 and 2024-11-05 are served through the session layer: `Revision` gains `@"2025-03-26"` and `@"2024-11-05"` (and `batches()`), `server/discover` and the version refusal name the five revisions served, and `Client.Options.revisions` offers all five by default. Nothing is down-levelled: fields the older revisions lack go out as they are.
@@ -144,7 +146,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `wire`: JSON-RPC 2.0 as MCP speaks it. `decode` reads a message's envelope and tells a request, a notification, a result and an error apart, leaving `params` and `result` as their bytes; a refusal names its code and, when it could be read, the id. `writeRequest`, `writeNotification`, `writeResult` (and `beginResult`/`endResult` around a result written in place) and `writeFailure`.
 - `Revision`: the protocol revisions parley speaks.
 
-[Unreleased]: https://github.com/pedronaugusto/parley/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/pedronaugusto/parley/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/pedronaugusto/parley/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/pedronaugusto/parley/compare/v0.5.1...v0.7.0
 [0.5.1]: https://github.com/pedronaugusto/parley/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/pedronaugusto/parley/compare/v0.4.0...v0.5.0
