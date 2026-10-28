@@ -3,9 +3,10 @@
 parley is the Model Context Protocol (MCP) for Zig: servers and clients. Its
 core answers one request with one reply, statelessly, as the 2026-07-28
 revision has it; the session revisions before it (2025-11-25 and 2025-06-18,
-which Codex and Claude Code speak today) are served above the core, from the
-same handlers. Transports: stdio, and Streamable HTTP on
-[uplink](https://github.com/pedronaugusto/uplink).
+which Codex and Claude Code speak today, and 2025-03-26 and 2024-11-05 for the
+clients that still do) are served above the core, from the same handlers.
+Transports: stdio, Streamable HTTP, and 2024-11-05's HTTP+SSE on the server's
+side, on [uplink](https://github.com/pedronaugusto/uplink).
 
 Work in progress toward the public cut: the server, the client, the tasks
 extension and authorization are built.
@@ -208,6 +209,14 @@ only those revisions have: `ping`, `logging/setLevel`, `resources/subscribe`.
 Input a handler asks for goes to the client as the server's own requests
 (`elicitation/create`, `sampling/createMessage`, `roots/list`), and the
 handler is called again with the answers. A handler is the same in both eras.
+An `initialize` for a version parley does not speak is answered with
+2025-11-25. A session at 2025-03-26 or 2024-11-05 takes a JSON-RPC batch, read
+by one decoder (`wire.decodeBatch`) and bounded as single messages are:
+`initialize` inside one is refused, and the answers to its requests go back as
+one array (one line on stdio; over Streamable HTTP a 202 when it holds no
+request, else one JSON array or one event stream). Nothing is down-levelled
+for the older revisions: fields they lack go out as they are, as the
+TypeScript SDK sends them.
 
 **Changes.** A tool, prompt or resource added or removed, or a resource
 updated, is told to every open `subscriptions/listen` stream that asked for
@@ -243,6 +252,15 @@ input ends; every stream when the server closes, answered `complete`. A
 session's GET stream and DELETE are served for the session revisions, where a
 disconnect is not a cancellation.
 
+**HTTP+SSE (2024-11-05).** The transport 2025-03-26 deprecated, served for the
+clients that speak only it: `parley.http.SseEndpoint`, mounted at a path of
+its own beside the endpoint. A GET opens a session and its event stream, whose
+first event, `endpoint`, names where to POST (`?sessionId=`); each POST is
+answered 202 at once, and what answers it goes out on the stream. A session is
+stdio's `Connection` with events for lines and POSTs for input, so it is
+served, canceled (`notifications/cancelled`) and bounded as stdio's is, and it
+ends with its stream. The host, origin and access checks are the endpoint's.
+
 **The client.** `Client.connect` asks `server/discover` at 2026-07-28 (or the
 versions `Options.revisions` names): an answer, or an error that names the
 versions the server speaks, means a modern server, whose requests then carry
@@ -257,7 +275,10 @@ request carries the headers its revision asks for, a tool's `x-mcp-header`
 arguments mirrored from its last `tools/list` (a tool whose marks break the
 rules is left out of the list), a session's GET stream is read for what belongs
 to no request, and a session stream the server closes is reopened with
-`Last-Event-ID` after the `retry` it set. A tool call a server runs as a task
+`Last-Event-ID` after the `retry` it set. A session server that answers
+`initialize` at 2025-03-26 or 2024-11-05 is spoken to at it: a batch it sends
+is taken, its requests in one answered together as one array, and the client
+sends no batch of its own; the client never speaks HTTP+SSE. A tool call a server runs as a task
 is polled to its end, its input given as it asks, and returned as if answered
 at once (`Options.tasks`).
 
@@ -286,11 +307,14 @@ clearance's.
 
 ## Scope
 
-MCP as the specification has it, in the revisions in use: 2026-07-28, and
-2025-11-25 and 2025-06-18 through a session. Not built: the HTTP+SSE transport
-(deprecated since 2025-03-26), a session's resumable streams (`Last-Event-ID`,
-removed in 2026-07-28), JSON-RPC batches (removed in 2025-06-18), and
-dereferencing a schema's `$ref` over the network.
+MCP as the specification has it: 2026-07-28, and 2025-11-25, 2025-06-18,
+2025-03-26 and 2024-11-05 through a session, with batches where a revision has
+them, and 2024-11-05's HTTP+SSE on the server's side. Not built: HTTP+SSE on the
+client's side, a session's resumable streams (`Last-Event-ID`, removed in
+2026-07-28), and dereferencing a schema's `$ref` over the network. No
+conformance set covers 2025-03-26 or 2024-11-05: their proof is the handshake
+at each revision, batches on each transport, and the TypeScript SDK's
+2025-03-26 client (trials) over stdio, Streamable HTTP and HTTP+SSE.
 
 ## Built with
 

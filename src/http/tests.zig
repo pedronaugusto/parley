@@ -5,6 +5,7 @@ const shakedown = @import("shakedown");
 const parley = @import("parley");
 const uplink = @import("uplink");
 const Endpoint = @import("Endpoint.zig");
+const SseEndpoint = @import("SseEndpoint.zig");
 
 test {
     _ = @import("headers.zig");
@@ -48,6 +49,7 @@ fn repeated(arena: std.mem.Allocator, line: []const u8, n: usize) error{OutOfMem
 const Harness = struct {
     core: parley.Server,
     endpoint: Endpoint,
+    sse: SseEndpoint,
     router: uplink.server.Router,
     http: uplink.Server,
     listener: Io.net.Server,
@@ -64,6 +66,8 @@ const Harness = struct {
         h.endpoint = .init(testing.allocator, &h.core, .{ .keep_alive = .literal("100ms") });
         h.router = .init(testing.allocator);
         try h.router.add("/mcp", h.endpoint.handler());
+        h.sse = .init(testing.allocator, &h.core, .{ .keep_alive = .literal("100ms") });
+        try h.router.add("/sse", h.sse.handler());
         h.http = .init(testing.allocator, .{}, h.router.handler());
         h.listener = try (try Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{ .reuse_address = true });
         h.port = h.listener.socket.address.getPort();
@@ -78,6 +82,7 @@ const Harness = struct {
         h.serving.await(io) catch {};
         h.http.deinit(io);
         h.endpoint.deinit();
+        h.sse.deinit();
         h.listener.deinit(io);
         h.router.deinit();
         h.core.deinit();
@@ -388,4 +393,172 @@ test "a client that closes its stream stops the call: the handler is canceled" {
     // glint-ignore: Z026 -- the client gives up; how its own call ends is not what the test checks
     calling.cancel(io) catch {};
     try Stall.until(&Stall.canceled);
+}
+
+/// Opens a session at `version` and returns its id.
+fn openSession(h: *Harness, io: Io, arena: std.mem.Allocator, version: []const u8) ![]const u8 {
+    var url_buffer: [64]u8 = undefined;
+    const url = try std.mem.print(&url_buffer, "http://127.0.0.1:{d}/mcp", .{h.port});
+    const body = try arena.print("{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{s}\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"t\",\"version\":\"0\"}}}}}}", .{version});
+    var opened = try h.client.send(io, .{ .method = .POST, .url = url, .headers = &.{
+        .{ .name = "Content-Type", .value = "application/json" },
+        .{ .name = "Accept", .value = "application/json, text/event-stream" },
+    }, .body = .{ .bytes = body } });
+    defer opened.deinit(io);
+    const session = try arena.dupe(u8, opened.headers.get("Mcp-Session-Id") orelse return error.TestNoSession);
+    const answer = try opened.collect(arena, io, .limited(1 << 16));
+    try expectContains(answer, try arena.print("\"protocolVersion\":\"{s}\"", .{version}));
+    return session;
+}
+
+test "a 2025-03-26 session over HTTP takes a batch: one array of answers, 202 for one with no request, initialize refused inside" {
+    const io = testing.io;
+    var h: Harness = undefined;
+    try h.start(io);
+    defer h.stop(io);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const session = try openSession(&h, io, a, "2025-03-26");
+    // A 2025-03-26 client sends no MCP-Protocol-Version: the session's is taken.
+    const by_session = [_]uplink.Header{.{ .name = "Mcp-Session-Id", .value = session }};
+    const notices = try h.post(io, a, "[{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}]", &by_session);
+    try testing.expectEqual(std.http.Status.accepted, notices.status);
+    const batch = try h.post(io, a,
+        \\[{"jsonrpc":"2.0","id":2,"method":"ping"},{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"text":"in a batch"}}},{"jsonrpc":"2.0","id":4,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{}}},{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":0}}]
+    , &by_session);
+    try testing.expectEqual(std.http.Status.ok, batch.status);
+    try expectContains(batch.content_type, "application/json");
+    try testing.expect(batch.body[0] == '[' and batch.body[batch.body.len - 1] == ']');
+    try expectContains(batch.body, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}");
+    try expectContains(batch.body, "\"in a batch\"");
+    try expectContains(batch.body, "{\"jsonrpc\":\"2.0\",\"id\":4,\"error\":{\"code\":-32600");
+    // A request whose answer has progress before it: the batch's answers
+    // go out as events.
+    const streamed = try h.post(io, a,
+        \\[{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"counted","_meta":{"progressToken":"p"}}},{"jsonrpc":"2.0","id":6,"method":"ping"}]
+    , &by_session);
+    try expectContains(streamed.content_type, "text/event-stream");
+    try expectContains(streamed.body, "notifications/progress");
+    try expectContains(streamed.body, "\"id\":5,\"result\"");
+    try expectContains(streamed.body, "\"id\":6,\"result\":{}");
+}
+
+test "a batch over HTTP is refused whole on a 2025-11-25 session and without one" {
+    const io = testing.io;
+    var h: Harness = undefined;
+    try h.start(io);
+    defer h.stop(io);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ping = "[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}]";
+    const alone = try h.post(io, a, ping, &.{});
+    try testing.expectEqual(std.http.Status.bad_request, alone.status);
+    try expectContains(alone.body, "a batch is taken only on a session at 2025-03-26 or 2024-11-05");
+    const session = try openSession(&h, io, a, "2025-11-25");
+    const later = try h.post(io, a, ping, &.{ .{ .name = "Mcp-Session-Id", .value = session }, .{ .name = "MCP-Protocol-Version", .value = "2025-11-25" } });
+    try testing.expectEqual(std.http.Status.bad_request, later.status);
+    try expectContains(later.body, "a batch is taken only on a session at 2025-03-26 or 2024-11-05");
+}
+
+/// A 2024-11-05 client's stream on the HTTP+SSE endpoint, and where it
+/// POSTs.
+const SseClient = struct {
+    h: *Harness,
+    stream: uplink.Response,
+    events: uplink.wire.sse.Reader,
+    data: [1 << 16]u8,
+    url_buffer: [256]u8,
+    url: []const u8,
+
+    fn open(c: *SseClient, h: *Harness, io: Io) !void {
+        c.h = h;
+        var url_buffer: [64]u8 = undefined;
+        const url = try std.mem.print(&url_buffer, "http://127.0.0.1:{d}/sse", .{h.port});
+        // The stream is left open, never read to an end: its connection is
+        // not one to keep.
+        c.stream = try h.client.send(io, .{ .method = .GET, .url = url, .headers = &.{
+            .{ .name = "Accept", .value = "text/event-stream" },
+            .{ .name = "Connection", .value = "close" },
+        } });
+        errdefer c.stream.deinit(io);
+        try testing.expectEqual(std.http.Status.ok, c.stream.status);
+        c.events = .init(c.stream.reader(io), &c.data);
+        const first = (try c.events.next()).?;
+        try testing.expectEqualStrings("endpoint", first.type);
+        try testing.expect(std.mem.startsWith(u8, first.data, "/sse?sessionId="));
+        c.url = try std.mem.print(&c.url_buffer, "http://127.0.0.1:{d}{s}", .{ h.port, first.data });
+    }
+
+    fn close(c: *SseClient, io: Io) void {
+        c.stream.deinit(io);
+    }
+
+    fn post(c: *SseClient, io: Io, body: []const u8) !std.http.Status {
+        var response = try c.h.client.send(io, .{ .method = .POST, .url = c.url, .headers = &.{.{ .name = "Content-Type", .value = "application/json" }}, .body = .{ .bytes = body } });
+        defer response.deinit(io);
+        return response.status;
+    }
+
+    /// The next message event's data.
+    fn next(c: *SseClient) ![]const u8 {
+        while (try c.events.next()) |event| if (std.mem.eql(u8, event.type, "message")) return event.data;
+        return error.EndOfStream;
+    }
+};
+
+const initialize_2024 =
+    \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}
+;
+
+test "HTTP+SSE: the stream names where to POST; each POST is taken with 202 and answered on the stream" {
+    const io = testing.io;
+    var h: Harness = undefined;
+    try h.start(io);
+    defer h.stop(io);
+    var c: SseClient = undefined;
+    try c.open(&h, io);
+    defer c.close(io);
+
+    try testing.expectEqual(std.http.Status.accepted, try c.post(io, initialize_2024));
+    try expectContains(try c.next(), "\"protocolVersion\":\"2024-11-05\"");
+    try testing.expectEqual(std.http.Status.accepted, try c.post(io, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}"));
+    try testing.expectEqual(std.http.Status.accepted, try c.post(io, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"text\":\"over sse\"}}}"));
+    const answer = try c.next();
+    try expectContains(answer, "\"id\":2");
+    try expectContains(answer, "over sse");
+
+    // A batch, as 2024-11-05 has them: its answers one array, one event.
+    try testing.expectEqual(std.http.Status.accepted, try c.post(io, "[{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"},{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"text\":\"batched\"}}}]"));
+    const array = try c.next();
+    try testing.expect(array[0] == '[');
+    try expectContains(array, "\"id\":3");
+    try expectContains(array, "batched");
+
+    // What does not decode is refused on the stream, as stdio refuses a line.
+    try testing.expectEqual(std.http.Status.accepted, try c.post(io, "{not json"));
+    try expectContains(try c.next(), "\"code\":-32700");
+}
+
+test "HTTP+SSE: a POST naming no session, or one whose stream has ended, is refused" {
+    const io = testing.io;
+    var h: Harness = undefined;
+    try h.start(io);
+    defer h.stop(io);
+    var url_buffer: [96]u8 = undefined;
+    const unknown = try std.mem.print(&url_buffer, "http://127.0.0.1:{d}/sse?sessionId=00", .{h.port});
+    var refused = try h.client.send(io, .{ .method = .POST, .url = unknown, .headers = &.{.{ .name = "Content-Type", .value = "application/json" }}, .body = .{ .bytes = initialize_2024 } });
+    defer refused.deinit(io);
+    try testing.expectEqual(std.http.Status.not_found, refused.status);
+
+    var c: SseClient = undefined;
+    try c.open(&h, io);
+    c.close(io);
+    // The server notices the client gone within a keep-alive.
+    var tries: u32 = 0;
+    while (tries < 100) : (tries += 1) {
+        if (try c.post(io, initialize_2024) == .not_found) break;
+        try io.sleep(.fromMilliseconds(20), .awake);
+    } else return error.TestExpectedNotFound;
 }

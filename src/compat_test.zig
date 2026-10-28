@@ -127,6 +127,87 @@ test "the session's own methods: ping, the log level, subscriptions; requests be
     try expectContains(answerTo(lines, "\"id\":8,").?, "\"resultType\":\"complete\"");
 }
 
+test "2025-03-26 and 2024-11-05 are answered as asked, and a later session's handshake as before" {
+    for ([_][]const u8{ "2025-03-26", "2024-11-05", "2025-11-25" }) |version| {
+        var server = try newServer(testing.io);
+        defer server.deinit();
+        var input: std.ArrayList(u8) = .empty;
+        defer input.deinit(testing.allocator);
+        try input.print(testing.allocator, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{s}\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"t\",\"version\":\"1\"}}}}}}\n", .{version});
+        try input.appendSlice(testing.allocator, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"text\":\"hi\"}}}\n");
+        var in: std.Io.Reader = .fixed(input.items);
+        var out: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        try stdio.serve(testing.io, testing.allocator, &server, &in, &out.writer, .{});
+        const lines = out.written();
+        var want: [64]u8 = undefined;
+        try expectContains(answerTo(lines, "\"id\":1,").?, try std.mem.print(&want, "\"protocolVersion\":\"{s}\"", .{version}));
+        try expectContains(answerTo(lines, "\"id\":2,").?, "\"text\":\"hi\"");
+    }
+}
+
+test "a 2025-03-26 session takes a batch: one array of its requests' answers, its notifications taken, initialize refused inside it" {
+    var server = try newServer(testing.io);
+    defer server.deinit();
+    const input =
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}
+        \\[{"jsonrpc":"2.0","method":"notifications/initialized"},{"jsonrpc":"2.0","id":2,"method":"ping"},{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"text":"in a batch"}}},{"jsonrpc":"2.0","id":4,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{}}},{"jsonrpc":"1.0","id":5,"method":"ping"}]
+        \\[{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":99}}]
+        \\[]
+        \\{"jsonrpc":"2.0","id":6,"method":"ping"}
+        \\
+    ;
+    var in: std.Io.Reader = .fixed(input);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try stdio.serve(testing.io, testing.allocator, &server, &in, &out.writer, .{});
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(testing.allocator);
+    var it = std.mem.splitScalar(u8, out.written(), '\n');
+    while (it.next()) |line| if (line.len != 0) try lines.append(testing.allocator, line);
+    // initialize; the batch's array; the empty batch's refusal; ping, in
+    // the order they were answered: the batch's when its last request is.
+    // The batch of one notification has no answer.
+    try testing.expectEqual(@as(usize, 4), lines.items.len);
+    var arrays: usize = 0;
+    var batch: []const u8 = "";
+    var refusal: []const u8 = "";
+    var ping: []const u8 = "";
+    for (lines.items) |line| {
+        if (line[0] == '[') {
+            arrays += 1;
+            batch = line;
+        } else if (std.mem.find(u8, line, "\"id\":null") != null) refusal = line else if (std.mem.find(u8, line, "\"id\":6,") != null) ping = line;
+    }
+    try testing.expectEqual(@as(usize, 1), arrays);
+    try testing.expect(batch[batch.len - 1] == ']');
+    try expectContains(batch, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}");
+    try expectContains(batch, "\"in a batch\"");
+    try expectContains(batch, "{\"jsonrpc\":\"2.0\",\"id\":4,\"error\":{\"code\":-32600");
+    try expectContains(batch, "{\"jsonrpc\":\"2.0\",\"id\":5,\"error\":{\"code\":-32600");
+    try expectContains(refusal, "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600");
+    try expectContains(ping, "\"id\":6,\"result\":{}");
+}
+
+test "a batch is refused whole on a session whose revision removed them, and before a session" {
+    var server = try newServer(testing.io);
+    defer server.deinit();
+    const input =
+        \\[{"jsonrpc":"2.0","id":1,"method":"ping"}]
+        \\{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}
+        \\[{"jsonrpc":"2.0","id":3,"method":"ping"}]
+        \\
+    ;
+    var in: std.Io.Reader = .fixed(input);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try stdio.serve(testing.io, testing.allocator, &server, &in, &out.writer, .{});
+    const lines = out.written();
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, lines, "\n"));
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, lines, "a batch is taken only on a session at 2025-03-26 or 2024-11-05"));
+    try testing.expect(std.mem.find(u8, lines, "\"id\":3,\"result\"") == null);
+}
+
 /// An `Io` with no task to spare.
 const Serial = shakedown.Layer(u8, .{
     .concurrent = struct {

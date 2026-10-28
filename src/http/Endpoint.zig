@@ -21,6 +21,7 @@ const parley = @import("parley");
 const uplink = @import("uplink");
 const strand = @import("strand");
 const headers = @import("headers.zig");
+const guard = @import("guard.zig");
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -76,32 +77,16 @@ pub const Options = struct {
     session: parley.compat.Options = .{},
 };
 
-pub const Access = struct {
-    context: ?*anyopaque = null,
-    /// Whether `request` may be served, and for whom. `message` is what its
-    /// body holds (null for a GET or a DELETE), for an access whose needs
-    /// depend on the method or the tool. What it returns lives in `arena`.
-    check: *const fn (context: ?*anyopaque, io: Io, arena: Allocator, request: *const Request, message: ?wire.Message) Error!Verdict,
+/// Who may send a request, and who sent it (`guard.Access`).
+pub const Access = guard.Access;
+pub const Verdict = guard.Verdict;
+pub const Refusal = guard.Refusal;
 
-    /// `Unavailable`: what checks credentials could not answer (an
-    /// authorization server down): a 503.
-    pub const Error = error{ Unavailable, Canceled, OutOfMemory };
-};
+const refuse = guard.refuse;
 
-pub const Verdict = union(enum) {
-    /// Served, for the principal named (null: nobody told apart).
-    admitted: ?[]const u8,
-    refused: Refusal,
-};
-
-pub const Refusal = struct {
-    /// 400, 401 or 403.
-    status: std.http.Status,
-    /// The `WWW-Authenticate` value: why, and where to get credentials.
-    challenge: []const u8,
-    /// The body, JSON (an OAuth error object), or empty.
-    body: []const u8 = "",
-};
+fn served(e: *const Endpoint) guard.Served {
+    return .{ .loopback = e.options.loopback, .hosts = e.options.hosts, .origins = e.options.origins };
+}
 
 pub fn init(gpa: Allocator, server: *parley.Server, options: Options) Endpoint {
     return .{ .gpa = gpa, .server = server, .options = options };
@@ -123,15 +108,15 @@ fn handle(e: *Endpoint, io: Io, request: *Request, response: *Response) anyerror
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    if (!e.hostServed(request.headers.get("Host") orelse request.host) or !e.originServed(request.headers.get("Origin")))
-        return refuse(io, response, .forbidden, null, .invalid_request, "Origin or Host not served: a page another site serves may not reach this server");
+    if (!guard.served(e.served(), request))
+        return refuse(io, response, .forbidden, null, .invalid_request, guard.not_served);
     const session_id = request.headers.get(headers.session_id);
     if (std.mem.eql(u8, request.method.name, "GET")) {
-        _ = try e.checkAccess(io, arena, request, response, null) orelse return;
+        _ = try guard.checkAccess(e.options.access, io, arena, request, response, null) orelse return;
         return e.openStream(io, response, session_id, request.headers.get("Accept"));
     }
     if (std.mem.eql(u8, request.method.name, "DELETE")) {
-        _ = try e.checkAccess(io, arena, request, response, null) orelse return;
+        _ = try guard.checkAccess(e.options.access, io, arena, request, response, null) orelse return;
         return e.endSession(io, response, session_id);
     }
     if (!std.mem.eql(u8, request.method.name, "POST")) {
@@ -140,7 +125,7 @@ fn handle(e: *Endpoint, io: Io, request: *Request, response: *Response) anyerror
     }
     if (!accepts(request.headers.get("Accept")))
         return refuse(io, response, .not_acceptable, null, .invalid_request, "Accept must list application/json and text/event-stream");
-    if (!isJson(request.headers.get("Content-Type")))
+    if (!guard.isJson(request.headers.get("Content-Type")))
         return refuse(io, response, .unsupported_media_type, null, .invalid_request, "The body is application/json");
     // The server's message limit bounds the body. It is read onto `gpa`, not
     // the arena: growing it frees what it outgrew, where an arena would keep
@@ -152,12 +137,19 @@ fn handle(e: *Endpoint, io: Io, request: *Request, response: *Response) anyerror
     };
     defer e.gpa.free(body);
 
+    // A batch, on a session whose revision has them (2025-03-26 and
+    // 2024-11-05); anywhere else the decode refuses it.
+    if (wire.isBatch(body)) if (session_id) |id| if (e.lookup(io, id)) |entry| {
+        defer entry.release(e.gpa);
+        if (entry.session.revision.batches()) return e.serveBatch(io, arena, request, response, entry, body);
+    };
+
     var fault: wire.Fault = .{};
     const message = wire.decode(arena, body, .{ .fault = &fault, .limits = e.server.jsonLimits() }) catch |err| switch (err) {
         error.OutOfMemory => return err,
         error.Malformed, error.Invalid => return refuse(io, response, .bad_request, fault.id, fault.code, fault.reason),
     };
-    const admitted = try e.checkAccess(io, arena, request, response, message) orelse return;
+    const admitted = try guard.checkAccess(e.options.access, io, arena, request, response, message) orelse return;
 
     // The session era: a request naming a session, or one opening it.
     if (session_id) |id| {
@@ -368,6 +360,117 @@ fn serveSession(e: *Endpoint, io: Io, arena: Allocator, request: *Request, respo
     return response.end(io);
 }
 
+/// A batch on a session: its notifications and answers taken, its requests
+/// answered together, as 2025-03-26 has it: 202 when it holds no request,
+/// else one JSON array, or one event stream when something went out before
+/// the answers. `initialize` is refused inside one.
+fn serveBatch(e: *Endpoint, io: Io, arena: Allocator, request: *Request, response: *Response, entry: *Entry, body: []const u8) anyerror!void {
+    const session = &entry.session;
+    var fault: wire.Fault = .{};
+    const elements = wire.decodeBatch(arena, body, .{ .fault = &fault, .limits = e.server.jsonLimits() }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.Malformed, error.Invalid => return refuse(io, response, .bad_request, fault.id, fault.code, fault.reason),
+    };
+    for (elements) |element| if (element.read == .message) {
+        _ = try guard.checkAccess(e.options.access, io, arena, request, response, element.read.message) orelse return;
+    };
+    if (request.headers.get(headers.protocol_version)) |version| {
+        if (!std.mem.eql(u8, version, session.revision.text()))
+            return refuse(io, response, .bad_request, null, .invalid_request, "MCP-Protocol-Version is not the session's version");
+    }
+    // Each request on an arena of its own (they run at once, and an arena
+    // is one task's), kept until its answer is written.
+    const answers = try arena.alloc(Answered, elements.len);
+    for (answers) |*a| a.* = .{ .arena = .init(e.gpa) };
+    defer for (answers) |*a| a.arena.deinit();
+    var stream: Stream = .{ .io = io, .response = response };
+    {
+        var group: Io.Group = .init;
+        defer group.cancel(io);
+        for (elements, answers) |element, *a| switch (element.read) {
+            .refused => |f| a.outcome = .{ .refused = f },
+            .message => |message| switch (message) {
+                .request => |req| {
+                    if (std.mem.eql(u8, req.method, "initialize")) {
+                        a.outcome = .{ .refused = .{ .id = req.id, .code = .invalid_request, .reason = "initialize is not sent in a batch" } };
+                        continue;
+                    }
+                    a.request = req;
+                    group.concurrent(io, Answered.run, .{ a, io, session, stream.sink(e) }) catch a.run(io, session, stream.sink(e));
+                },
+                .notification => |n| if (std.mem.eql(u8, n.method, "notifications/initialized")) session.initialized(io),
+                .result, .failure => session.deliver(io, message),
+            },
+        };
+        try group.await(io);
+    }
+    var any = false;
+    for (answers) |a| any = any or a.outcome != null;
+    if (!any) {
+        response.status = .accepted;
+        return response.end(io);
+    }
+    var out: Io.Writer.Allocating = .init(arena);
+    var first = true;
+    for (answers) |*a| {
+        const outcome = a.outcome orelse continue;
+        var one: Io.Writer.Allocating = .init(a.arena.allocator());
+        switch (outcome) {
+            .refused => |f| try wire.writeFailure(&one.writer, f.id, f.code, f.reason, null),
+            .answered => |result| {
+                const reply = result catch |err| switch (err) {
+                    // Canceled: nothing is answered for it.
+                    error.Canceled => continue,
+                    error.OutOfMemory => return err,
+                };
+                try e.writeReply(a.arena.allocator(), &one.writer, a.request.id, reply);
+            },
+        }
+        if (stream.events) {
+            try stream.event(one.written());
+            continue;
+        }
+        try out.writer.writeByte(if (first) '[' else ',');
+        first = false;
+        try out.writer.writeAll(one.written());
+    }
+    if (stream.events) return response.end(io);
+    if (first) {
+        response.status = .accepted;
+        return response.end(io);
+    }
+    try out.writer.writeByte(']');
+    try response.header("Content-Type", "application/json");
+    return response.send(io, out.written());
+}
+
+/// One element of a batch, its arena, and what answers it.
+const Answered = struct {
+    arena: std.heap.ArenaAllocator,
+    request: wire.Request = undefined,
+    outcome: ?union(enum) {
+        refused: wire.Fault,
+        answered: parley.Server.HandleError!parley.Server.Reply,
+    } = null,
+
+    fn run(a: *Answered, io: Io, session: *parley.compat.Session, sink: parley.Sink) void {
+        a.outcome = .{ .answered = session.handle(io, a.arena.allocator(), a.request, sink) };
+    }
+};
+
+/// `reply` to the request `id` names, as JSON: a result as it is written,
+/// never copied first.
+fn writeReply(e: *Endpoint, arena: Allocator, w: *Io.Writer, id: wire.Id, reply: parley.Server.Reply) anyerror!void {
+    const body: parley.Server.Body = switch (reply) {
+        .result => |b| b,
+        .input_required => |ir| .{ .json = try e.server.inputRequiredJson(arena, ir) },
+        .failure => |f| return wire.writeFailure(w, id, f.code, f.message, f.data),
+    };
+    try wire.beginResult(w, id);
+    try body.write(w);
+    try wire.endResult(w);
+}
+
 /// GET: the session's own stream, where its list changes and resource
 /// updates go; one at a time.
 fn openStream(e: *Endpoint, io: Io, response: *Response, session_id: ?[]const u8, accept: ?[]const u8) anyerror!void {
@@ -521,68 +624,6 @@ fn member(arena: Allocator, params: ?[]const u8, name: []const u8, limits: stran
     return null;
 }
 
-const Admitted = struct { principal: ?[]const u8 };
-
-/// Holds `request` to the endpoint's access: who sent it, or null when it
-/// is refused (the refusal written).
-fn checkAccess(e: *Endpoint, io: Io, arena: Allocator, request: *const Request, response: *Response, message: ?wire.Message) anyerror!?Admitted {
-    const access = e.options.access orelse return .{ .principal = null };
-    const verdict = access.check(access.context, io, arena, request, message) catch |err| switch (err) {
-        error.Unavailable => {
-            try refuse(io, response, .service_unavailable, null, .internal_error, "The server cannot check credentials now");
-            return null;
-        },
-        error.Canceled, error.OutOfMemory => |x| return x,
-    };
-    switch (verdict) {
-        .admitted => |principal| return .{ .principal = principal },
-        .refused => |r| {
-            response.status = r.status;
-            try response.header("WWW-Authenticate", r.challenge);
-            if (r.body.len != 0) try response.header("Content-Type", "application/json");
-            try response.send(io, r.body);
-            return null;
-        },
-    }
-}
-
-fn refuse(io: Io, response: *Response, status: std.http.Status, id: ?wire.Id, code: wire.Code, message: []const u8) anyerror!void {
-    var buffer: [512]u8 = undefined;
-    var w: Io.Writer = .fixed(&buffer);
-    wire.writeFailure(&w, id, code, message, null) catch {
-        w = .fixed(&buffer);
-        try wire.writeFailure(&w, null, code, message, null);
-    };
-    response.status = status;
-    try response.header("Content-Type", "application/json");
-    return response.send(io, w.buffered());
-}
-
-fn hostServed(e: *const Endpoint, host: []const u8) bool {
-    for (e.options.hosts) |h| if (std.ascii.eqlIgnoreCase(h, host)) return true;
-    if (e.options.loopback) return loopbackHost(host);
-    return e.options.hosts.len == 0;
-}
-
-fn originServed(e: *const Endpoint, origin: ?[]const u8) bool {
-    const o = origin orelse return true;
-    for (e.options.origins) |allowed| if (std.ascii.eqlIgnoreCase(allowed, o)) return true;
-    if (!e.options.loopback) return false;
-    const scheme_end = std.mem.find(u8, o, "://") orelse return false;
-    const scheme = o[0..scheme_end];
-    if (!std.mem.eql(u8, scheme, "http") and !std.mem.eql(u8, scheme, "https")) return false;
-    return loopbackHost(o[scheme_end + 3 ..]);
-}
-
-/// Whether `authority` (`host[:port]`) names this machine.
-fn loopbackHost(authority: []const u8) bool {
-    const host = if (std.mem.startsWith(u8, authority, "[")) blk: {
-        const close = std.mem.findScalar(u8, authority, ']') orelse return false;
-        break :blk authority[0 .. close + 1];
-    } else if (std.mem.findScalar(u8, authority, ':')) |colon| authority[0..colon] else authority;
-    return std.ascii.eqlIgnoreCase(host, "localhost") or std.mem.eql(u8, host, "127.0.0.1") or std.mem.eql(u8, host, "[::1]");
-}
-
 /// Whether `Accept` lists both types an answer may be (or a wildcard that
 /// covers them).
 fn accepts(accept: ?[]const u8) bool {
@@ -599,17 +640,13 @@ fn accepts(accept: ?[]const u8) bool {
     return json and events;
 }
 
-fn isJson(content_type: ?[]const u8) bool {
-    const value = content_type orelse return false;
-    const media = std.mem.trim(u8, value[0 .. std.mem.findScalar(u8, value, ';') orelse value.len], " \t");
-    return std.ascii.eqlIgnoreCase(media, "application/json");
-}
-
 /// A response that becomes an event stream at the first notification.
 const Stream = struct {
     io: Io,
     response: *Response,
     events: bool = false,
+    /// One event at a time: a batch's requests write to one stream.
+    mutex: Io.Mutex = .init,
 
     fn begin(s: *Stream) Response.Error!*Io.Writer {
         if (!s.events) {
@@ -622,6 +659,8 @@ const Stream = struct {
     }
 
     fn event(s: *Stream, message: []const u8) anyerror!void {
+        try s.mutex.lock(s.io);
+        defer s.mutex.unlock(s.io);
         const w = try s.begin();
         try uplink.wire.sse.writeEvent(w, .{ .type = "message", .data = message });
         try s.response.flush(s.io);
@@ -659,6 +698,8 @@ const Stream = struct {
     fn keepAliveFn(context: *anyopaque, io: Io) parley.Sink.SendError!void {
         _ = io;
         const s: *Stream = @ptrCast(@alignCast(context)); // safe: the sink was made from this stream
+        s.mutex.lock(s.io) catch return error.Canceled;
+        defer s.mutex.unlock(s.io);
         const w = s.begin() catch |err| return switch (err) {
             error.Canceled => error.Canceled,
             else => error.Closed,

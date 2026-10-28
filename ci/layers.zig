@@ -24,8 +24,10 @@ pub const layers: []const gantry.rules.Layer = &.{
     .{ .name = "stdio", .patterns = &.{"src/stdio.zig"} },
     .{ .name = "public", .patterns = &.{"src/parley.zig"} },
     .{ .name = "HTTP headers", .patterns = &.{"src/http/headers.zig"} },
+    .{ .name = "HTTP guard", .patterns = &.{"src/http/guard.zig"} },
     .{ .name = "HTTP ends", .patterns = &.{
         "src/http/Endpoint.zig",
+        "src/http/SseEndpoint.zig",
         "src/http/Transport.zig",
     } },
     .{ .name = "HTTP public", .patterns = &.{"src/http.zig"} },

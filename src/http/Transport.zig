@@ -174,15 +174,19 @@ fn sessionStream(t: *Transport, io: Io) Io.Cancelable!void {
     while (reader.next() catch return) |event| {
         var turn: std.heap.ArenaAllocator = .init(t.gpa);
         defer turn.deinit();
-        const message = wire.decode(turn.allocator(), event.data, .{ .limits = client.jsonLimits() }) catch continue;
-        switch (message) {
-            .request => |r| switch (client.serveRequest(io, turn.allocator(), r)) {
-                // glint-ignore: Z026 -- an answer the server cannot take leaves its request unanswered, which it times out
-                .message => |answer| t.postAnswer(io, turn.allocator(), client.revision, answer) catch {},
-                .none => {},
+        const a = turn.allocator();
+        const elements = wire.decodeFrame(a, event.data, client.revision.batches(), .{ .limits = client.jsonLimits() }) catch continue;
+        var replies: parley.Client.Replies = .init(a, event.data);
+        for (elements) |element| switch (element.read) {
+            .message => |message| switch (message) {
+                .request => |r| replies.add(client.serveRequest(io, a, r)) catch break,
+                else => {},
             },
-            else => {},
-        }
+            .refused => {},
+        };
+        const answer = (replies.message() catch continue) orelse continue;
+        // glint-ignore: Z026 -- an answer the server cannot take leaves its request unanswered, which it times out
+        t.postAnswer(io, a, client.revision, answer) catch {};
     }
 }
 
@@ -304,16 +308,26 @@ fn events(t: *Transport, io: Io, arena: Allocator, exchange: *Client.Exchange, f
             if (event.id.len != 0) last_id = try arena.dupe(u8, event.id);
             if (event.retry) |r| retry = r;
             if (event.data.len == 0) continue;
-            const message = wire.decode(arena, event.data, .{ .limits = exchange.client.jsonLimits() }) catch continue;
-            switch (message) {
-                .result => |r| if (r.id.eql(exchange.id)) return arena.dupe(u8, event.data),
-                .failure => |f| if (f.id) |id| if (id.eql(exchange.id)) return arena.dupe(u8, event.data),
-                .request => switch (exchange.inbound(io, arena, message)) {
-                    .message => |answer| try t.post(io, arena, exchange, answer),
-                    .none => {},
+            const elements = wire.decodeFrame(arena, event.data, exchange.revision.batches(), .{ .limits = exchange.client.jsonLimits() }) catch continue;
+            // The event's requests are answered before the answer it may
+            // carry is taken: a batch's are answered together.
+            var replies: parley.Client.Replies = .init(arena, event.data);
+            var found: ?[]const u8 = null;
+            for (elements) |element| switch (element.read) {
+                .message => |message| switch (message) {
+                    .result => |r| if (r.id.eql(exchange.id)) {
+                        found = element.bytes;
+                    },
+                    .failure => |f| if (f.id) |id| if (id.eql(exchange.id)) {
+                        found = element.bytes;
+                    },
+                    .request => try replies.add(exchange.inbound(io, arena, message)),
+                    .notification => {},
                 },
-                .notification => {},
-            }
+                .refused => {},
+            };
+            if (try replies.message()) |answer| try t.post(io, arena, exchange, answer);
+            if (found) |bytes| return arena.dupe(u8, bytes);
         }
         // Closed before the answer: a session's stream is resumed after the
         // wait the server set (2025-11-25); a 2026-07-28 stream is not.

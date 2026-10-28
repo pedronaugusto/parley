@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Breaking
+
+- 2025-03-26 and 2024-11-05 are served through the session layer: `Revision` gains `@"2025-03-26"` and `@"2024-11-05"` (and `batches()`), `server/discover` and the version refusal name the five revisions served, and `Client.Options.revisions` offers all five by default. Nothing is down-levelled: fields the older revisions lack go out as they are.
+
+### Added
+
+- JSON-RPC batches where the revision has them (2025-03-26, 2024-11-05), read by one decoder (`wire.decodeBatch`; `wire.decodeFrame` for a frame that is one message or a batch; each `wire.Element` keeps the bytes it was written as): a session takes one on stdio and Streamable HTTP, refuses `initialize` inside one, and answers its requests as one array (Streamable HTTP: 202 when it holds no request, else one JSON array or one event stream). The client takes a server's batch and answers its requests as one array (`Client.Replies`); it sends none of its own.
+- `parley.http.SseEndpoint`: 2024-11-05's HTTP+SSE transport on the server's side, behind the session layer. A GET opens a session and its stream, whose `endpoint` event names where to POST; each POST is answered 202, its answer sent on the stream.
+- `stdio.Connection` and `stdio.Out`: the connection `serve` reads line by line, for a transport whose messages come and go in other frames (`take` one message, `finish`, `keepAlive`); HTTP+SSE is one.
+- The fixture server serves HTTP+SSE at `/sse` beside `/mcp`.
+
 ## [0.7.0] - 2026-10-25
 
 ### Breaking

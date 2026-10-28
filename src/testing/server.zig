@@ -2,7 +2,7 @@
 //! `sleep` (a long call, canceled at once), and with `--tools <n>` that many
 //! more tools with large input schemas. Over stdio by default; with
 //! `--port <port>` over Streamable HTTP at `http://127.0.0.1:<port>/mcp`
-//! instead. It runs on a reactor runtime, the family's evented `Io`, or with
+//! instead, and 2024-11-05's HTTP+SSE at `/sse` beside it. It runs on a reactor runtime, the family's evented `Io`, or with
 //! `--io threaded` on std's. It says `ready` on its standard error once it
 //! serves; with `--linger` it stays after its input ends, until it is asked
 //! to stop; with `--exit` it ends at once.
@@ -104,6 +104,9 @@ fn serve(gpa: std.mem.Allocator, io: Io, arguments: Arguments) !void {
         var router: uplink.server.Router = .init(gpa);
         defer router.deinit();
         try router.add("/mcp", endpoint.handler());
+        var sse: http.SseEndpoint = .init(gpa, &server, .{});
+        defer sse.deinit();
+        try router.add("/sse", sse.handler());
         var web: uplink.Server = .init(gpa, .{}, router.handler());
         defer web.deinit(io);
         var listener = try (try Io.net.IpAddress.parse("127.0.0.1", port)).listen(io, .{ .reuse_address = true });

@@ -92,6 +92,47 @@ test "what is not JSON is a parse error; what is not a message is invalid, namin
     try expectRefused("{\"jsonrpc\":\"2.0\",\"id\":9223372036854775808,\"method\":\"a\"}", .invalid_request, null);
 }
 
+test "a batch's elements are read each on its own: messages, and refusals naming their ids" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const batch =
+        \\[{"jsonrpc":"2.0","id":1,"method":"tools/list"},
+        \\ {"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":0}},
+        \\ {"jsonrpc":"2.0","id":2,"result":{}},
+        \\ {"jsonrpc":"1.0","id":"q","method":"ping"},
+        \\ 7]
+    ;
+    const elements = try wire.decodeBatch(arena.allocator(), batch, .{ .limits = wire_limits });
+    try testing.expectEqual(@as(usize, 5), elements.len);
+    try testing.expectEqualStrings("tools/list", elements[0].read.message.request.method);
+    try testing.expectEqualStrings("notifications/cancelled", elements[1].read.message.notification.method);
+    try testing.expectEqual(wire.Id{ .integer = 2 }, elements[2].read.message.result.id);
+    try testing.expectEqual(wire.Code.invalid_request, elements[3].read.refused.code);
+    try testing.expect(elements[3].read.refused.id.?.eql(.{ .string = "q" }));
+    try testing.expectEqual(wire.Code.invalid_request, elements[4].read.refused.code);
+    try testing.expect(elements[4].read.refused.id == null);
+    // Each element keeps the bytes it was written as.
+    try testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}", elements[2].bytes);
+}
+
+test "a batch that is not JSON, empty, or not an array is refused whole" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const cases = [_]struct { []const u8, wire.DecodeError, wire.Code }{
+        .{ "[{\"jsonrpc\":\"2.0\",", error.Malformed, .parse_error },
+        .{ "[]", error.Invalid, .invalid_request },
+        .{ "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}", error.Invalid, .invalid_request },
+    };
+    for (cases) |case| {
+        var fault: wire.Fault = .{};
+        try testing.expectError(case[1], wire.decodeBatch(arena.allocator(), case[0], .{ .fault = &fault, .limits = wire_limits }));
+        try testing.expectEqual(case[2], fault.code);
+    }
+    // One message alone is no batch, and a batch is not one message.
+    try testing.expect(wire.isBatch(" \n[{}]"));
+    try testing.expect(!wire.isBatch("{}"));
+}
+
 test "what Claude Code 2.1.302 and Codex 0.160.0 send is read" {
     const lines = [_][]const u8{
         @embedFile("testing/captures/claude-code-2.1.302.jsonl"),
@@ -169,4 +210,19 @@ test "the limits of a small message bound nothing its bytes admit" {
     defer arena.deinit();
     const dense = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"m\",\"params\":[1,2,3,4,5,6,7]}";
     _ = try wire.decode(arena.allocator(), dense, .{ .limits = wire.limitsFor(.fromRaw(dense.len)) });
+}
+
+test "a frame is one message, or a batch's elements where the revision has batches" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const one = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
+    const single = try wire.decodeFrame(arena.allocator(), one, false, .{ .limits = wire_limits });
+    try testing.expectEqual(@as(usize, 1), single.len);
+    try testing.expectEqualStrings(one, single[0].bytes);
+    const batch = "[" ++ one ++ ",{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}]";
+    const elements = try wire.decodeFrame(arena.allocator(), batch, true, .{ .limits = wire_limits });
+    try testing.expectEqual(@as(usize, 2), elements.len);
+    try testing.expectEqualStrings("notifications/progress", elements[1].read.message.notification.method);
+    // Where the revision has none, a batch is refused as any non-message.
+    try testing.expectError(error.Invalid, wire.decodeFrame(arena.allocator(), batch, false, .{ .limits = wire_limits }));
 }

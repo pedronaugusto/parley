@@ -57,8 +57,10 @@ pub const Options = struct {
     max_rounds: u8 = 8,
     /// The revisions the client speaks, newest first. Without 2026-07-28
     /// it opens a session at once; without the session revisions it speaks
-    /// to 2026-07-28 servers alone.
-    revisions: []const Revision = &.{ .@"2026-07-28", .@"2025-11-25", .@"2025-06-18" },
+    /// to 2026-07-28 servers alone. A session server that answers
+    /// `initialize` with 2025-03-26 or 2024-11-05 is served at it: a batch
+    /// from it is taken, and the client sends none of its own.
+    revisions: []const Revision = &.{ .@"2026-07-28", .@"2025-11-25", .@"2025-06-18", .@"2025-03-26", .@"2024-11-05" },
     /// How long `server/discover` waits before the server is taken for a
     /// session server that stays silent before `initialize` (stdio).
     probe_timeout: Duration = .literal("5s"),
@@ -166,6 +168,38 @@ pub const Exchange = struct {
 /// What a transport sends back for an inbound message: nothing, or the
 /// answer to a server's request.
 pub const Answer = union(enum) { none, message: []const u8 };
+
+/// The answers to what one frame from the server asked, as they go back:
+/// the one answer as it is, or for a batch one array (JSON-RPC 2.0 §6), the
+/// only batch the client sends.
+pub const Replies = struct {
+    batch: bool,
+    out: Writer.Allocating,
+    count: u32 = 0,
+
+    /// For the answers to `frame`'s requests.
+    pub fn init(arena: Allocator, frame: []const u8) Replies {
+        return .{ .batch = wire.isBatch(frame), .out = .init(arena) };
+    }
+
+    pub fn add(r: *Replies, answer: Answer) Allocator.Error!void {
+        const one = switch (answer) {
+            .none => return,
+            .message => |m| m,
+        };
+        const w = &r.out.writer;
+        if (r.batch) w.writeByte(if (r.count == 0) '[' else ',') catch return error.OutOfMemory;
+        w.writeAll(one) catch return error.OutOfMemory;
+        r.count += 1;
+    }
+
+    /// What goes back, or null when nothing does.
+    pub fn message(r: *Replies) Allocator.Error!?[]const u8 {
+        if (r.count == 0) return null;
+        if (r.batch) r.out.writer.writeByte(']') catch return error.OutOfMemory;
+        return r.out.written();
+    }
+};
 
 /// `Unsupported`: the server speaks no version this client does.
 /// `Protocol`: the server's answer is not what the protocol says.

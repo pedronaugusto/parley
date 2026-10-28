@@ -161,6 +161,64 @@ pub fn decode(arena: Allocator, bytes: []const u8, options: DecodeOptions) Decod
     return decodeInto(arena, bytes, options.limits, fault);
 }
 
+/// One element of a batch: the bytes it was written as, and the message
+/// they are or why they are refused.
+pub const Element = struct {
+    /// The element as written, inside the batch's bytes.
+    bytes: []const u8,
+    read: Read,
+
+    pub const Read = union(enum) {
+        message: Message,
+        refused: Fault,
+    };
+};
+
+/// A JSON-RPC batch, which 2025-03-26 and 2024-11-05 have and the later
+/// revisions removed: the elements of a non-empty array, each read as
+/// `decode` reads one message and each refused on its own (JSON-RPC 2.0
+/// §6). `Malformed`: the bytes are not JSON. `Invalid`: JSON, but not a
+/// non-empty array. Messages point into `bytes`, as `decode`'s do.
+pub fn decodeBatch(arena: Allocator, bytes: []const u8, options: DecodeOptions) DecodeError![]const Element {
+    var scratch: Fault = .{};
+    const fault = options.fault orelse &scratch;
+    fault.* = .{};
+    if (!isBatch(bytes)) return refuse(fault, .invalid_request, "a batch is a JSON array");
+    const raws = json.parseLeaky([]const json.Raw, arena, bytes, .{ .limits = options.limits }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SyntaxError, error.InvalidUtf8 => return refuse(fault, .parse_error, "the batch is not JSON"),
+        error.InputLimit, error.DepthLimit, error.ItemLimit, error.LengthLimit, error.AllocationLimit, error.WorkLimit => return refuse(fault, .invalid_request, "the batch is past a limit"),
+        else => return refuse(fault, .invalid_request, "the batch is not an array of messages"),
+    };
+    if (raws.len == 0) return refuse(fault, .invalid_request, "the batch is empty");
+    const elements = try arena.alloc(Element, raws.len);
+    for (raws, elements) |raw, *element| {
+        var refused: Fault = .{};
+        element.* = .{ .bytes = raw.bytes, .read = if (decodeInto(arena, raw.bytes, options.limits, &refused)) |message| .{ .message = message } else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Malformed, error.Invalid => .{ .refused = refused },
+        } };
+    }
+    return elements;
+}
+
+/// What one frame of a connection holds (a line, an event, a body): one
+/// message, as `decode` reads it, or, where `batches` (the revision has
+/// them), a batch's elements, as `decodeBatch` reads them. One message is
+/// one element.
+pub fn decodeFrame(arena: Allocator, bytes: []const u8, batches: bool, options: DecodeOptions) DecodeError![]const Element {
+    if (batches and isBatch(bytes)) return decodeBatch(arena, bytes, options);
+    const one = try arena.alloc(Element, 1);
+    one[0] = .{ .bytes = bytes, .read = .{ .message = try decode(arena, bytes, options) } };
+    return one;
+}
+
+/// Whether `bytes` is written as a batch: a JSON array, the one shape no
+/// single message has.
+pub fn isBatch(bytes: []const u8) bool {
+    return firstByte(bytes) == '[';
+}
+
 /// One envelope member at most once each.
 const envelope = [_][]const u8{ "jsonrpc", "id", "method", "params", "result", "error" };
 
@@ -229,7 +287,7 @@ fn refuse(fault: *Fault, code: Code, reason: []const u8) DecodeError {
 fn refuseMembers(fault: *Fault, err: json.MembersError, bytes: []const u8) DecodeError {
     return switch (err) {
         // JSON, but not an object: a batch, a scalar.
-        error.UnexpectedType => refuse(fault, .invalid_request, if (firstByte(bytes) == '[') "batches are not part of MCP" else "the message is not an object"),
+        error.UnexpectedType => refuse(fault, .invalid_request, if (firstByte(bytes) == '[') "a batch is taken only on a session at 2025-03-26 or 2024-11-05" else "the message is not an object"),
         error.SyntaxError => refuse(fault, .parse_error, "the message is not JSON"),
         error.InputLimit, error.DepthLimit, error.ItemLimit, error.LengthLimit, error.WorkLimit => refuse(fault, .invalid_request, "the message is past a limit"),
     };

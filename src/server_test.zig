@@ -145,7 +145,7 @@ test "server/discover names the versions, the capabilities and the server, with 
     var r: Recorder = .{ .gpa = testing.allocator };
     defer r.deinit();
     const answer = try ask(&s, arena.allocator(), &r, "server/discover", "{" ++ meta ++ "}");
-    try expectContains(answer, "\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\",\"2025-11-25\",\"2025-06-18\"]");
+    try expectContains(answer, "\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\",\"2025-11-25\",\"2025-06-18\",\"2025-03-26\",\"2024-11-05\"]");
     try expectContains(answer, "\"tools\":{\"listChanged\":true}");
     try expectContains(answer, "\"resources\":{\"subscribe\":true,\"listChanged\":true}");
     try expectContains(answer, "\"instructions\":\"for tests\"");
@@ -295,7 +295,7 @@ test "what every 2026-07-28 request must carry, and versions not served" {
     try expectContains(try ask(&s, arena.allocator(), &r, "tools/list", "{}"), "\"code\":-32602");
     try expectContains(try ask(&s, arena.allocator(), &r, "tools/list", "{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}}"), "\"code\":-32602");
     const old = try ask(&s, arena.allocator(), &r, "tools/list", "{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"1900-01-01\",\"io.modelcontextprotocol/clientCapabilities\":{}}}");
-    try expectContains(old, "\"error\":{\"code\":-32022,\"message\":\"Unsupported protocol version\",\"data\":{\"supported\":[\"2026-07-28\",\"2025-11-25\",\"2025-06-18\"],\"requested\":\"1900-01-01\"}}");
+    try expectContains(old, "\"error\":{\"code\":-32022,\"message\":\"Unsupported protocol version\",\"data\":{\"supported\":[\"2026-07-28\",\"2025-11-25\",\"2025-06-18\",\"2025-03-26\",\"2024-11-05\"],\"requested\":\"1900-01-01\"}}");
     try expectContains(try ask(&s, arena.allocator(), &r, "ping", "{" ++ meta ++ "}"), "\"code\":-32601");
     try expectContains(try ask(&s, arena.allocator(), &r, "initialize", "{" ++ meta ++ "}"), "\"code\":-32601");
 }

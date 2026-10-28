@@ -217,3 +217,61 @@ test "a session server: discover not understood, so initialize, then requests wi
     try testing.expectEqualStrings("old school", called.content[0].text.text);
     wiring.to_server.close();
 }
+
+/// A 2024-11-05 server, scripted: it answers `initialize` at its own
+/// revision whatever the client offers, and a call with a batch holding a
+/// request of its own beside the call's answer.
+const BatchingServer = struct {
+    /// The line the client answered the batch with.
+    answer: [256]u8 = undefined,
+    answer_len: usize = 0,
+
+    fn run(s: *BatchingServer, io: Io, in: *Pipe, out: *Pipe) void {
+        defer out.close();
+        while (in.reader.takeDelimiter('\n') catch null) |line| {
+            if (line.len != 0 and line[0] == '[') {
+                @memcpy(s.answer[0..line.len], line);
+                s.answer_len = line.len;
+                continue;
+            }
+            const id_at = std.mem.find(u8, line, "\"id\":") orelse continue;
+            const id_end = std.mem.findAnyPos(u8, line, id_at + 5, ",}").?;
+            const id = line[id_at + 5 .. id_end];
+            var buffer: [512]u8 = undefined;
+            const answer = if (std.mem.find(u8, line, "server/discover") != null)
+                std.mem.print(&buffer, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"error\":{{\"code\":-32601,\"message\":\"Method not found\"}}}}\n", .{id}) catch unreachable
+            else if (std.mem.find(u8, line, "\"initialize\"") != null)
+                std.mem.print(&buffer, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"older\",\"version\":\"1\"}}}}}}\n", .{id}) catch unreachable
+            else
+                std.mem.print(&buffer, "[{{\"jsonrpc\":\"2.0\",\"id\":900,\"method\":\"ping\"}},{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"batched\"}}]}}}}]\n", .{id}) catch unreachable;
+            out.queue.putAll(io, answer) catch return;
+        }
+    }
+};
+
+test "a 2024-11-05 server: its revision taken, a batch from it taken, its requests in one answered as an array" {
+    const io = testing.io;
+    var wiring: Wiring = .{ .to_server = undefined, .from_server = undefined };
+    wiring.init(io);
+    var server: BatchingServer = .{};
+    var task = try io.concurrent(BatchingServer.run, .{ &server, io, &wiring.to_server, &wiring.from_server });
+    defer task.cancel(io);
+    var writer_buffer: [4096]u8 = undefined;
+    var out = PipeWriter.init(&wiring.to_server, &writer_buffer);
+    var channel: stdio.Channel = .init(testing.allocator, &wiring.from_server.reader, &out.writer);
+    var client: Client = .init(testing.allocator, channel.transport(), .{ .info = .{ .name = "c", .version = "1" } });
+    defer client.deinit();
+    try channel.start(io, &client);
+    defer channel.deinit(io);
+
+    try client.connect(io);
+    try testing.expectEqual(Client.Era.session, client.era);
+    try testing.expectEqual(parley.Revision.@"2024-11-05", client.revision);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const called = try client.callTool(io, arena.allocator(), "anything", .{}, null);
+    try testing.expectEqualStrings("batched", called.content[0].text.text);
+    wiring.to_server.close();
+    task.await(io);
+    try testing.expectEqualStrings("[{\"jsonrpc\":\"2.0\",\"id\":900,\"result\":{}}]", server.answer[0..server.answer_len]);
+}
