@@ -44,7 +44,8 @@ pub const ServeError = error{ ReadFailed, WriteFailed, Canceled, OutOfMemory, Co
 /// it: the server's cue to exit) or the task is canceled. Requests still
 /// running then are canceled.
 pub fn serve(io: Io, gpa: Allocator, server: *Server, in: *Io.Reader, out: *Io.Writer, options: Options) ServeError!void {
-    var conn: Connection = .init(io, gpa, server, .lines(out), options);
+    var lines: Out.Lines = .{ .writer = out };
+    var conn: Connection = .init(io, gpa, server, &lines.out, options);
     defer conn.deinit();
     while (true) {
         const job = try Job.create(&conn);
@@ -68,34 +69,36 @@ pub fn serve(io: Io, gpa: Allocator, server: *Server, in: *Io.Reader, out: *Io.W
 }
 
 /// Where a connection's messages go, one whole message at a time: a line
-/// each on stdio (`lines`), an event each on HTTP+SSE.
+/// each on stdio (`Lines`), an event each on HTTP+SSE. A writer embeds one
+/// and finds itself from it by `@fieldParentPtr`.
 pub const Out = struct {
-    context: *anyopaque,
     /// A writer for the next message.
-    beginFn: *const fn (context: *anyopaque) Error!*Io.Writer,
+    beginFn: *const fn (o: *Out) Error!*Io.Writer,
     /// The message written to `beginFn`'s writer is whole: framed, and
     /// flushed.
-    endFn: *const fn (context: *anyopaque) Error!void,
+    endFn: *const fn (o: *Out) Error!void,
     /// Keeps a quiet stream open (a comment, on HTTP+SSE); null where
     /// nothing needs it.
-    keepAliveFn: ?*const fn (context: *anyopaque) Error!void = null,
+    keepAliveFn: ?*const fn (o: *Out) Error!void = null,
 
     pub const Error = error{WriteFailed};
 
-    /// Each message a line on `w`, flushed.
-    pub fn lines(w: *Io.Writer) Out {
-        return .{ .context = w, .beginFn = lineBegin, .endFn = lineEnd };
-    }
+    /// Each message a line on `writer`, flushed.
+    pub const Lines = struct {
+        writer: *Io.Writer,
+        out: Out = .{ .beginFn = lineBegin, .endFn = lineEnd },
 
-    fn lineBegin(context: *anyopaque) Error!*Io.Writer {
-        return @ptrCast(@alignCast(context)); // safe: `lines` made the context from this writer
-    }
+        fn lineBegin(o: *Out) Error!*Io.Writer {
+            const l: *Lines = @fieldParentPtr("out", o);
+            return l.writer;
+        }
 
-    fn lineEnd(context: *anyopaque) Error!void {
-        const w: *Io.Writer = @ptrCast(@alignCast(context)); // safe: `lines` made the context from this writer
-        try w.writeByte('\n');
-        try w.flush();
-    }
+        fn lineEnd(o: *Out) Error!void {
+            const l: *Lines = @fieldParentPtr("out", o);
+            try l.writer.writeByte('\n');
+            try l.writer.flush();
+        }
+    };
 };
 
 /// One client's messages, as they come, answered to `Out`: what `serve`
@@ -105,7 +108,7 @@ pub const Connection = struct {
     io: Io,
     gpa: Allocator,
     server: *Server,
-    out: Out,
+    out: *Out,
     options: Options,
     /// Private: one message at a time on `out`.
     write_mutex: Io.Mutex = .init,
@@ -121,8 +124,10 @@ pub const Connection = struct {
     session: ?*compat.Session = null,
     /// The task writing the session's list changes.
     session_stream: ?Io.Future(Io.Cancelable!void) = null,
+    /// Private: where lines that belong to no request go.
+    target: Sink.Target = .{ .sendFn = sendLine },
 
-    pub fn init(io: Io, gpa: Allocator, server: *Server, out: Out, options: Options) Connection {
+    pub fn init(io: Io, gpa: Allocator, server: *Server, out: *Out, options: Options) Connection {
         return .{ .io = io, .gpa = gpa, .server = server, .out = out, .options = options };
     }
 
@@ -186,7 +191,7 @@ pub const Connection = struct {
         const keep = c.out.keepAliveFn orelse return;
         try c.write_mutex.lock(c.io);
         defer c.write_mutex.unlock(c.io);
-        try keep(c.out.context);
+        try keep(c.out);
     }
 
     const Read = enum { line, empty, too_long, end };
@@ -376,12 +381,12 @@ pub const Connection = struct {
 
     /// Lines that belong to no request.
     fn sink(c: *Connection) Sink {
-        return .{ .context = c, .sendFn = sendLine };
+        return .{ .target = &c.target };
     }
 
-    fn sendLine(context: *anyopaque, io: Io, message: []const u8) Sink.SendError!void {
+    fn sendLine(t: *Sink.Target, io: Io, message: []const u8) Sink.SendError!void {
         _ = io;
-        const c: *Connection = @ptrCast(@alignCast(context)); // safe: the sink was made from this connection
+        const c: *Connection = @fieldParentPtr("target", t);
         c.send(message) catch |err| return switch (err) {
             error.Canceled => error.Canceled,
             error.WriteFailed => error.Closed,
@@ -429,18 +434,18 @@ pub const Connection = struct {
     fn send(c: *Connection, message: []const u8) error{ WriteFailed, Canceled }!void {
         try c.write_mutex.lock(c.io);
         defer c.write_mutex.unlock(c.io);
-        const w = try c.out.beginFn(c.out.context);
+        const w = try c.out.beginFn(c.out);
         try w.writeAll(message);
-        try c.out.endFn(c.out.context);
+        try c.out.endFn(c.out);
     }
 
     /// Writes a request's answer, whole.
     fn sendAnswer(c: *Connection, id: wire.Id, answer: Answer) error{ WriteFailed, Canceled }!void {
         try c.write_mutex.lock(c.io);
         defer c.write_mutex.unlock(c.io);
-        const w = try c.out.beginFn(c.out.context);
+        const w = try c.out.beginFn(c.out);
         try answer.write(w, id);
-        try c.out.endFn(c.out.context);
+        try c.out.endFn(c.out);
     }
 
     fn writeFailure(c: *Connection, id: ?wire.Id, code: wire.Code, message: []const u8) ServeError!void {
@@ -553,6 +558,7 @@ const Job = struct {
     session: ?*compat.Session = null,
     /// The batch the request came in, whose array its answer joins.
     batch: ?*Batch = null,
+    target: Sink.Target = .{ .sendFn = sendFn },
 
     fn create(conn: *Connection) Allocator.Error!*Job {
         const job = try conn.gpa.create(Job);
@@ -666,12 +672,12 @@ const Job = struct {
     }
 
     fn sink(job: *Job) Sink {
-        return .{ .context = job, .sendFn = sendFn, .end = &job.end };
+        return .{ .target = &job.target, .end = &job.end };
     }
 
-    fn sendFn(context: *anyopaque, io: Io, message: []const u8) Sink.SendError!void {
+    fn sendFn(t: *Sink.Target, io: Io, message: []const u8) Sink.SendError!void {
         _ = io;
-        const job: *Job = @ptrCast(@alignCast(context)); // safe: the sink was made from this job
+        const job: *Job = @fieldParentPtr("target", t);
         if (job.canceled.load(.acquire)) return error.Canceled;
         job.conn.send(message) catch |err| return switch (err) {
             error.Canceled => error.Canceled,
@@ -698,6 +704,8 @@ pub const Channel = struct {
     closed: std.atomic.Value(bool) = .init(false),
     /// Private, under `write_mutex`: set by `end`, nothing more is written.
     ended: bool = false,
+    /// Private: the channel as a client's transport (`transport`).
+    transporting: Client.Transport = .{ .vtable = &.{ .request = request, .notify = notify, .opened = opened } },
 
     const Waiter = struct {
         id: wire.Id,
@@ -733,12 +741,14 @@ pub const Channel = struct {
         ch.ended = true;
     }
 
-    pub fn transport(ch: *Channel) Client.Transport {
-        return .{ .context = ch, .vtable = &.{ .request = request, .notify = notify, .opened = opened } };
+    /// The channel as a client's transport, for as long as the channel
+    /// stays where it is.
+    pub fn transport(ch: *Channel) *Client.Transport {
+        return &ch.transporting;
     }
 
-    fn request(context: *anyopaque, io: Io, arena: Allocator, exchange: *Client.Exchange) Client.RequestError![]const u8 {
-        const ch: *Channel = @ptrCast(@alignCast(context)); // safe: the transport was made from this channel
+    fn request(t: *Client.Transport, io: Io, arena: Allocator, exchange: *Client.Exchange) Client.RequestError![]const u8 {
+        const ch: *Channel = @fieldParentPtr("transporting", t);
         if (ch.closed.load(.acquire)) return error.Closed;
         var waiter: Waiter = .{ .id = exchange.id };
         {
@@ -781,12 +791,12 @@ pub const Channel = struct {
         ch.out.flush() catch return error.Closed;
     }
 
-    fn notify(context: *anyopaque, io: Io, message: []const u8) Client.RequestError!void {
-        const ch: *Channel = @ptrCast(@alignCast(context)); // safe: the transport was made from this channel
+    fn notify(t: *Client.Transport, io: Io, message: []const u8) Client.RequestError!void {
+        const ch: *Channel = @fieldParentPtr("transporting", t);
         return ch.write(io, message);
     }
 
-    fn opened(_: *anyopaque, _: Io, _: *Client) Io.ConcurrentError!void {}
+    fn opened(_: *Client.Transport, _: Io, _: *Client) Io.ConcurrentError!void {}
 
     fn retire(ch: *Channel, io: Io, waiter: *Waiter) void {
         ch.mutex.lockUncancelable(io);

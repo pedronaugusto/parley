@@ -95,30 +95,24 @@ const Session = struct {
     /// The event being written, between `begin` and `end`.
     event: sse.EventWriter = undefined,
     buffer: [256]u8 = undefined,
+    /// The connection's messages, an event each.
+    out: parley.stdio.Out = .{ .beginFn = begin, .endFn = end, .keepAliveFn = keepAlive },
 
-    fn out(s: *Session) parley.stdio.Out {
-        return .{ .context = s, .beginFn = begin, .endFn = end, .keepAliveFn = keepAlive };
-    }
-
-    fn of(context: *anyopaque) *Session {
-        return @ptrCast(@alignCast(context)); // safe: `out` made the context from this session
-    }
-
-    fn begin(context: *anyopaque) parley.stdio.Out.Error!*Io.Writer {
-        const s = of(context);
+    fn begin(o: *parley.stdio.Out) parley.stdio.Out.Error!*Io.Writer {
+        const s: *Session = @fieldParentPtr("out", o);
         const w = s.response.writer(s.io) catch return error.WriteFailed;
         s.event = sse.EventWriter.begin(w, &s.buffer, .{ .type = "message" }) catch return error.WriteFailed;
         return &s.event.interface;
     }
 
-    fn end(context: *anyopaque) parley.stdio.Out.Error!void {
-        const s = of(context);
+    fn end(o: *parley.stdio.Out) parley.stdio.Out.Error!void {
+        const s: *Session = @fieldParentPtr("out", o);
         s.event.end() catch return error.WriteFailed;
         s.response.flush(s.io) catch return error.WriteFailed;
     }
 
-    fn keepAlive(context: *anyopaque) parley.stdio.Out.Error!void {
-        const s = of(context);
+    fn keepAlive(o: *parley.stdio.Out) parley.stdio.Out.Error!void {
+        const s: *Session = @fieldParentPtr("out", o);
         const w = s.response.writer(s.io) catch return error.WriteFailed;
         w.writeAll(":\n\n") catch return error.WriteFailed;
         s.response.flush(s.io) catch return error.WriteFailed;
@@ -157,7 +151,7 @@ fn open(e: *SseEndpoint, io: Io, request: *Request, response: *Response) anyerro
         return err;
     };
     session.* = .{ .id = std.fmt.bytesToHex(random, .lower), .io = io, .response = response, .connection = undefined };
-    session.connection = .init(io, e.gpa, e.server, session.out(), e.options.connection);
+    session.connection = .init(io, e.gpa, e.server, &session.out, e.options.connection);
     if (!try e.admit(io, session)) {
         e.gpa.destroy(session);
         return refuse(io, response, .service_unavailable, null, .internal_error, "The server holds as many sessions as it takes");

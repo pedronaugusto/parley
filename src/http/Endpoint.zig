@@ -656,6 +656,7 @@ const Stream = struct {
     events: bool = false,
     /// One event at a time: a batch's requests write to one stream.
     mutex: Io.Mutex = .init,
+    target: parley.Sink.Target = .{ .sendFn = send, .keepAliveFn = keepAliveFn },
 
     fn begin(s: *Stream) Response.Error!*Io.Writer {
         if (!s.events) {
@@ -682,21 +683,16 @@ const Stream = struct {
     }
 
     fn sink(s: *Stream, e: *const Endpoint) parley.Sink {
-        return .{
-            .context = s,
-            .sendFn = send,
-            .keep_alive = e.options.keep_alive.toIoDuration(),
-            .keepAliveFn = keepAliveFn,
-        };
+        return .{ .target = &s.target, .keep_alive = e.options.keep_alive.toIoDuration() };
     }
 
     fn keepAlive(s: *Stream, io: Io) parley.Sink.SendError!void {
-        return keepAliveFn(s, io);
+        return keepAliveFn(&s.target, io);
     }
 
-    fn send(context: *anyopaque, io: Io, message: []const u8) parley.Sink.SendError!void {
+    fn send(t: *parley.Sink.Target, io: Io, message: []const u8) parley.Sink.SendError!void {
         _ = io;
-        const s: *Stream = @ptrCast(@alignCast(context)); // safe: the sink was made from this stream
+        const s: *Stream = @fieldParentPtr("target", t);
         s.event(message) catch |err| return switch (err) {
             error.Canceled => error.Canceled,
             error.OutOfMemory => error.OutOfMemory,
@@ -704,9 +700,9 @@ const Stream = struct {
         };
     }
 
-    fn keepAliveFn(context: *anyopaque, io: Io) parley.Sink.SendError!void {
+    fn keepAliveFn(t: *parley.Sink.Target, io: Io) parley.Sink.SendError!void {
         _ = io;
-        const s: *Stream = @ptrCast(@alignCast(context)); // safe: the sink was made from this stream
+        const s: *Stream = @fieldParentPtr("target", t);
         s.mutex.lock(s.io) catch return error.Canceled;
         defer s.mutex.unlock(s.io);
         const w = s.begin() catch |err| return switch (err) {

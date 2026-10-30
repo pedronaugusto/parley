@@ -31,7 +31,7 @@ pub const Duration = aegis.units.Duration(.millisecond, u32);
 
 gpa: Allocator,
 options: Options,
-transport: Transport,
+transport: *Transport,
 /// Private: what `connect` learned, kept for the client's life.
 arena: std.heap.ArenaAllocator,
 era: Era = .unknown,
@@ -99,36 +99,36 @@ pub const HandlerError = error{ Refused, Canceled, OutOfMemory };
 /// How a request reaches the server and its answer comes back: stdio's
 /// lines, Streamable HTTP's posts. A transport hands every message that
 /// arrives for a request before its answer (a notification, the server's
-/// own request in a session) to `Exchange.inbound`.
+/// own request in a session) to `Exchange.inbound`. A transport embeds one
+/// and finds itself from it by `@fieldParentPtr`.
 pub const Transport = struct {
-    context: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
         /// Sends `exchange.message` and returns the answer, one JSON-RPC
         /// message, on `arena`.
-        request: *const fn (context: *anyopaque, io: Io, arena: Allocator, exchange: *Exchange) RequestError![]const u8,
+        request: *const fn (t: *Transport, io: Io, arena: Allocator, exchange: *Exchange) RequestError![]const u8,
         /// Sends a notification.
-        notify: *const fn (context: *anyopaque, io: Io, message: []const u8) RequestError!void,
+        notify: *const fn (t: *Transport, io: Io, message: []const u8) RequestError!void,
         /// The session was opened (`initialize` answered at
         /// `client.revision`): a transport with a stream of the session's
         /// own (an HTTP GET) opens it, for the server's requests and
         /// notifications that belong to no request. `ConcurrencyUnavailable`
         /// when the `Io` gives no task to read it on: `connect` returns it,
         /// where a session without it would miss what the server sends.
-        opened: *const fn (context: *anyopaque, io: Io, client: *Client) Io.ConcurrentError!void,
+        opened: *const fn (t: *Transport, io: Io, client: *Client) Io.ConcurrentError!void,
         /// A `tools/list` answer, as the application should see it: a
         /// transport that mirrors arguments into headers learns the tools'
         /// marks, and leaves out a tool whose marks it cannot honour.
-        listed: ?*const fn (context: *anyopaque, io: Io, client: *const Client, arena: Allocator, result: []const u8) Allocator.Error![]const u8 = null,
+        listed: ?*const fn (t: *Transport, io: Io, client: *const Client, arena: Allocator, result: []const u8) Allocator.Error![]const u8 = null,
     };
 
-    pub fn request(t: Transport, io: Io, arena: Allocator, exchange: *Exchange) RequestError![]const u8 {
-        return t.vtable.request(t.context, io, arena, exchange);
+    pub fn request(t: *Transport, io: Io, arena: Allocator, exchange: *Exchange) RequestError![]const u8 {
+        return t.vtable.request(t, io, arena, exchange);
     }
 
-    pub fn notify(t: Transport, io: Io, message: []const u8) RequestError!void {
-        return t.vtable.notify(t.context, io, message);
+    pub fn notify(t: *Transport, io: Io, message: []const u8) RequestError!void {
+        return t.vtable.notify(t, io, message);
     }
 };
 
@@ -207,7 +207,7 @@ pub const Replies = struct {
 /// to run on (`Transport.VTable.opened`).
 pub const ConnectError = RequestError || Io.ConcurrentError || error{ Unsupported, Protocol };
 
-pub fn init(gpa: Allocator, transport: Transport, options: Options) Client {
+pub fn init(gpa: Allocator, transport: *Transport, options: Options) Client {
     return .{ .gpa = gpa, .options = options, .transport = transport, .arena = .init(gpa) };
 }
 
@@ -314,7 +314,7 @@ fn openSession(c: *Client, io: Io, arena: Allocator) ConnectError!void {
     c.server_capabilities = r.capabilities.bytes;
     c.server_info = r.serverInfo;
     c.instructions = r.instructions;
-    try c.transport.vtable.opened(c.transport.context, io, c);
+    try c.transport.vtable.opened(c.transport, io, c);
     try c.transport.notify(io, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
 }
 
@@ -677,7 +677,7 @@ pub fn list(c: *Client, io: Io, arena: Allocator, method: []const u8, cursor: ?[
     }
     out.writer.writeByte('}') catch return error.OutOfMemory;
     const result = try c.call(io, arena, method, out.written(), null, null, diagnostics);
-    if (std.mem.eql(u8, method, "tools/list")) if (c.transport.vtable.listed) |f| return f(c.transport.context, io, c, arena, result);
+    if (std.mem.eql(u8, method, "tools/list")) if (c.transport.vtable.listed) |f| return f(c.transport, io, c, arena, result);
     return result;
 }
 

@@ -24,17 +24,23 @@ pub const Context = struct {
 /// an event on the request's HTTP stream. Each is one whole JSON-RPC
 /// message.
 pub const Sink = struct {
-    context: *anyopaque,
-    sendFn: *const fn (context: *anyopaque, io: std.Io, message: []const u8) SendError!void,
+    /// What writes them: the transport's, which embeds it.
+    target: *Target,
     /// A stream that would close when nothing crosses it for a while (an
-    /// HTTP response behind a proxy) is kept open by `keepAliveFn`, every
-    /// `keep_alive`, while a long-lived request has nothing to send.
+    /// HTTP response behind a proxy) is kept open by the target's
+    /// `keepAliveFn`, every `keep_alive`, while a long-lived request has
+    /// nothing to send.
     keep_alive: ?std.Io.Duration = null,
-    keepAliveFn: ?*const fn (context: *anyopaque, io: std.Io) SendError!void = null,
     /// How the transport ends a stream this request opens
     /// (`subscriptions/listen`): its client canceling it, or leaving. Null
     /// for a transport whose streams end only with the server.
     end: ?*End = null,
+
+    /// A transport embeds one and finds itself from it by `@fieldParentPtr`.
+    pub const Target = struct {
+        sendFn: *const fn (t: *Target, io: std.Io, message: []const u8) SendError!void,
+        keepAliveFn: ?*const fn (t: *Target, io: std.Io) SendError!void = null,
+    };
 
     /// The end of one request's stream, which its transport holds.
     pub const End = subscriptions.End;
@@ -43,16 +49,18 @@ pub const Sink = struct {
     pub const SendError = error{ Canceled, Closed, OutOfMemory };
 
     pub fn send(s: Sink, io: std.Io, message: []const u8) SendError!void {
-        return s.sendFn(s.context, io, message);
+        return s.target.sendFn(s.target, io, message);
     }
 
     pub fn keepAlive(s: Sink, io: std.Io) SendError!void {
-        if (s.keepAliveFn) |f| return f(s.context, io);
+        if (s.target.keepAliveFn) |f| return f(s.target, io);
     }
 
     /// A sink that drops everything: for a request whose notifications have
     /// nowhere to go.
-    pub const none: Sink = .{ .context = undefined, .sendFn = drop };
+    pub const none: Sink = .{ .target = &dropped };
 
-    fn drop(_: *anyopaque, _: std.Io, _: []const u8) SendError!void {}
+    var dropped: Target = .{ .sendFn = drop };
+
+    fn drop(_: *Target, _: std.Io, _: []const u8) SendError!void {}
 };
