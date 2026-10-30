@@ -13,6 +13,9 @@ const Allocator = std.mem.Allocator;
 
 /// The document, JSON, owned.
 document: []u8,
+/// Private: the metadata as an uplink handler (`handler`), which finds the
+/// metadata by `@fieldParentPtr`.
+handling: uplink.server.Handler = .{ .handleFn = served },
 
 /// The document for `metadata`: its `resource` this server's MCP URL, its
 /// `authorization_servers` the issuers that grant tokens for it.
@@ -35,9 +38,15 @@ pub fn location(w: *Io.Writer, resource: []const u8) (oauth.url.Error || Io.Writ
     return oauth.url.writeResourceDiscovery(w, resource, .inserted);
 }
 
-/// The document, for a GET at its location.
-pub fn handler(m: *const ResourceMetadata) uplink.server.Handler {
-    return .init(m, serve);
+/// The document, for a GET at its location, for as long as the metadata
+/// stays where it is.
+pub fn handler(m: *ResourceMetadata) *uplink.server.Handler {
+    return &m.handling;
+}
+
+fn served(h: *uplink.server.Handler, io: Io, request: *uplink.server.Request, response: *uplink.server.Response) anyerror!void {
+    const m: *const ResourceMetadata = @alignCast(@fieldParentPtr("handling", h));
+    return serve(m, io, request, response);
 }
 
 fn serve(m: *const ResourceMetadata, io: Io, request: *uplink.server.Request, response: *uplink.server.Response) anyerror!void {

@@ -124,16 +124,17 @@ pub const default_message: aegis.units.Bytes(u32) = .literal("16MiB");
 /// proportions (twice and eight times its input); depth and the sizes of
 /// keys and numbers stay strand's, as no larger message needs more of them.
 pub fn limitsFor(message: aegis.units.Bytes(u32)) strand.core.Limits {
-    const m: usize = message.raw();
+    const bytes = message.convert(usize);
+    const m: usize = bytes.raw();
     const base: strand.core.Limits = .{};
     return .{
-        .input_bytes = m,
-        .output_bytes = m,
-        .string_bytes = m,
+        .input_bytes = bytes,
+        .output_bytes = bytes,
+        .string_bytes = bytes,
         .items = @max(1, m / 2),
         .container_items = @max(1, m / 2),
-        .allocation_bytes = std.math.mul(usize, m, base.allocation_bytes / base.input_bytes) catch std.math.maxInt(usize),
-        .work = std.math.mul(usize, m, base.work / base.input_bytes) catch std.math.maxInt(usize),
+        .allocation_bytes = bytes.mul(base.allocation_bytes.raw() / base.input_bytes.raw()) catch .fromRaw(std.math.maxInt(usize)),
+        .work = std.math.mul(usize, m, base.work / base.input_bytes.raw()) catch std.math.maxInt(usize),
         .depth = base.depth,
         .key_bytes = base.key_bytes,
         .numeric_bytes = base.numeric_bytes,

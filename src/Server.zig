@@ -456,7 +456,7 @@ pub const Content = struct {
         var counter: Writer.Discarding = .init(&buffer);
         try c.write(&counter.writer);
         c.len = std.math.cast(usize, counter.fullCount()) orelse return error.TooLong;
-        if (c.len > s.jsonLimits().output_bytes) return error.TooLong;
+        if (c.len > s.jsonLimits().output_bytes.raw()) return error.TooLong;
         return .{ .content = c };
     }
 
@@ -711,7 +711,7 @@ const Result = struct {
     /// The object made whole (`begin`), ended: past the message limit, refused.
     fn body(r: *Result) BuildError!Body {
         const bytes = r.made.?.written();
-        if (bytes.len > r.limits.output_bytes) return error.TooLong;
+        if (bytes.len > r.limits.output_bytes.raw()) return error.TooLong;
         return .{ .json = bytes };
     }
 };

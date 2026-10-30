@@ -31,6 +31,9 @@ const refuse = guard.refuse;
 gpa: Allocator,
 server: *parley.Server,
 options: Options,
+/// Private: the endpoint as an uplink handler (`handler`), which finds the
+/// endpoint by `@fieldParentPtr`.
+handling: uplink.server.Handler = .{ .handleFn = handled },
 /// Private: the open sessions; `refs` counts who holds each.
 sessions_mutex: Io.Mutex = .init,
 sessions: std.ArrayList(*Session) = .empty,
@@ -69,9 +72,15 @@ pub fn deinit(e: *SseEndpoint) void {
     e.sessions.deinit(e.gpa);
 }
 
-/// The endpoint as an uplink handler.
-pub fn handler(e: *SseEndpoint) uplink.server.Handler {
-    return .init(e, handle);
+/// The endpoint as an uplink handler, for as long as the endpoint stays where
+/// it is.
+pub fn handler(e: *SseEndpoint) *uplink.server.Handler {
+    return &e.handling;
+}
+
+fn handled(h: *uplink.server.Handler, io: Io, request: *Request, response: *Response) anyerror!void {
+    const e: *SseEndpoint = @alignCast(@fieldParentPtr("handling", h));
+    return e.handle(io, request, response);
 }
 
 /// One session: its stream's response, the connection that answers it,

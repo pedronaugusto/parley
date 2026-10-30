@@ -204,7 +204,7 @@ test "every limit grows with the message limit: a value past strand's defaults i
 
 test "the limits of a small message bound nothing its bytes admit" {
     const l = wire.limitsFor(.fromRaw(64));
-    try testing.expectEqual(@as(usize, 64), l.input_bytes);
+    try testing.expectEqual(@as(usize, 64), l.input_bytes.raw());
     try testing.expectEqual(@as(usize, 32), l.items);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();

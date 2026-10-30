@@ -32,6 +32,9 @@ const wire = parley.wire;
 gpa: Allocator,
 server: *parley.Server,
 options: Options,
+/// Private: the endpoint as an uplink handler (`handler`), which finds the
+/// endpoint by `@fieldParentPtr`.
+handling: uplink.server.Handler = .{ .handleFn = handled },
 /// Private: the open sessions, each named by its `Mcp-Session-Id`.
 sessions_mutex: Io.Mutex = .init,
 sessions: std.ArrayList(*Entry) = .empty,
@@ -98,9 +101,15 @@ pub fn deinit(e: *Endpoint) void {
     e.sessions.deinit(e.gpa);
 }
 
-/// The endpoint as an uplink handler.
-pub fn handler(e: *Endpoint) uplink.server.Handler {
-    return .init(e, handle);
+/// The endpoint as an uplink handler, for as long as the endpoint stays where
+/// it is.
+pub fn handler(e: *Endpoint) *uplink.server.Handler {
+    return &e.handling;
+}
+
+fn handled(h: *uplink.server.Handler, io: Io, request: *Request, response: *Response) anyerror!void {
+    const e: *Endpoint = @alignCast(@fieldParentPtr("handling", h));
+    return e.handle(io, request, response);
 }
 
 fn handle(e: *Endpoint, io: Io, request: *Request, response: *Response) anyerror!void {
