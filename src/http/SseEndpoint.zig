@@ -83,6 +83,10 @@ const Session = struct {
     connection: parley.stdio.Connection,
     /// Private, under `sessions_mutex`.
     refs: u32 = 1,
+    /// Set once the stream's first event, which names the session, is
+    /// written: the response is the GET's alone until then, and a POST
+    /// waits for it before anything answers on the stream.
+    opened: Io.Event = .unset,
     /// The event being written, between `begin` and `end`.
     event: sse.EventWriter = undefined,
     buffer: [256]u8 = undefined,
@@ -162,6 +166,8 @@ fn open(e: *SseEndpoint, io: Io, request: *Request, response: *Response) anyerro
         e.forget(io, session);
         session.connection.deinit();
     }
+    // A POST waiting finds the session ended, where its stream never opens.
+    defer session.opened.set(io);
 
     try response.header("Content-Type", "text/event-stream");
     try response.header("Cache-Control", "no-cache");
@@ -170,10 +176,12 @@ fn open(e: *SseEndpoint, io: Io, request: *Request, response: *Response) anyerro
         var endpoint_buffer: [512]u8 = undefined;
         const endpoint = std.mem.print(&endpoint_buffer, "{s}?{s}={s}", .{ request.path, session_parameter, &session.id }) catch
             return refuse(io, response, .uri_too_long, null, .invalid_request, "The endpoint's path is longer than its stream names");
-        // Nothing else writes yet: no POST names the session before this
-        // event does.
+        // Nothing else writes yet: a POST names the session only once the
+        // client has this event, which it may have before the flush
+        // returns, so a POST waits for `opened`.
         try sse.writeEvent(try response.writer(io), .{ .type = "endpoint", .data = endpoint });
         try response.flush(io);
+        session.opened.set(io);
     }
     // The stream is open until the client leaves or the server stops; a
     // quiet one is kept open with a comment.
@@ -206,6 +214,10 @@ fn post(e: *SseEndpoint, io: Io, arena: Allocator, request: *Request, response: 
             return;
         }
     }
+    session.opened.wait(io) catch {
+        e.gpa.free(body);
+        return;
+    };
     session.connection.take(body) catch |err| switch (err) {
         error.Ended => return refuse(io, response, .not_found, null, .invalid_request, "Session not found: its stream has ended"),
         // The stream broke: the session ends with its GET.

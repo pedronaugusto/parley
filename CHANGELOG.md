@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- HTTP+SSE: a POST arriving while its stream's `endpoint` event was still being flushed answered on the stream at the same time as the GET's flush (a data race ThreadSanitizer found); a POST now waits until that event is written.
+
 ## [0.8.0] - 2026-10-28
 
 ### Breaking
