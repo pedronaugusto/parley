@@ -30,6 +30,7 @@ const Provider = struct {
     http: uplink.Server,
     listener: Io.net.Server,
     serving: Io.Future(uplink.Server.ServeError!void),
+    handling: uplink.server.Handler = .{ .handleFn = handled },
     base_buffer: [64]u8 = undefined,
     base: []const u8 = "",
 
@@ -51,7 +52,7 @@ const Provider = struct {
         p.* = .{ .gpa = testing.allocator, .http = undefined, .listener = undefined, .serving = undefined };
         p.listener = try (try Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{ .reuse_address = true });
         p.base = try std.mem.print(&p.base_buffer, "http://127.0.0.1:{d}", .{p.listener.socket.address.getPort()});
-        p.http = .init(testing.allocator, .{}, .init(p, handle));
+        p.http = .init(testing.allocator, .{}, &p.handling);
         p.serving = io.concurrent(uplink.Server.serve, .{ &p.http, io, &p.listener }) catch return error.SkipZigTest;
     }
 
@@ -61,6 +62,11 @@ const Provider = struct {
         p.serving.await(io) catch {};
         p.http.deinit(io);
         p.listener.deinit(io);
+    }
+
+    fn handled(h: *uplink.server.Handler, io: Io, request: *uplink.server.Request, response: *uplink.server.Response) anyerror!void {
+        const p: *Provider = @alignCast(@fieldParentPtr("handling", h));
+        return p.handle(io, request, response);
     }
 
     fn handle(p: *Provider, io: Io, request: *uplink.server.Request, response: *uplink.server.Response) anyerror!void {

@@ -43,7 +43,7 @@ pub fn access(g: *Guard) Endpoint.Access {
 fn check(context: ?*anyopaque, io: Io, arena: Allocator, request: *const uplink.server.Request, message: ?parley.wire.Message) Endpoint.Access.Error!Endpoint.Verdict {
     const g: *const Guard = @ptrCast(@alignCast(context.?)); // safe: `access` makes the context a guard
     const scopes = if (g.needs) |n| try std.mem.concat(arena, []const u8, &.{ g.scopes, try n.scopes(n.context, arena, message) }) else g.scopes;
-    const outcome = g.verifier.check(io, g.web, arena, request.headers.get("Authorization"), scopes) catch |err| return switch (err) {
+    const outcome = g.verifier.check(io, g.web, arena, .{ .authorization = request.headers.get("Authorization") }, scopes) catch |err| return switch (err) {
         error.Unavailable => error.Unavailable,
         error.Canceled => error.Canceled,
         error.OutOfMemory => error.OutOfMemory,

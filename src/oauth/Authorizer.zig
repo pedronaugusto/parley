@@ -84,8 +84,8 @@ pub const Options = struct {
     /// Ask for refresh tokens where the server gives them.
     offline: bool = true,
     /// Where tokens are kept between runs, by the server and resource;
-    /// null: in this process's memory.
-    store: ?oauth.TokenStore = null,
+    /// null: in this process's memory. Outlives the authorizer.
+    store: ?*oauth.TokenStore = null,
     fetch: oauth.fetch.Options = .{},
 };
 
@@ -191,8 +191,8 @@ pub fn authorization(a: *Authorizer) http.Transport.Authorization {
     return .{ .context = a, .vtable = &.{ .credentials = credentials, .refused = refused } };
 }
 
-fn store(a: *Authorizer) oauth.TokenStore {
-    return a.options.store orelse a.memory.store();
+fn store(a: *Authorizer) *oauth.TokenStore {
+    return a.options.store orelse &a.memory.store;
 }
 
 fn credentials(context: *anyopaque, io: Io, arena: Allocator) http.Transport.Authorization.Error!?[]const u8 {
@@ -313,7 +313,7 @@ fn renew(a: *Authorizer, io: Io, arena: Allocator, status: u16, challenges: []co
 fn signIn(a: *Authorizer, io: Io, arena: Allocator, as: *const oauth.metadata.AuthorizationServer, client: oauth.Client, scope: ?[]const u8, resource: []const u8) RenewError!oauth.token.Response {
     const sign_in = a.options.sign_in orelse return error.NoSignIn;
     var url: Io.Writer.Allocating = .init(arena);
-    var flow = try oauth.AuthorizationFlow.begin(io, as, .{
+    var flow = try oauth.AuthorizationFlow.begin(a.gpa, io, as, .{
         .client_id = client.id,
         .redirect_uri = a.options.redirect_uri,
         .scope = scope,
@@ -419,7 +419,7 @@ fn withSecret(method: Method, secret: []const u8) oauth.client_auth.Credentials 
         .client_secret_post => .{ .client_secret_post = secret },
         .client_secret_jwt => .{ .client_secret_jwt = secret },
         // unreachable: a secret's methods are the three above, and none
-        .private_key_jwt => unreachable,
+        .private_key_jwt, .tls_client_auth, .self_signed_tls_client_auth => unreachable,
     };
 }
 

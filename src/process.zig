@@ -188,7 +188,7 @@ pub const Child = struct {
         const file = c.process.stderrFile() orelse unreachable;
         var buffer: [4096]u8 = undefined;
         while (true) {
-            const n = file.readStreaming(io, &.{&buffer}) catch return;
+            const n = file.get().readStreaming(io, &.{&buffer}) catch return;
             if (n == 0) return;
             k.append(io, buffer[0..n]);
         }
