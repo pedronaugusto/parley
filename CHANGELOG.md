@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Mixed operators are parenthesized where Zig master refuses them as ambiguous (`x catch … orelse y`): the parentheses say what Zig 0.17 already did, and nothing changes at runtime.
+
 ## [0.8.0] - 2026-10-28
 
 ### Breaking

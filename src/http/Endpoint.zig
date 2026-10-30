@@ -556,10 +556,10 @@ fn mismatch(e: *Endpoint, io: Io, arena: Allocator, request: *const Request, req
 /// Why the tool's `Mcp-Param-*` headers disagree with its arguments, or
 /// null when they agree (2026-07-28 streamable-http, custom headers).
 fn paramMismatch(e: *Endpoint, io: Io, arena: Allocator, request: *const Request, req: wire.Request, tool: []const u8) Allocator.Error!?[]const u8 {
-    const params = e.server.toolHeaders(io, arena, tool) catch |err| switch (err) {
+    const params = (e.server.toolHeaders(io, arena, tool) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Canceled => return null,
-    } orelse return null;
+    }) orelse return null;
     const limits = e.server.jsonLimits();
     const arguments = rawMember(req.params, "arguments", limits);
     for (params) |p| {

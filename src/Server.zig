@@ -1011,10 +1011,10 @@ const Run = struct {
             error.OutOfMemory => return error.OutOfMemory,
             error.Malformed => unreachable, // unreachable: `serve` read these params before the task was made
         };
-        const p = s.parseParams(types.CallToolParams, a, task.params) catch |err| switch (err) {
+        const p = (s.parseParams(types.CallToolParams, a, task.params) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Canceled => unreachable, // unreachable: parsing does not wait
-        } orelse unreachable; // unreachable: `callTool` parsed these params before the task was made
+        }) orelse unreachable; // unreachable: `callTool` parsed these params before the task was made
         run.arguments = if (p.arguments) |args| args.bytes else null;
         run.context = .{
             .revision = .@"2026-07-28",
