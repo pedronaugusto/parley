@@ -49,8 +49,9 @@ pub const Era = enum { unknown, modern, session };
 pub const Options = struct {
     info: types.Implementation,
     /// What the client answers when a server asks for input. A capability
-    /// is declared only for a handler given.
-    handlers: Handlers = .{},
+    /// is declared only for a handler given. Outlives the client; null:
+    /// none.
+    handlers: ?*Handlers = null,
     /// How long a request may take before it is canceled.
     timeout: Duration = .literal("60s"),
     /// Rounds of input one request may ask for.
@@ -85,12 +86,12 @@ pub fn jsonLimits(c: *const Client) strand.core.Limits {
 }
 
 /// The application's answers to a server's requests for input. Each takes
-/// the request's params as JSON and returns its answer.
+/// the request's params as JSON and returns its answer. Their owner embeds
+/// them and recovers itself with `@fieldParentPtr`.
 pub const Handlers = struct {
-    context: ?*anyopaque = null,
-    elicit: ?*const fn (context: ?*anyopaque, io: Io, arena: Allocator, params: []const u8) HandlerError!types.ElicitResult = null,
-    sample: ?*const fn (context: ?*anyopaque, io: Io, arena: Allocator, params: []const u8) HandlerError!types.CreateMessageResult = null,
-    roots: ?*const fn (context: ?*anyopaque, io: Io, arena: Allocator) HandlerError!types.ListRootsResult = null,
+    elicit: ?*const fn (h: *Handlers, io: Io, arena: Allocator, params: []const u8) HandlerError!types.ElicitResult = null,
+    sample: ?*const fn (h: *Handlers, io: Io, arena: Allocator, params: []const u8) HandlerError!types.CreateMessageResult = null,
+    roots: ?*const fn (h: *Handlers, io: Io, arena: Allocator) HandlerError!types.ListRootsResult = null,
 };
 
 /// `Refused`: the application will not give what was asked.
@@ -319,11 +320,12 @@ fn openSession(c: *Client, io: Io, arena: Allocator) ConnectError!void {
 }
 
 fn writeCapabilities(c: *const Client, w: *Writer) Writer.Error!void {
-    const h = c.options.handlers;
     var caps: types.ClientCapabilities = .{};
-    if (h.roots != null) caps.roots = .{ .bytes = "{}" };
-    if (h.sample != null) caps.sampling = .{};
-    if (h.elicit != null) caps.elicitation = .{ .form = .{ .bytes = "{}" } };
+    if (c.options.handlers) |h| {
+        if (h.roots != null) caps.roots = .{ .bytes = "{}" };
+        if (h.sample != null) caps.sampling = .{};
+        if (h.elicit != null) caps.elicitation = .{ .form = .{ .bytes = "{}" } };
+    }
     if (c.options.tasks and c.revision.stateless()) caps.extensions = .{ .bytes = "{\"" ++ tasks_extension ++ "\":{}}" };
     strand.json.write(w, caps, types.writeOptions(c.jsonLimits())) catch return error.WriteFailed;
 }
@@ -384,18 +386,21 @@ pub fn serveRequest(c: *Client, io: Io, arena: Allocator, request: wire.Request)
     const result: (HandlerError || error{ MethodNotFound, WriteFailed })![]const u8 = blk: {
         if (std.mem.eql(u8, request.method, "ping")) break :blk "{}";
         if (std.mem.eql(u8, request.method, "elicitation/create")) {
-            const f = c.options.handlers.elicit orelse break :blk error.MethodNotFound;
-            var answer = f(c.options.handlers.context, io, arena, params) catch |err| break :blk err;
+            const h = c.options.handlers orelse break :blk error.MethodNotFound;
+            const f = h.elicit orelse break :blk error.MethodNotFound;
+            var answer = f(h, io, arena, params) catch |err| break :blk err;
             if (answer.action == .accept) answer.content = .{ .bytes = withDefaults(arena, c.jsonLimits(), params, if (answer.content) |r| r.bytes else "{}") catch |err| break :blk err };
             break :blk encode(arena, c.jsonLimits(), answer);
         }
         if (std.mem.eql(u8, request.method, "sampling/createMessage")) {
-            const f = c.options.handlers.sample orelse break :blk error.MethodNotFound;
-            break :blk encode(arena, c.jsonLimits(), f(c.options.handlers.context, io, arena, params) catch |err| break :blk err);
+            const h = c.options.handlers orelse break :blk error.MethodNotFound;
+            const f = h.sample orelse break :blk error.MethodNotFound;
+            break :blk encode(arena, c.jsonLimits(), f(h, io, arena, params) catch |err| break :blk err);
         }
         if (std.mem.eql(u8, request.method, "roots/list")) {
-            const f = c.options.handlers.roots orelse break :blk error.MethodNotFound;
-            break :blk encode(arena, c.jsonLimits(), f(c.options.handlers.context, io, arena) catch |err| break :blk err);
+            const h = c.options.handlers orelse break :blk error.MethodNotFound;
+            const f = h.roots orelse break :blk error.MethodNotFound;
+            break :blk encode(arena, c.jsonLimits(), f(h, io, arena) catch |err| break :blk err);
         }
         break :blk error.MethodNotFound;
     };

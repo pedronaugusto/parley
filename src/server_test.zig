@@ -15,13 +15,14 @@ const Recorder = struct {
     gpa: std.mem.Allocator,
     messages: std.ArrayList([]u8) = .empty,
     mutex: std.Io.Mutex = .init,
+    target: parley.Sink.Target = .{ .sendFn = send },
 
     fn sink(r: *Recorder) parley.Sink {
-        return .{ .context = r, .sendFn = send };
+        return .{ .target = &r.target };
     }
 
-    fn send(context: *anyopaque, io: std.Io, message: []const u8) parley.Sink.SendError!void {
-        const r: *Recorder = @ptrCast(@alignCast(context));
+    fn send(t: *parley.Sink.Target, io: std.Io, message: []const u8) parley.Sink.SendError!void {
+        const r: *Recorder = @alignCast(@fieldParentPtr("target", t));
         r.mutex.lockUncancelable(io);
         defer r.mutex.unlock(io);
         r.messages.append(r.gpa, r.gpa.dupe(u8, message) catch return error.OutOfMemory) catch return error.OutOfMemory;
@@ -80,13 +81,16 @@ fn sampleIt(call: *Call) Call.Error!parley.ToolResult {
     return .ofText("sampled");
 }
 
-fn readStatic(_: ?*anyopaque, call: *Call, uri: []const u8) Call.Error!parley.ReadResult {
+var read_static: parley.ReadHandler = .{ .readFn = readStatic };
+var read_item: parley.ReadHandler = .{ .readFn = readItem };
+
+fn readStatic(_: *parley.ReadHandler, call: *Call, uri: []const u8) Call.Error!parley.ReadResult {
     const contents = try call.arena.alloc(parley.types.ResourceContents, 1);
     contents[0] = .{ .uri = uri, .mime_type = "text/plain", .text = "static" };
     return .{ .contents = contents };
 }
 
-fn readItem(_: ?*anyopaque, call: *Call, uri: []const u8) Call.Error!parley.ReadResult {
+fn readItem(_: *parley.ReadHandler, call: *Call, uri: []const u8) Call.Error!parley.ReadResult {
     const contents = try call.arena.alloc(parley.types.ResourceContents, 1);
     contents[0] = .{ .uri = uri, .text = uri["test://items/".len..] };
     return .{ .contents = contents };
@@ -111,8 +115,8 @@ fn newServer(io: std.Io) !Server {
     try s.addTool(io, .{ .name = "broken" }, broken);
     try s.addTool(io, .{ .name = "greet" }, greet);
     try s.addTool(io, .{ .name = "sample" }, sampleIt);
-    try s.addResource(io, .{ .uri = "test://static", .name = "static" }, .{ .read = readStatic });
-    try s.addTemplate(io, .{ .uri_template = "test://items/{id}", .name = "item" }, .{ .read = readItem });
+    try s.addResource(io, .{ .uri = "test://static", .name = "static" }, &read_static);
+    try s.addTemplate(io, .{ .uri_template = "test://items/{id}", .name = "item" }, &read_item);
     try s.addPrompt(io, .{ .name = "review" }, review);
     return s;
 }

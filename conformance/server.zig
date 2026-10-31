@@ -311,25 +311,25 @@ const json_schema_2020_12 =
     \\{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","$defs":{"address":{"$anchor":"addressDef","type":"object","properties":{"street":{"type":"string"},"city":{"type":"string"}}}},"properties":{"name":{"type":"string"},"address":{"$ref":"#/$defs/address"},"contactMethod":{"type":"string","enum":["phone","email"]},"phone":{"type":"string"},"email":{"type":"string"}},"allOf":[{"anyOf":[{"required":["phone"]},{"required":["email"]}]}],"if":{"properties":{"contactMethod":{"const":"phone"}},"required":["contactMethod"]},"then":{"required":["phone"]},"else":{"required":["email"]},"additionalProperties":false}
 ;
 
-fn jsonSchemaTool(_: ?*anyopaque, _: *Call, arguments: ?[]const u8) Call.Error!ToolResult {
+fn jsonSchemaTool(_: *parley.ToolHandler, _: *Call, arguments: ?[]const u8) Call.Error!ToolResult {
     return .ofText(arguments orelse "{}");
 }
 
 // Resources.
 
-fn staticText(_: ?*anyopaque, call: *Call, uri: []const u8) Call.Error!parley.ReadResult {
+fn staticText(_: *parley.ReadHandler, call: *Call, uri: []const u8) Call.Error!parley.ReadResult {
     return .{ .contents = try call.arena.dupe(types.ResourceContents, &.{.{ .uri = uri, .mime_type = "text/plain", .text = "This is the content of the static text resource." }}) };
 }
 
-fn staticBinary(_: ?*anyopaque, call: *Call, uri: []const u8) Call.Error!parley.ReadResult {
+fn staticBinary(_: *parley.ReadHandler, call: *Call, uri: []const u8) Call.Error!parley.ReadResult {
     return .{ .contents = try call.arena.dupe(types.ResourceContents, &.{.{ .uri = uri, .mime_type = "image/png", .blob = image }}) };
 }
 
-fn watched(_: ?*anyopaque, call: *Call, uri: []const u8) Call.Error!parley.ReadResult {
+fn watched(_: *parley.ReadHandler, call: *Call, uri: []const u8) Call.Error!parley.ReadResult {
     return .{ .contents = try call.arena.dupe(types.ResourceContents, &.{.{ .uri = uri, .mime_type = "text/plain", .text = "Watched resource content" }}) };
 }
 
-fn templated(_: ?*anyopaque, call: *Call, uri: []const u8) Call.Error!parley.ReadResult {
+fn templated(_: *parley.ReadHandler, call: *Call, uri: []const u8) Call.Error!parley.ReadResult {
     const prefix = "test://template/";
     const id = uri[prefix.len .. uri.len - "/data".len];
     const body = try call.arena.print("{{\"id\":\"{s}\",\"templateTest\":true,\"data\":\"Data for ID: {s}\"}}", .{ id, id });
@@ -372,7 +372,7 @@ fn promptInputRequired(call: *Call) Call.Error!parley.PromptResult {
     return .{ .messages = try call.arena.dupe(types.PromptMessage, &.{.{ .role = .user, .content = .ofText(t) }}) };
 }
 
-fn complete(_: ?*anyopaque, _: *Call, _: types.CompleteParams) Call.Error!types.Completion {
+fn complete(_: *parley.Server.Completer, _: *Call, _: types.CompleteParams) Call.Error!types.Completion {
     return .{ .values = &.{}, .total = 0, .has_more = false };
 }
 
@@ -477,10 +477,11 @@ pub fn main(init: std.process.Init) !void {
     try server.addTool(io, .{ .name = "test_elicitation", .description = "Tests server-initiated elicitation (user input request)" }, elicitation);
     try server.addTool(io, .{ .name = "test_elicitation_sep1034_defaults", .description = "Tests elicitation with default values per SEP-1034" }, elicitDefaults);
     try server.addTool(io, .{ .name = "test_elicitation_sep1330_enums", .description = "Tests elicitation with enum schema improvements per SEP-1330" }, elicitEnums);
-    try server.addDynamicTool(io, .{ .name = "json_schema_2020_12_tool", .description = "Tool with JSON Schema 2020-12 features", .input_schema = json_schema_2020_12 }, .{ .call = jsonSchemaTool });
+    var json_schema_tool: parley.ToolHandler = .{ .callFn = jsonSchemaTool };
+    try server.addDynamicTool(io, .{ .name = "json_schema_2020_12_tool", .description = "Tool with JSON Schema 2020-12 features", .input_schema = json_schema_2020_12 }, &json_schema_tool);
     try server.addDynamicTool(io, .{ .name = "test_custom_headers", .description = "Mirrors its region into a header (x-mcp-header)", .input_schema =
         \\{"type":"object","properties":{"region":{"type":"string","description":"The region to run in","x-mcp-header":"Region"},"query":{"type":"string"}},"required":["region"]}
-    }, .{ .call = jsonSchemaTool });
+    }, &json_schema_tool);
     try server.addTool(io, .{ .name = "test_missing_capability", .description = "Test tool requiring sampling" }, missingCapability);
     try server.addTool(io, .{ .name = "test_input_required_result_elicitation", .description = "MRTR: returns InputRequiredResult with elicitation request" }, mrtrElicitation);
     try server.addTool(io, .{ .name = "test_input_required_result_sampling", .description = "MRTR: returns InputRequiredResult with sampling request" }, mrtrSampling);
@@ -502,10 +503,14 @@ pub fn main(init: std.process.Init) !void {
     try server.addTool(io, .{ .name = "multi_input", .description = "Asks for two values at once as a task", .task = .required }, multiInput);
     try server.addTool(io, .{ .name = "test_tool_with_task", .description = "Asks for a name, then runs as a task", .task = .required }, toolWithTask);
 
-    try server.addResource(io, .{ .uri = "test://static-text", .name = "static-text", .title = "Static Text Resource", .description = "A static text resource for testing", .mime_type = "text/plain" }, .{ .read = staticText });
-    try server.addResource(io, .{ .uri = "test://static-binary", .name = "static-binary", .title = "Static Binary Resource", .description = "A static binary resource (image) for testing", .mime_type = "image/png" }, .{ .read = staticBinary });
-    try server.addResource(io, .{ .uri = "test://watched-resource", .name = "watched-resource", .title = "Watched Resource", .description = "A resource that auto-updates every 3 seconds", .mime_type = "text/plain" }, .{ .read = watched });
-    try server.addTemplate(io, .{ .uri_template = "test://template/{id}/data", .name = "template", .title = "Resource Template", .description = "A resource template with parameter substitution", .mime_type = "application/json" }, .{ .read = templated });
+    var static_text: parley.ReadHandler = .{ .readFn = staticText };
+    var static_binary: parley.ReadHandler = .{ .readFn = staticBinary };
+    var watched_resource: parley.ReadHandler = .{ .readFn = watched };
+    var template: parley.ReadHandler = .{ .readFn = templated };
+    try server.addResource(io, .{ .uri = "test://static-text", .name = "static-text", .title = "Static Text Resource", .description = "A static text resource for testing", .mime_type = "text/plain" }, &static_text);
+    try server.addResource(io, .{ .uri = "test://static-binary", .name = "static-binary", .title = "Static Binary Resource", .description = "A static binary resource (image) for testing", .mime_type = "image/png" }, &static_binary);
+    try server.addResource(io, .{ .uri = "test://watched-resource", .name = "watched-resource", .title = "Watched Resource", .description = "A resource that auto-updates every 3 seconds", .mime_type = "text/plain" }, &watched_resource);
+    try server.addTemplate(io, .{ .uri_template = "test://template/{id}/data", .name = "template", .title = "Resource Template", .description = "A resource template with parameter substitution", .mime_type = "application/json" }, &template);
 
     try server.addPrompt(io, .{ .name = "test_simple_prompt", .title = "Simple Test Prompt", .description = "A simple prompt without arguments" }, simplePrompt);
     try server.addPrompt(io, .{ .name = "test_prompt_with_arguments", .title = "Prompt With Arguments", .description = "A prompt with required arguments", .arguments = &.{
@@ -517,7 +522,8 @@ pub fn main(init: std.process.Init) !void {
     } }, promptWithEmbeddedResource);
     try server.addPrompt(io, .{ .name = "test_prompt_with_image", .title = "Prompt With Image", .description = "A prompt that includes image content" }, promptWithImage);
     try server.addPrompt(io, .{ .name = "test_input_required_result_prompt", .description = "MRTR: prompt that requires elicitation input" }, promptInputRequired);
-    server.setCompleter(.{ .complete = complete });
+    var completer: parley.Server.Completer = .{ .completeFn = complete };
+    server.setCompleter(&completer);
 
     var endpoint: http.Endpoint = .init(gpa, &server, .{});
     defer endpoint.deinit();

@@ -40,7 +40,7 @@ tools: std.ArrayList(*registry.Tool) = .empty,
 resources: std.ArrayList(*registry.Resource) = .empty,
 templates: std.ArrayList(*registry.Template) = .empty,
 prompts: std.ArrayList(*registry.Prompt) = .empty,
-completer: ?Completer = null,
+completer: ?*Completer = null,
 /// Private: bumped when a list changes, so a cursor into an older list is
 /// refused rather than read against the new one.
 generations: std.EnumArray(List, u32) = .initFill(0),
@@ -67,8 +67,9 @@ pub const Options = struct {
     logging: bool = true,
     /// Whether every 2026-07-28 result names the server in its `_meta`.
     identify: bool = true,
-    /// Decides per request what a client may see and use.
-    filter: ?Filter = null,
+    /// Decides per request what a client may see and use. Outlives the
+    /// server.
+    filter: ?*Filter = null,
     /// Serve the tasks extension (`io.modelcontextprotocol/tasks`): a tool
     /// call may run as a task the client polls. Null: not served.
     tasks: ?tasks.Options = null,
@@ -130,18 +131,27 @@ pub const Offers = struct {
 /// The four lists a server keeps.
 pub const List = enum { tools, resources, templates, prompts };
 
+/// What a request may see and use. Its owner embeds it and recovers itself
+/// with `@fieldParentPtr`.
 pub const Filter = struct {
-    context: ?*anyopaque = null,
     /// Whether the request may see and use the item of `list` named `name`
     /// (a tool or prompt name, a resource URI or template). A list a filter
     /// shapes is private to its caller.
-    admit: *const fn (context: ?*anyopaque, request: *const Context, which: List, name: []const u8) bool,
+    admitFn: *const fn (f: *Filter, request: *const Context, which: List, name: []const u8) bool,
+
+    pub fn admit(f: *Filter, request: *const Context, which: List, name: []const u8) bool {
+        return f.admitFn(f, request, which, name);
+    }
 };
 
-/// Completes an argument of a prompt or a resource template.
+/// Completes an argument of a prompt or a resource template. Its owner
+/// embeds it and recovers itself with `@fieldParentPtr`.
 pub const Completer = struct {
-    context: ?*anyopaque = null,
-    complete: *const fn (context: ?*anyopaque, call: *Call, request: types.CompleteParams) Call.Error!types.Completion,
+    completeFn: *const fn (c: *Completer, call: *Call, request: types.CompleteParams) Call.Error!types.Completion,
+
+    pub fn complete(c: *Completer, call: *Call, request: types.CompleteParams) Call.Error!types.Completion {
+        return c.completeFn(c, call, request);
+    }
 };
 
 pub const InitError = Allocator.Error || Io.RandomSecureError;
@@ -217,11 +227,11 @@ pub fn addTool(s: *Server, io: Io, spec: registry.ToolSpec, comptime handler: an
 
 /// Adds a tool with a handler that takes its arguments as JSON; `spec`
 /// must give its input schema.
-pub fn addDynamicTool(s: *Server, io: Io, spec: registry.ToolSpec, handler: registry.ToolHandler) AddError!void {
+pub fn addDynamicTool(s: *Server, io: Io, spec: registry.ToolSpec, handler: *registry.ToolHandler) AddError!void {
     return s.addToolWith(io, spec, spec.input_schema orelse return error.InvalidSchema, spec.output_schema, handler);
 }
 
-fn addToolWith(s: *Server, io: Io, spec: registry.ToolSpec, input: []const u8, output: ?[]const u8, handler: registry.ToolHandler) AddError!void {
+fn addToolWith(s: *Server, io: Io, spec: registry.ToolSpec, input: []const u8, output: ?[]const u8, handler: *registry.ToolHandler) AddError!void {
     if (spec.task != .forbidden and s.options.tasks == null) return error.TasksNotServed;
     const tool = try s.gpa.create(registry.Tool);
     errdefer s.gpa.destroy(tool);
@@ -258,7 +268,7 @@ pub fn removeTool(s: *Server, io: Io, name: []const u8) Io.Cancelable!bool {
 }
 
 /// Adds a resource read by `read`.
-pub fn addResource(s: *Server, io: Io, spec: registry.ResourceSpec, handler: registry.ReadHandler) AddError!void {
+pub fn addResource(s: *Server, io: Io, spec: registry.ResourceSpec, handler: *registry.ReadHandler) AddError!void {
     const resource = try s.gpa.create(registry.Resource);
     errdefer s.gpa.destroy(resource);
     const uri = try s.gpa.dupe(u8, spec.uri);
@@ -275,7 +285,7 @@ pub fn removeResource(s: *Server, io: Io, uri: []const u8) Io.Cancelable!bool {
 
 /// Adds a resource template: a URI that matches it (RFC 6570, `{name}` a
 /// segment, `{+name}` anything) is read by `read`.
-pub fn addTemplate(s: *Server, io: Io, spec: registry.TemplateSpec, handler: registry.ReadHandler) AddError!void {
+pub fn addTemplate(s: *Server, io: Io, spec: registry.TemplateSpec, handler: *registry.ReadHandler) AddError!void {
     const template = try s.gpa.create(registry.Template);
     errdefer s.gpa.destroy(template);
     const pattern = try s.gpa.dupe(u8, spec.uri_template);
@@ -294,11 +304,11 @@ pub fn addPrompt(s: *Server, io: Io, spec: registry.PromptSpec, comptime handler
 }
 
 /// Adds a prompt whose handler takes its arguments as JSON.
-pub fn addDynamicPrompt(s: *Server, io: Io, spec: registry.PromptSpec, handler: registry.PromptHandler) AddError!void {
+pub fn addDynamicPrompt(s: *Server, io: Io, spec: registry.PromptSpec, handler: *registry.PromptHandler) AddError!void {
     return s.addPromptWith(io, spec, spec.arguments orelse &.{}, handler);
 }
 
-fn addPromptWith(s: *Server, io: Io, spec: registry.PromptSpec, arguments: []const types.PromptArgument, handler: registry.PromptHandler) AddError!void {
+fn addPromptWith(s: *Server, io: Io, spec: registry.PromptSpec, arguments: []const types.PromptArgument, handler: *registry.PromptHandler) AddError!void {
     const prompt = try s.gpa.create(registry.Prompt);
     errdefer s.gpa.destroy(prompt);
     const name = try s.gpa.dupe(u8, spec.name);
@@ -319,8 +329,9 @@ pub fn removePrompt(s: *Server, io: Io, name: []const u8) Io.Cancelable!bool {
     return s.remove(io, .prompts, &s.prompts, name);
 }
 
-/// Completes prompt and template arguments with `completer`.
-pub fn setCompleter(s: *Server, completer: Completer) void {
+/// Completes prompt and template arguments with `completer`, which
+/// outlives the server.
+pub fn setCompleter(s: *Server, completer: *Completer) void {
     s.completer = completer;
 }
 
@@ -761,7 +772,7 @@ fn discover(s: *Server, arena: Allocator, context: *const Context) BuildError!Re
 
 fn admitted(s: *const Server, context: *const Context, which: List, name: []const u8) bool {
     const f = s.options.filter orelse return true;
-    return f.admit(f.context, context, which, name);
+    return f.admit(context, which, name);
 }
 
 fn parseParams(s: *const Server, comptime T: type, arena: Allocator, params: ?[]const u8) HandleError!?T {
@@ -942,7 +953,7 @@ fn callTool(s: *Server, io: Io, arena: Allocator, request: wire.Request, context
     };
     if (task_support != .forbidden and tasks_declared) return s.callAsTask(io, arena, request, context, sink, handler, p.name, r);
     var call = s.newCall(io, arena, request, context, sink, r);
-    const returned = handler.call(handler.context, &call, if (p.arguments) |a| a.bytes else null);
+    const returned = handler.call(&call, if (p.arguments) |a| a.bytes else null);
     return s.answerTool(io, arena, &call, returned, request.method, p.name, context.revision);
 }
 
@@ -971,7 +982,7 @@ fn missingTasks() Reply {
 const Run = struct {
     server: *Server,
     task: *tasks.Task,
-    handler: registry.ToolHandler,
+    handler: *registry.ToolHandler,
     arena: std.heap.ArenaAllocator,
     context: Context,
     call: Call,
@@ -988,9 +999,11 @@ const Run = struct {
     /// Who holds the round: the round itself, and the call waiting on it.
     /// The last to let go frees it.
     holders: std.atomic.Value(u8),
+    /// How the call becomes a task: the call's `task`.
+    hook: Call.TaskHook = .{ .becomeFn = become },
 
     /// A round over `task`'s call, with the answers and state given.
-    fn create(s: *Server, task: *tasks.Task, handler: registry.ToolHandler, attached: bool, id: wire.Id, sink: Sink, responses: ?[]const u8, state_in: ?[]const u8) Allocator.Error!*Run {
+    fn create(s: *Server, task: *tasks.Task, handler: *registry.ToolHandler, attached: bool, id: wire.Id, sink: Sink, responses: ?[]const u8, state_in: ?[]const u8) Allocator.Error!*Run {
         const run = try s.gpa.create(Run);
         errdefer s.gpa.destroy(run);
         run.* = .{
@@ -1039,7 +1052,7 @@ const Run = struct {
             .limits = s.jsonLimits(),
             .responses = if (responses) |r| try a.dupe(u8, r) else null,
             .state_in = if (state_in) |st| try a.dupe(u8, st) else null,
-            .task = .{ .context = run, .become = become },
+            .task = &run.hook,
         };
         return run;
     }
@@ -1053,7 +1066,7 @@ const Run = struct {
     }
 };
 
-fn callAsTask(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink, handler: registry.ToolHandler, name: []const u8, r: Round) BuildError!Reply {
+fn callAsTask(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink, handler: *registry.ToolHandler, name: []const u8, r: Round) BuildError!Reply {
     const table = &s.task_table.?;
     const task = table.create(context.principal, request.params orelse "{}", now(io)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -1114,8 +1127,8 @@ fn now(io: Io) i64 {
 
 /// `Call.runAsTask` for a round: the task is held, and the waiting call
 /// answers with it.
-fn become(context: *anyopaque) Call.Error!bool {
-    const run: *Run = @ptrCast(@alignCast(context)); // safe: the hook was made from this round
+fn become(hook: *Call.TaskHook) Call.Error!bool {
+    const run: *Run = @alignCast(@fieldParentPtr("hook", hook));
     if (!run.attached) return true;
     if (!run.may_detach) return false;
     const s = run.server;
@@ -1166,7 +1179,7 @@ fn answerRound(run: *Run) Call.Error!registry.ToolResult {
 }
 
 fn callHandler(run: *Run) Call.Error!registry.ToolResult {
-    return run.handler.call(run.handler.context, &run.call, run.arguments);
+    return run.handler.call(&run.call, run.arguments);
 }
 
 fn waitCancel(event: *Io.Event, io: Io) Io.Cancelable!void {
@@ -1276,7 +1289,7 @@ fn recordOutcome(s: *Server, table: *tasks.Table, run: *Run, returned: Call.Erro
 
 /// Starts a round of `task`'s handler with `responses` (its `inputResponses`)
 /// and `state`; one that cannot start ends the task failed.
-fn startRound(s: *Server, task: *tasks.Task, handler: registry.ToolHandler, responses: ?[]const u8, state_in: ?[]const u8) void {
+fn startRound(s: *Server, task: *tasks.Task, handler: *registry.ToolHandler, responses: ?[]const u8, state_in: ?[]const u8) void {
     const table = &s.task_table.?;
     const run = Run.create(s, task, handler, false, .{ .string = &task.id }, .none, responses, state_in) catch {
         table.mutex.lockUncancelable(table.io);
@@ -1303,7 +1316,7 @@ fn taskRequest(s: *Server, io: Io, arena: Allocator, request: wire.Request, cont
     };
     var next: ?[]const u8 = null;
     var changed = false;
-    var handler: ?registry.ToolHandler = null;
+    var handler: ?*registry.ToolHandler = null;
     var task: *tasks.Task = undefined;
     var id: tasks.Id = undefined;
     {
@@ -1367,7 +1380,7 @@ fn taskJson(s: *Server, io: Io, arena: Allocator, id: []const u8, principal: ?[]
 }
 
 /// The handler of the tool `task` calls, or null when it is gone.
-fn toolOf(s: *Server, io: Io, task: *const tasks.Task) (Allocator.Error || Io.Cancelable)!?registry.ToolHandler {
+fn toolOf(s: *Server, io: Io, task: *const tasks.Task) (Allocator.Error || Io.Cancelable)!?*registry.ToolHandler {
     var scratch: std.heap.ArenaAllocator = .init(s.gpa);
     defer scratch.deinit();
     const p = (s.parseParams(types.CallToolParams, scratch.allocator(), task.params) catch |err| switch (err) {
@@ -1404,7 +1417,7 @@ fn readResource(s: *Server, io: Io, arena: Allocator, request: wire.Request, con
         .refused => |reply| return reply,
     };
     var call = s.newCall(io, arena, request, context, sink, r);
-    const result = handler.read(handler.context, &call, p.uri) catch |err| switch (err) {
+    const result = handler.read(&call, p.uri) catch |err| switch (err) {
         error.NotFound => return try notFound(arena, context.revision, p.uri),
         else => |e| return s.outcome(io, arena, &call, e, request.method, p.uri),
     };
@@ -1480,7 +1493,7 @@ fn getPrompt(s: *Server, io: Io, arena: Allocator, request: wire.Request, contex
         .refused => |reply| return reply,
     };
     var call = s.newCall(io, arena, request, context, sink, r);
-    const result = handler.get(handler.context, &call, if (p.arguments) |a| a.bytes else null) catch |err|
+    const result = handler.get(&call, if (p.arguments) |a| a.bytes else null) catch |err|
         return s.outcome(io, arena, &call, err, request.method, p.name);
     var out: Result = .begin(s, arena, context.revision);
     if (result.description) |d| try out.field("description", d);
@@ -1500,7 +1513,7 @@ fn complete(s: *Server, io: Io, arena: Allocator, request: wire.Request, context
     const completer = s.completer orelse return failure(.method_not_found, "Method not found");
     const p = try s.parseParams(types.CompleteParams, arena, request.params) orelse return failure(.invalid_params, "params are not what the schema says");
     var call = s.newCall(io, arena, request, context, sink, .{ .responses = null, .state = null });
-    const completion: types.Completion = completer.complete(completer.context, &call, p) catch |err| switch (err) {
+    const completion: types.Completion = completer.complete(&call, p) catch |err| switch (err) {
         error.NotFound => return failure(.invalid_params, "nothing to complete there"),
         else => |e| return s.outcome(io, arena, &call, e, request.method, ""),
     };

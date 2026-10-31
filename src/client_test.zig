@@ -27,7 +27,7 @@ fn greet(call: *Call) Call.Error!parley.ToolResult {
     return .ofText(answer.content.?.bytes);
 }
 
-fn answerName(_: ?*anyopaque, _: Io, _: std.mem.Allocator, params: []const u8) Client.HandlerError!parley.types.ElicitResult {
+fn answerName(_: *Client.Handlers, _: Io, _: std.mem.Allocator, params: []const u8) Client.HandlerError!parley.types.ElicitResult {
     if (std.mem.find(u8, params, "Who are you?") == null) return error.Refused;
     return .{ .action = .accept, .content = .{ .bytes = "{\"name\":\"ada\"}" } };
 }
@@ -65,9 +65,10 @@ test "a 2026-07-28 server: discovered, listed, called, input given across rounds
     var writer_buffer: [4096]u8 = undefined;
     var out = PipeWriter.init(&wiring.to_server, &writer_buffer);
     var channel: stdio.Channel = .init(testing.allocator, &wiring.from_server.reader, &out.writer);
+    var answers: Client.Handlers = .{ .elicit = answerName };
     var client: Client = .init(testing.allocator, channel.transport(), .{
         .info = .{ .name = "c", .version = "1" },
-        .handlers = .{ .elicit = answerName },
+        .handlers = &answers,
     });
     defer client.deinit();
     try channel.start(io, &client);
@@ -126,9 +127,10 @@ test "a call the server runs as a task: polled, its input given, answered as if 
     var writer_buffer: [4096]u8 = undefined;
     var out = PipeWriter.init(&wiring.to_server, &writer_buffer);
     var channel: stdio.Channel = .init(testing.allocator, &wiring.from_server.reader, &out.writer);
+    var answers: Client.Handlers = .{ .elicit = answerName };
     var client: Client = .init(testing.allocator, channel.transport(), .{
         .info = .{ .name = "c", .version = "1" },
-        .handlers = .{ .elicit = answerName },
+        .handlers = &answers,
     });
     defer client.deinit();
     try channel.start(io, &client);

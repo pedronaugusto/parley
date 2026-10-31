@@ -49,8 +49,8 @@ pub const Options = struct {
     /// a client gone from one is noticed.
     keep_alive: parley.Server.Duration = .literal("15s"),
     /// As `Endpoint.Options.access`: the GET is held to it, and each message
-    /// POSTed.
-    access: ?guard.Access = null,
+    /// POSTed. Outlives the endpoint.
+    access: ?*guard.Access = null,
     /// Sessions open at once: a GET past it is refused (503), as each holds
     /// a stream.
     max_sessions: u32 = 1024,

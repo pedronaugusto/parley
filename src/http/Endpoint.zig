@@ -70,8 +70,8 @@ pub const Options = struct {
     /// How often a quiet event stream is kept open with a comment.
     keep_alive: parley.Server.Duration = .literal("15s"),
     /// Who may send a request, and who sent it; null: anyone, and nobody
-    /// is told apart.
-    access: ?Access = null,
+    /// is told apart. Outlives the endpoint.
+    access: ?*Access = null,
     /// Sessions (2025-11-25 and before) open at once; the one idle longest
     /// is ended to make room.
     max_sessions: u32 = 1024,

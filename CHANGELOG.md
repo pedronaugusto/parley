@@ -6,6 +6,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Breaking
+
+- Every interface is embedded: its owner holds it as a field and recovers itself with `@fieldParentPtr`, where a `context: *anyopaque` was cast back. The interface's functions take a pointer to it, an option or a call takes that pointer, and the owner gives it from an accessor (`Stream.sink`, `Channel.transport`, `http.Transport.transport`, `oauth.Authorizer.authorization`, `oauth.Guard.access`). So it goes for `Sink` (its `Target`), `stdio.Out`, `Client.Transport`, `Client.Handlers` (`Client.Options.handlers` is `?*Handlers`), `http.Transport.Authorization`, `http.Endpoint.Access` (`access: ?*Access`), `oauth.Guard.Needs`, `oauth.Authorizer.TokenSource` and `SignIn` (the options hold pointers), `Server.Filter`, `Server.Completer` (`setCompleter(*Completer)`), `Call.TaskHook`, and `ToolHandler`, `ReadHandler` and `PromptHandler` (`addDynamicTool`, `addResource`, `addTemplate` and `addDynamicPrompt` take a pointer the server keeps; `typedTool` and `typedPrompt` give one that lives as long as the program). Each function is named for what it does with `Fn` after it (`sendFn`, `checkFn`, `callFn`), and a method of the same name calls it.
+- The endpoints' uplink `Handler`s are embedded the same way, as uplink's `Server.init` takes `*Handler`.
+
 ### Changed
 
 - Mixed operators are parenthesized where Zig master refuses them as ambiguous (`x catch … orelse y`): the parentheses say what Zig 0.17 already did, and nothing changes at runtime.

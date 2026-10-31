@@ -11,16 +11,21 @@ const Request = uplink.server.Request;
 const Response = uplink.server.Response;
 const wire = parley.wire;
 
+/// Who may send a request. Its owner embeds it and recovers itself with
+/// `@fieldParentPtr`.
 pub const Access = struct {
-    context: ?*anyopaque = null,
     /// Whether `request` may be served, and for whom. `message` is what its
     /// body holds (null for a GET or a DELETE), for an access whose needs
     /// depend on the method or the tool. What it returns lives in `arena`.
-    check: *const fn (context: ?*anyopaque, io: Io, arena: Allocator, request: *const Request, message: ?wire.Message) Error!Verdict,
+    checkFn: *const fn (a: *Access, io: Io, arena: Allocator, request: *const Request, message: ?wire.Message) Error!Verdict,
 
     /// `Unavailable`: what checks credentials could not answer (an
     /// authorization server down): a 503.
     pub const Error = error{ Unavailable, Canceled, OutOfMemory };
+
+    pub fn check(a: *Access, io: Io, arena: Allocator, request: *const Request, message: ?wire.Message) Error!Verdict {
+        return a.checkFn(a, io, arena, request, message);
+    }
 };
 
 pub const Verdict = union(enum) {
@@ -82,9 +87,9 @@ pub const Admitted = struct { principal: ?[]const u8 };
 
 /// Holds `request` to `access`: who sent it, or null when it is refused
 /// (the refusal written).
-pub fn checkAccess(access_: ?Access, io: Io, arena: Allocator, request: *const Request, response: *Response, message: ?wire.Message) anyerror!?Admitted {
+pub fn checkAccess(access_: ?*Access, io: Io, arena: Allocator, request: *const Request, response: *Response, message: ?wire.Message) anyerror!?Admitted {
     const access = access_ orelse return .{ .principal = null };
-    const verdict = access.check(access.context, io, arena, request, message) catch |err| switch (err) {
+    const verdict = access.check(io, arena, request, message) catch |err| switch (err) {
         error.Unavailable => {
             try refuse(io, response, .service_unavailable, null, .internal_error, "The server cannot check credentials now");
             return null;

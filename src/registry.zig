@@ -61,17 +61,21 @@ pub const TaskSupport = enum {
 };
 
 /// A handler whose types are erased: `arguments` is the call's arguments
-/// object as written, or null.
+/// object as written, or null. Its owner embeds it and recovers itself
+/// with `@fieldParentPtr`.
 pub const ToolHandler = struct {
-    context: ?*anyopaque = null,
-    call: *const fn (context: ?*anyopaque, call: *Call, arguments: ?[]const u8) Call.Error!ToolResult,
+    callFn: *const fn (h: *ToolHandler, call: *Call, arguments: ?[]const u8) Call.Error!ToolResult,
+
+    pub fn call(h: *ToolHandler, c: *Call, arguments: ?[]const u8) Call.Error!ToolResult {
+        return h.callFn(h, c, arguments);
+    }
 };
 
 pub const Tool = struct {
     name: []const u8,
     /// The `Tool` object, as `tools/list` writes it.
     listed: []const u8,
-    handler: ToolHandler,
+    handler: *ToolHandler,
     /// The arguments its schema mirrors into `Mcp-Param-{name}` headers.
     headers: []const HeaderParam = &.{},
     task: TaskSupport = .forbidden,
@@ -225,22 +229,27 @@ pub const ReadResult = struct {
     contents: []const types.ResourceContents,
 };
 
+/// Reads a resource. Its owner embeds it and recovers itself with
+/// `@fieldParentPtr`.
 pub const ReadHandler = struct {
-    context: ?*anyopaque = null,
     /// `uri` is the URI asked for, which a template matched.
-    read: *const fn (context: ?*anyopaque, call: *Call, uri: []const u8) Call.Error!ReadResult,
+    readFn: *const fn (h: *ReadHandler, call: *Call, uri: []const u8) Call.Error!ReadResult,
+
+    pub fn read(h: *ReadHandler, call: *Call, uri: []const u8) Call.Error!ReadResult {
+        return h.readFn(h, call, uri);
+    }
 };
 
 pub const Resource = struct {
     uri: []const u8,
     listed: []const u8,
-    handler: ReadHandler,
+    handler: *ReadHandler,
 };
 
 pub const Template = struct {
     uri_template: []const u8,
     listed: []const u8,
-    handler: ReadHandler,
+    handler: *ReadHandler,
 };
 
 pub const PromptSpec = struct {
@@ -258,10 +267,15 @@ pub const PromptResult = struct {
     messages: []const types.PromptMessage,
 };
 
+/// Gets a prompt. Its owner embeds it and recovers itself with
+/// `@fieldParentPtr`.
 pub const PromptHandler = struct {
-    context: ?*anyopaque = null,
     /// `arguments` is the request's arguments object (names to strings), or null.
-    get: *const fn (context: ?*anyopaque, call: *Call, arguments: ?[]const u8) Call.Error!PromptResult,
+    getFn: *const fn (h: *PromptHandler, call: *Call, arguments: ?[]const u8) Call.Error!PromptResult,
+
+    pub fn get(h: *PromptHandler, call: *Call, arguments: ?[]const u8) Call.Error!PromptResult {
+        return h.getFn(h, call, arguments);
+    }
 };
 
 pub const Prompt = struct {
@@ -269,7 +283,7 @@ pub const Prompt = struct {
     listed: []const u8,
     /// The names of the arguments that must be given.
     required: []const []const u8,
-    handler: PromptHandler,
+    handler: *PromptHandler,
 };
 
 /// `Tool` JSON for `spec`, on `gpa`.
@@ -391,11 +405,14 @@ pub fn Signature(comptime handler: anytype) type {
 /// `handler` as a `ToolHandler`: its arguments decoded with strand (a
 /// decode failure is an execution error naming the field, which the model
 /// can correct), its result turned into a `ToolResult`, and any error of its
-/// own an execution error naming it.
-pub fn typedTool(comptime handler: anytype) ToolHandler {
+/// own an execution error naming it. One handler per function, for the
+/// program's life.
+pub fn typedTool(comptime handler: anytype) *ToolHandler {
     const S = Signature(handler);
     const Erased = struct {
-        fn call(_: ?*anyopaque, c: *Call, arguments: ?[]const u8) Call.Error!ToolResult {
+        var erased: ToolHandler = .{ .callFn = call };
+
+        fn call(_: *ToolHandler, c: *Call, arguments: ?[]const u8) Call.Error!ToolResult {
             const out = if (S.Args == void)
                 handler(c)
             else blk: {
@@ -413,7 +430,7 @@ pub fn typedTool(comptime handler: anytype) ToolHandler {
             return toolResult(c.arena, c.limits, value);
         }
     };
-    return .{ .call = Erased.call };
+    return &Erased.erased;
 }
 
 fn invalidArguments(arena: Allocator, err: anyerror, diagnostics: *const strand.core.Diagnostics) Allocator.Error![]const u8 {
@@ -469,11 +486,14 @@ pub fn promptArguments(comptime Args: type) []const types.PromptArgument {
     }
 }
 
-/// `handler` as a `PromptHandler`, its arguments decoded with strand.
-pub fn typedPrompt(comptime handler: anytype) PromptHandler {
+/// `handler` as a `PromptHandler`, its arguments decoded with strand. One
+/// handler per function, for the program's life.
+pub fn typedPrompt(comptime handler: anytype) *PromptHandler {
     const S = Signature(handler);
     const Erased = struct {
-        fn get(_: ?*anyopaque, c: *Call, arguments: ?[]const u8) Call.Error!PromptResult {
+        var erased: PromptHandler = .{ .getFn = getPrompt };
+
+        fn getPrompt(_: *PromptHandler, c: *Call, arguments: ?[]const u8) Call.Error!PromptResult {
             const out = if (S.Args == void) handler(c) else blk: {
                 const args = strand.json.parseLeaky(S.Args, c.arena, arguments orelse "{}", types.readOptions(c.limits)) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
@@ -484,7 +504,7 @@ pub fn typedPrompt(comptime handler: anytype) PromptHandler {
             return out catch |err| ownError(err);
         }
     };
-    return .{ .get = Erased.get };
+    return &Erased.erased;
 }
 
 /// A handler's error: the core's pass through; any of its own is

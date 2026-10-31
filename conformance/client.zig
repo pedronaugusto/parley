@@ -30,12 +30,18 @@ const Raw = strand.json.Raw;
 /// limit the default.
 const read_options = types.readOptions(parley.wire.limitsFor(parley.wire.default_message));
 
+/// The client's answers to the server's requests, as the scenario asks.
+const Answers = struct {
+    scenario: []const u8,
+    handlers: parley.Client.Handlers = .{ .elicit = elicit, .sample = sample, .roots = roots },
+};
+
 /// Accepts every form, filling each field the schema gives no default with
 /// a value of its type (the client fills the defaults itself).
-fn elicit(context: ?*anyopaque, _: Io, arena: Allocator, params: []const u8) parley.Client.HandlerError!types.ElicitResult {
-    const scenario: *const []const u8 = @ptrCast(@alignCast(context.?)); // safe: main passes its scenario's name
+fn elicit(h: *parley.Client.Handlers, _: Io, arena: Allocator, params: []const u8) parley.Client.HandlerError!types.ElicitResult {
+    const answers: *Answers = @alignCast(@fieldParentPtr("handlers", h));
     // Defaults are the client's to apply: the user answered nothing.
-    if (std.mem.find(u8, scenario.*, "defaults") != null) return .{ .action = .accept, .content = .{ .bytes = "{}" } };
+    if (std.mem.find(u8, answers.scenario, "defaults") != null) return .{ .action = .accept, .content = .{ .bytes = "{}" } };
     const Form = struct { requestedSchema: struct { properties: ?Raw = null } = .{} };
     const form = strand.json.parseLeaky(Form, arena, params, read_options) catch return .{ .action = .accept, .content = .{ .bytes = "{}" } };
     var out: Io.Writer.Allocating = .init(arena);
@@ -60,20 +66,25 @@ fn elicit(context: ?*anyopaque, _: Io, arena: Allocator, params: []const u8) par
     return .{ .action = .accept, .content = .{ .bytes = out.written() } };
 }
 
-fn sample(_: ?*anyopaque, _: Io, _: Allocator, _: []const u8) parley.Client.HandlerError!types.CreateMessageResult {
+fn sample(_: *parley.Client.Handlers, _: Io, _: Allocator, _: []const u8) parley.Client.HandlerError!types.CreateMessageResult {
     return .{ .role = .assistant, .content = .{ .bytes = "{\"type\":\"text\",\"text\":\"Paris\"}" }, .model = "parley-conformance", .stop_reason = "endTurn" };
 }
 
-fn roots(_: ?*anyopaque, _: Io, _: Allocator) parley.Client.HandlerError!types.ListRootsResult {
+fn roots(_: *parley.Client.Handlers, _: Io, _: Allocator) parley.Client.HandlerError!types.ListRootsResult {
     return .{ .roots = &.{} };
 }
 
 /// Signs in as the suite's authorization server lets a program: the
 /// authorization URL answers with a redirect to the redirect URI, code and
 /// all, which is read and not followed.
-fn signIn(context: ?*anyopaque, io: Io, arena: Allocator, url: []const u8) oauth.Authorizer.SignInError![]const u8 {
-    const web: *uplink.Client = @ptrCast(@alignCast(context.?)); // safe: main passes its uplink client
-    var response = web.send(io, .{ .url = url, .redirects = .none }) catch |err| return switch (err) {
+const Browser = struct {
+    web: *uplink.Client,
+    sign_in: oauth.Authorizer.SignIn = .{ .openFn = signIn },
+};
+
+fn signIn(s: *oauth.Authorizer.SignIn, io: Io, arena: Allocator, url: []const u8) oauth.Authorizer.SignInError![]const u8 {
+    const browser: *Browser = @alignCast(@fieldParentPtr("sign_in", s));
+    var response = browser.web.send(io, .{ .url = url, .redirects = .none }) catch |err| return switch (err) {
         error.Canceled => error.Canceled,
         error.OutOfMemory => error.OutOfMemory,
         else => error.Declined,
@@ -105,9 +116,14 @@ const Registration = struct {
 };
 
 /// A token the context gave, as the authorizer asks for one.
-fn given(context: ?*anyopaque, _: Io, _: Allocator) oauth.Authorizer.SourceError![]const u8 {
-    const token: *const []const u8 = @ptrCast(@alignCast(context.?)); // safe: main passes a token from the context
-    return token.*;
+const Given = struct {
+    token: []const u8,
+    source: oauth.Authorizer.TokenSource = .{ .getFn = given },
+};
+
+fn given(s: *oauth.Authorizer.TokenSource, _: Io, _: Allocator) oauth.Authorizer.SourceError![]const u8 {
+    const g: *Given = @alignCast(@fieldParentPtr("source", s));
+    return g.token;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -137,17 +153,26 @@ pub fn main(init: std.process.Init) !void {
         }
         credentials = &registered;
     }
+    var id_token: Given = .{ .token = "" };
     var enterprise: ?oauth.Authorizer.Enterprise = null;
-    if (registration.idp_issuer) |issuer| enterprise = .{
-        .issuer = issuer,
-        .token_endpoint = registration.idp_token_endpoint,
-        .client = .{ .issuer = issuer, .client_id = registration.idp_client_id orelse return error.NoIdpClient },
-        .subject = .{ .context = @ptrCast(@constCast(&registration.idp_id_token.?)), .get = given }, // safe: given casts it back to this type
-    };
-    var assertion: ?oauth.Authorizer.TokenSource = null;
-    if (registration.valid_jwt) |*jwt| assertion = .{ .context = @ptrCast(@constCast(jwt)), .get = given }; // safe: given casts it back to this type
+    if (registration.idp_issuer) |issuer| {
+        id_token.token = registration.idp_id_token orelse return error.NoIdToken;
+        enterprise = .{
+            .issuer = issuer,
+            .token_endpoint = registration.idp_token_endpoint,
+            .client = .{ .issuer = issuer, .client_id = registration.idp_client_id orelse return error.NoIdpClient },
+            .subject = &id_token.source,
+        };
+    }
+    var workload: Given = .{ .token = "" };
+    var assertion: ?*oauth.Authorizer.TokenSource = null;
+    if (registration.valid_jwt) |jwt| {
+        workload.token = jwt;
+        assertion = &workload.source;
+    }
+    var browser: Browser = .{ .web = &web };
     var authorizer: oauth.Authorizer = .init(gpa, &web, url, .{
-        .sign_in = .{ .context = &web, .open = signIn },
+        .sign_in = &browser.sign_in,
         .redirect_uri = "http://localhost:3000/callback",
         .client_name = "parley-conformance-client",
         .metadata_url = metadata_url,
@@ -167,10 +192,11 @@ pub fn main(init: std.process.Init) !void {
     // alone, as the suite asks.
     const asked: ?parley.Revision = if (init.environ_map.get("MCP_CONFORMANCE_PROTOCOL_VERSION")) |v| parley.Revision.named(v) else null;
     const only = [1]parley.Revision{asked orelse .@"2026-07-28"};
+    var answers: Answers = .{ .scenario = scenario };
     var client: parley.Client = .init(gpa, remote.transport(), .{
         .info = .{ .name = "parley-conformance-client", .version = "1.0.0" },
         .revisions = if (asked != null) &only else &.{ .@"2026-07-28", .@"2025-11-25", .@"2025-06-18" },
-        .handlers = .{ .context = @ptrCast(@constCast(&scenario)), .elicit = elicit, .sample = sample, .roots = roots }, // safe: elicit casts it back to this type
+        .handlers = &answers.handlers,
     });
     defer client.deinit();
     try client.connect(io);

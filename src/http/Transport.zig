@@ -38,6 +38,8 @@ client: ?*Client = null,
 /// Private: the tools' `x-mcp-header` marks, from the last `tools/list`.
 marks_mutex: Io.Mutex = .init,
 marks: std.ArrayList(Marked) = .empty,
+/// Private: the transport the client holds, `transport()`.
+transporting: Client.Transport = .{ .vtable = &.{ .request = request, .notify = notify, .opened = opened, .listed = listedFn } },
 
 const Marked = struct {
     tool: []u8,
@@ -46,14 +48,14 @@ const Marked = struct {
 
 pub const Options = struct {
     /// The requests' credentials, and what answers a server that refuses
-    /// them; null: requests carry none.
-    authorization: ?Authorization = null,
+    /// them, which outlives the transport; null: requests carry none.
+    authorization: ?*Authorization = null,
 };
 
 /// Where a request's credentials come from, and what a refusal of them is
-/// handed to.
+/// handed to. Its owner embeds it and recovers itself with
+/// `@fieldParentPtr`.
 pub const Authorization = struct {
-    context: *anyopaque,
     vtable: *const VTable,
 
     pub const Error = error{ Canceled, OutOfMemory };
@@ -62,20 +64,20 @@ pub const Authorization = struct {
         /// The `Authorization` value to send, on `arena`; null when there
         /// is none yet (the first request goes without, and its refusal
         /// says where to get one).
-        credentials: *const fn (context: *anyopaque, io: Io, arena: Allocator) Error!?[]const u8,
+        credentials: *const fn (a: *Authorization, io: Io, arena: Allocator) Error!?[]const u8,
         /// The server answered `status` (401 or 403) with these
         /// `WWW-Authenticate` values to a request sent with `sent`: true
         /// when there are better credentials now, and the request is sent
         /// again; false leaves the refusal as the answer.
-        refused: *const fn (context: *anyopaque, io: Io, sent: ?[]const u8, status: u16, challenges: []const []const u8) Error!bool,
+        refused: *const fn (a: *Authorization, io: Io, sent: ?[]const u8, status: u16, challenges: []const []const u8) Error!bool,
     };
 
-    pub fn credentials(a: Authorization, io: Io, arena: Allocator) Error!?[]const u8 {
-        return a.vtable.credentials(a.context, io, arena);
+    pub fn credentials(a: *Authorization, io: Io, arena: Allocator) Error!?[]const u8 {
+        return a.vtable.credentials(a, io, arena);
     }
 
-    pub fn refused(a: Authorization, io: Io, sent: ?[]const u8, status: u16, challenges: []const []const u8) Error!bool {
-        return a.vtable.refused(a.context, io, sent, status, challenges);
+    pub fn refused(a: *Authorization, io: Io, sent: ?[]const u8, status: u16, challenges: []const []const u8) Error!bool {
+        return a.vtable.refused(a, io, sent, status, challenges);
     }
 };
 
@@ -135,19 +137,20 @@ fn free(t: *Transport, m: Marked) void {
     parley.registry.freeHeaderParams(t.gpa, m.params);
 }
 
-pub fn transport(t: *Transport) Client.Transport {
-    return .{ .context = t, .vtable = &.{ .request = request, .notify = notify, .opened = opened, .listed = listedFn } };
+/// The transport as a client's. The transport must outlive the client.
+pub fn transport(t: *Transport) *Client.Transport {
+    return &t.transporting;
 }
 
-fn listedFn(context: *anyopaque, io: Io, client: *const Client, arena: Allocator, result: []const u8) Allocator.Error![]const u8 {
-    const t: *Transport = @ptrCast(@alignCast(context)); // safe: the transport was made from this one
+fn listedFn(ct: *Client.Transport, io: Io, client: *const Client, arena: Allocator, result: []const u8) Allocator.Error![]const u8 {
+    const t: *Transport = @alignCast(@fieldParentPtr("transporting", ct));
     return t.listed(io, client.jsonLimits(), arena, result);
 }
 
 /// Opens the session's GET stream, where a session server sends what
 /// belongs to no request; a server that has none answers 405.
-fn opened(context: *anyopaque, io: Io, client: *Client) Io.ConcurrentError!void {
-    const t: *Transport = @ptrCast(@alignCast(context)); // safe: the transport was made from this one
+fn opened(ct: *Client.Transport, io: Io, client: *Client) Io.ConcurrentError!void {
+    const t: *Transport = @alignCast(@fieldParentPtr("transporting", ct));
     t.client = client;
     t.stream = try io.concurrent(sessionStream, .{ t, io });
 }
@@ -242,8 +245,8 @@ pub fn listed(t: *Transport, io: Io, limits: strand.core.Limits, arena: Allocato
     return out.written();
 }
 
-fn request(context: *anyopaque, io: Io, arena: Allocator, exchange: *Client.Exchange) Client.RequestError![]const u8 {
-    const t: *Transport = @ptrCast(@alignCast(context)); // safe: the transport was made from this one
+fn request(ct: *Client.Transport, io: Io, arena: Allocator, exchange: *Client.Exchange) Client.RequestError![]const u8 {
+    const t: *Transport = @alignCast(@fieldParentPtr("transporting", ct));
     var fields: std.ArrayList(std.http.Header) = .empty;
     try fields.appendSlice(arena, &.{
         .{ .name = "Content-Type", .value = "application/json" },
@@ -364,8 +367,8 @@ fn postAnswer(t: *Transport, io: Io, arena: Allocator, revision: parley.Revision
     response.deinit(io);
 }
 
-fn notify(context: *anyopaque, io: Io, message: []const u8) Client.RequestError!void {
-    const t: *Transport = @ptrCast(@alignCast(context)); // safe: the transport was made from this one
+fn notify(ct: *Client.Transport, io: Io, message: []const u8) Client.RequestError!void {
+    const t: *Transport = @alignCast(@fieldParentPtr("transporting", ct));
     var arena: std.heap.ArenaAllocator = .init(t.gpa);
     defer arena.deinit();
     var fields: std.ArrayList(std.http.Header) = .empty;

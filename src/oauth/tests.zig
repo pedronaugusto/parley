@@ -252,7 +252,9 @@ fn write(_: *parley.Call) error{}![]const u8 {
 }
 
 /// `write` needs `mcp:write` beyond what every request needs.
-fn needs(_: ?*anyopaque, _: std.mem.Allocator, message: ?parley.wire.Message) std.mem.Allocator.Error![]const []const u8 {
+var write_needs: Guard.Needs = .{ .scopesFn = needs };
+
+fn needs(_: *Guard.Needs, _: std.mem.Allocator, message: ?parley.wire.Message) std.mem.Allocator.Error![]const []const u8 {
     const m = message orelse return &.{};
     if (m != .request or !std.mem.eql(u8, m.request.method, "tools/call")) return &.{};
     if (std.mem.find(u8, m.request.params orelse "", "\"name\":\"write\"") == null) return &.{};
@@ -261,9 +263,14 @@ fn needs(_: ?*anyopaque, _: std.mem.Allocator, message: ?parley.wire.Message) st
 
 /// Signs in as a browser would, without one: the authorization URL's
 /// redirect read, not followed.
-fn signIn(context: ?*anyopaque, io: Io, arena: std.mem.Allocator, url: []const u8) Authorizer.SignInError![]const u8 {
-    const web: *uplink.Client = @ptrCast(@alignCast(context.?)); // safe: the test passes its client
-    var response = web.send(io, .{ .url = url, .redirects = .none }) catch |err| return switch (err) {
+const Browser = struct {
+    web: *uplink.Client,
+    sign_in: Authorizer.SignIn = .{ .openFn = signIn },
+};
+
+fn signIn(s: *Authorizer.SignIn, io: Io, arena: std.mem.Allocator, url: []const u8) Authorizer.SignInError![]const u8 {
+    const browser: *Browser = @alignCast(@fieldParentPtr("sign_in", s));
+    var response = browser.web.send(io, .{ .url = url, .redirects = .none }) catch |err| return switch (err) {
         error.Canceled => error.Canceled,
         error.OutOfMemory => error.OutOfMemory,
         else => error.Declined,
@@ -313,7 +320,7 @@ const Guarded = struct {
             .resource = g.url,
             .resource_metadata = g.location,
         };
-        g.guard = .{ .verifier = &g.verifier, .web = web, .scopes = &.{"mcp:read"}, .needs = .{ .scopes = needs } };
+        g.guard = .{ .verifier = &g.verifier, .web = web, .scopes = &.{"mcp:read"}, .needs = &write_needs };
         g.endpoint = .init(gpa, &g.core, .{ .access = g.guard.access() });
         errdefer g.endpoint.deinit();
         g.router = .init(gpa);
@@ -354,8 +361,9 @@ test "a client signs in when the server asks, and steps up for a tool that needs
     const url = mcp.url;
 
     // The client: no token at first, a sign-in on the first 401.
+    var browser: Browser = .{ .web = &web };
     var authorizer: Authorizer = .init(gpa, &web, url, .{
-        .sign_in = .{ .context = &web, .open = signIn },
+        .sign_in = &browser.sign_in,
         .client_name = "parley-test",
     });
     defer authorizer.deinit();
@@ -390,13 +398,19 @@ test "a client signs in when the server asks, and steps up for a tool that needs
     provider.mutex.unlock(io);
 }
 
-fn idToken(_: ?*anyopaque, _: Io, _: std.mem.Allocator) Authorizer.SourceError![]const u8 {
+fn idToken(_: *Authorizer.TokenSource, _: Io, _: std.mem.Allocator) Authorizer.SourceError![]const u8 {
     return "id-token-u1";
 }
 
-fn workloadToken(context: ?*anyopaque, _: Io, _: std.mem.Allocator) Authorizer.SourceError![]const u8 {
-    const token: *const []const u8 = @ptrCast(@alignCast(context.?)); // safe: the test passes its token
-    return token.*;
+/// A workload's token, as its platform gives it.
+const Workload = struct {
+    token: []const u8,
+    source: Authorizer.TokenSource = .{ .getFn = workloadToken },
+};
+
+fn workloadToken(s: *Authorizer.TokenSource, _: Io, _: std.mem.Allocator) Authorizer.SourceError![]const u8 {
+    const w: *Workload = @alignCast(@fieldParentPtr("source", s));
+    return w.token;
 }
 
 test "enterprise-managed authorization: no sign-in; the identity provider's ID-JAG redeemed, again for a step-up" {
@@ -414,6 +428,7 @@ test "enterprise-managed authorization: no sign-in; the identity provider's ID-J
     var issuer_buffer: [96]u8 = undefined;
     const idp = try std.mem.print(&issuer_buffer, "{s}/idp", .{provider.base});
     var endpoint_buffer: [96]u8 = undefined;
+    var id_token: Authorizer.TokenSource = .{ .getFn = idToken };
     var authorizer: Authorizer = .init(gpa, &web, mcp.url, .{
         .client_name = "parley-test",
         .grant = .enterprise,
@@ -422,7 +437,7 @@ test "enterprise-managed authorization: no sign-in; the identity provider's ID-J
             .issuer = idp,
             .token_endpoint = try std.mem.print(&endpoint_buffer, "{s}/token", .{idp}),
             .client = .{ .issuer = idp, .client_id = "idp-app" },
-            .subject = .{ .get = idToken },
+            .subject = &id_token,
         },
     });
     defer authorizer.deinit();
@@ -462,11 +477,11 @@ test "a workload's token as the grant: no client, no sign-in" {
     var workload: std.Io.Writer.Allocating = .init(gpa);
     defer workload.deinit();
     try signTyped(gpa, io, &workload.writer, "JWT", .{ .iss = "https://platform.example", .sub = "agent", .aud = provider.base, .exp = now + 600 });
-    const token = workload.written();
+    var source: Workload = .{ .token = workload.written() };
     var authorizer: Authorizer = .init(gpa, &web, mcp.url, .{
         .client_name = "parley-test",
         .grant = .jwt_bearer,
-        .assertion = .{ .context = @ptrCast(@constCast(&token)), .get = workloadToken }, // safe: workloadToken casts it back to this type
+        .assertion = &source.source,
     });
     defer authorizer.deinit();
     var remote: http.Transport = .init(gpa, &web, mcp.url, .{ .authorization = authorizer.authorization() });

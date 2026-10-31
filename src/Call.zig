@@ -51,12 +51,12 @@ missing: ?types.InputKind = null,
 /// Private: the last progress sent, which every next one must pass.
 progress_sent: ?f64 = null,
 /// Private: how the call becomes a task, when it may.
-task: ?TaskHook = null,
+task: ?*TaskHook = null,
 
 /// How a call becomes a task: given by the server for a call that may.
+/// Its owner embeds it and recovers itself with `@fieldParentPtr`.
 pub const TaskHook = struct {
-    context: *anyopaque,
-    become: *const fn (context: *anyopaque) Error!bool,
+    becomeFn: *const fn (h: *TaskHook) Error!bool,
 };
 
 /// What a handler fails with, beside its own errors.
@@ -127,7 +127,7 @@ pub fn roots(call: *Call, key: []const u8) Error!?types.ListRootsResult {
 /// would. Input gathered before is the request's own rounds.
 pub fn runAsTask(call: *Call) Error!bool {
     const hook = call.task orelse return false;
-    return hook.become(hook.context);
+    return hook.becomeFn(hook);
 }
 
 /// The bytes the handler kept in the round before, or null in the first.

@@ -25,24 +25,32 @@ web: *uplink.Client,
 /// The scopes every request needs.
 scopes: []const []const u8 = &.{},
 /// The scopes a request needs beyond those, by what it asks; null: none.
-needs: ?Needs = null,
+/// Outlives the guard.
+needs: ?*Needs = null,
+/// Private: the guard as an endpoint's, `access()`.
+checking: Endpoint.Access = .{ .checkFn = check },
 
+/// The scopes a request needs by what it asks. Its owner embeds it and
+/// recovers itself with `@fieldParentPtr`.
 pub const Needs = struct {
-    context: ?*anyopaque = null,
     /// The scopes `message` needs beyond the guard's own (a tool that
     /// writes, a method), on `arena`. `message` is null for a GET or a
     /// DELETE.
-    scopes: *const fn (context: ?*anyopaque, arena: Allocator, message: ?parley.wire.Message) Allocator.Error![]const []const u8,
+    scopesFn: *const fn (n: *Needs, arena: Allocator, message: ?parley.wire.Message) Allocator.Error![]const []const u8,
+
+    pub fn scopes(n: *Needs, arena: Allocator, message: ?parley.wire.Message) Allocator.Error![]const []const u8 {
+        return n.scopesFn(n, arena, message);
+    }
 };
 
 /// The guard as an endpoint's `access`. The guard must outlive the endpoint.
-pub fn access(g: *Guard) Endpoint.Access {
-    return .{ .context = g, .check = check };
+pub fn access(g: *Guard) *Endpoint.Access {
+    return &g.checking;
 }
 
-fn check(context: ?*anyopaque, io: Io, arena: Allocator, request: *const uplink.server.Request, message: ?parley.wire.Message) Endpoint.Access.Error!Endpoint.Verdict {
-    const g: *const Guard = @ptrCast(@alignCast(context.?)); // safe: `access` makes the context a guard
-    const scopes = if (g.needs) |n| try std.mem.concat(arena, []const u8, &.{ g.scopes, try n.scopes(n.context, arena, message) }) else g.scopes;
+fn check(a: *Endpoint.Access, io: Io, arena: Allocator, request: *const uplink.server.Request, message: ?parley.wire.Message) Endpoint.Access.Error!Endpoint.Verdict {
+    const g: *const Guard = @alignCast(@fieldParentPtr("checking", a));
+    const scopes = if (g.needs) |n| try std.mem.concat(arena, []const u8, &.{ g.scopes, try n.scopes(arena, message) }) else g.scopes;
     const outcome = g.verifier.check(io, g.web, arena, .{ .authorization = request.headers.get("Authorization") }, scopes) catch |err| return switch (err) {
         error.Unavailable => error.Unavailable,
         error.Canceled => error.Canceled,

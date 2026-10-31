@@ -232,7 +232,7 @@ fn greet(call: *Call) Call.Error!parley.ToolResult {
     return .ofText(answer.content.?.bytes);
 }
 
-fn acceptEmpty(_: ?*anyopaque, _: Io, _: std.mem.Allocator, _: []const u8) parley.Client.HandlerError!parley.types.ElicitResult {
+fn acceptEmpty(_: *parley.Client.Handlers, _: Io, _: std.mem.Allocator, _: []const u8) parley.Client.HandlerError!parley.types.ElicitResult {
     return .{ .action = .accept, .content = .{ .bytes = "{}" } };
 }
 
@@ -244,9 +244,10 @@ fn clientRound(io: Io, h: *Harness, revisions: []const parley.Revision, expect: 
     var remote: Transport = .init(testing.allocator, &h.client, url, .{});
     defer remote.deinit();
     defer remote.close(io);
+    var answers: parley.Client.Handlers = .{ .elicit = acceptEmpty };
     var client: parley.Client = .init(testing.allocator, remote.transport(), .{
         .info = .{ .name = "c", .version = "1" },
-        .handlers = .{ .elicit = acceptEmpty },
+        .handlers = &answers,
         .revisions = revisions,
     });
     defer client.deinit();

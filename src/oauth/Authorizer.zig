@@ -57,12 +57,15 @@ memory: oauth.store.Memory,
 /// Why the last refusal stood (a server that cannot be discovered, a
 /// sign-in refused); null once a renewal succeeds.
 failure: ?anyerror = null,
+/// Private: the authorizer as a transport's, `authorization()`.
+authorizing: http.Transport.Authorization = .{ .vtable = &.{ .credentials = credentials, .refused = refused } },
 
 pub const Options = struct {
     /// How the user signs in: open the authorization URL (in a browser),
     /// and return the URL the browser was sent back to (the redirect URI
-    /// with the code). Needed for `.authorization_code`.
-    sign_in: ?SignIn = null,
+    /// with the code). Needed for `.authorization_code`. Outlives the
+    /// authorizer.
+    sign_in: ?*SignIn = null,
     /// Exactly as registered: for a native application, a loopback one
     /// (RFC 8252).
     redirect_uri: []const u8 = "http://127.0.0.1/callback",
@@ -79,8 +82,9 @@ pub const Options = struct {
     /// The enterprise's identity provider and the user's token there:
     /// needed for `.enterprise`.
     enterprise: ?Enterprise = null,
-    /// The workload's identity token: needed for `.jwt_bearer`.
-    assertion: ?TokenSource = null,
+    /// The workload's identity token: needed for `.jwt_bearer`. Outlives
+    /// the authorizer.
+    assertion: ?*TokenSource = null,
     /// Ask for refresh tokens where the server gives them.
     offline: bool = true,
     /// Where tokens are kept between runs, by the server and resource;
@@ -116,18 +120,23 @@ pub const Enterprise = struct {
     client: Credentials,
     /// The user's token there, asked for at each exchange: the
     /// application signs the user in with the provider and keeps it.
-    subject: TokenSource,
+    /// Outlives the authorizer.
+    subject: *TokenSource,
     /// Its type: an ID token, a SAML assertion, a refresh token.
     subject_token_type: []const u8 = oauth.exchange.token_type.id_token,
 };
 
 /// A token the application holds and keeps current (a user's ID token, a
 /// workload's identity token rotated by its platform), asked for when one
-/// is needed.
+/// is needed. Its owner embeds it and recovers itself with
+/// `@fieldParentPtr`.
 pub const TokenSource = struct {
-    context: ?*anyopaque = null,
     /// The token now, on `arena`.
-    get: *const fn (context: ?*anyopaque, io: Io, arena: Allocator) SourceError![]const u8,
+    getFn: *const fn (s: *TokenSource, io: Io, arena: Allocator) SourceError![]const u8,
+
+    pub fn get(s: *TokenSource, io: Io, arena: Allocator) SourceError![]const u8 {
+        return s.getFn(s, io, arena);
+    }
 };
 
 /// `Unavailable`: the application has no token to give.
@@ -146,11 +155,16 @@ pub const Credentials = struct {
     private_key_jwt: ?oauth.client_auth.PrivateKeyJwt = null,
 };
 
+/// How the user signs in. Its owner embeds it and recovers itself with
+/// `@fieldParentPtr`.
 pub const SignIn = struct {
-    context: ?*anyopaque = null,
     /// Opens `url` for the user; returns where the browser was sent back
     /// to, on `arena`.
-    open: *const fn (context: ?*anyopaque, io: Io, arena: Allocator, url: []const u8) SignInError![]const u8,
+    openFn: *const fn (s: *SignIn, io: Io, arena: Allocator, url: []const u8) SignInError![]const u8,
+
+    pub fn open(s: *SignIn, io: Io, arena: Allocator, url: []const u8) SignInError![]const u8 {
+        return s.openFn(s, io, arena, url);
+    }
 };
 
 /// `Declined`: the user did not sign in.
@@ -186,25 +200,26 @@ pub fn deinit(a: *Authorizer) void {
     a.* = undefined;
 }
 
-/// The authorizer as the HTTP transport's `authorization`.
-pub fn authorization(a: *Authorizer) http.Transport.Authorization {
-    return .{ .context = a, .vtable = &.{ .credentials = credentials, .refused = refused } };
+/// The authorizer as the HTTP transport's `authorization`. The authorizer
+/// must outlive the transport.
+pub fn authorization(a: *Authorizer) *http.Transport.Authorization {
+    return &a.authorizing;
 }
 
 fn store(a: *Authorizer) *oauth.TokenStore {
     return a.options.store orelse &a.memory.store;
 }
 
-fn credentials(context: *anyopaque, io: Io, arena: Allocator) http.Transport.Authorization.Error!?[]const u8 {
-    const a: *Authorizer = @ptrCast(@alignCast(context)); // safe: the authorization was made from an authorizer
+fn credentials(auth: *http.Transport.Authorization, io: Io, arena: Allocator) http.Transport.Authorization.Error!?[]const u8 {
+    const a: *Authorizer = @alignCast(@fieldParentPtr("authorizing", auth));
     try a.mutex.lock(io);
     defer a.mutex.unlock(io);
     const set = a.active orelse return null;
     return try std.mem.concat(arena, u8, &.{ "Bearer ", set.access_token });
 }
 
-fn refused(context: *anyopaque, io: Io, sent: ?[]const u8, status: u16, challenges: []const []const u8) http.Transport.Authorization.Error!bool {
-    const a: *Authorizer = @ptrCast(@alignCast(context)); // safe: the authorization was made from an authorizer
+fn refused(auth: *http.Transport.Authorization, io: Io, sent: ?[]const u8, status: u16, challenges: []const []const u8) http.Transport.Authorization.Error!bool {
+    const a: *Authorizer = @alignCast(@fieldParentPtr("authorizing", auth));
     try a.mutex.lock(io);
     defer a.mutex.unlock(io);
     // Another request renewed the tokens since this one was sent.
@@ -296,7 +311,7 @@ fn renew(a: *Authorizer, io: Io, arena: Allocator, status: u16, challenges: []co
         .enterprise => try a.enterpriseGrant(io, arena, as, client.?, scope, resource),
         .jwt_bearer => blk: {
             const source = a.options.assertion orelse return error.NotConfigured;
-            const assertion = try source.get(source.context, io, arena);
+            const assertion = try source.get(io, arena);
             break :blk try oauth.jwtBearer(a.gpa, io, a.web, as, client, assertion, scope, .{ .resources = &.{resource}, .fetch = a.options.fetch });
         },
     };
@@ -322,7 +337,7 @@ fn signIn(a: *Authorizer, io: Io, arena: Allocator, as: *const oauth.metadata.Au
         .require_pkce_listed = true,
     }, &url.writer);
     defer flow.deinit();
-    const redirect = try sign_in.open(sign_in.context, io, arena, url.written());
+    const redirect = try sign_in.open(io, arena, url.written());
     return flow.finish(a.gpa, io, a.web, as, client, redirect, .{ .fetch = a.options.fetch });
 }
 
@@ -338,7 +353,7 @@ fn enterpriseGrant(a: *Authorizer, io: Io, arena: Allocator, as: *const oauth.me
         break :blk discovered.?.value;
     };
     const idp_client = try clientOf(e.client, &idp);
-    const subject = try e.subject.get(e.subject.context, io, arena);
+    const subject = try e.subject.get(io, arena);
     var issued = try oauth.requestIdJag(a.gpa, io, a.web, &idp, idp_client, .{
         .idp_issuer = e.issuer,
         .subject_token = subject,

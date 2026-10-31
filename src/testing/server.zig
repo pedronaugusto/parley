@@ -26,7 +26,7 @@ fn sleep(call: *parley.Call, args: struct { ms: u32 }) parley.Call.Error![]const
     return "slept";
 }
 
-fn wideCall(_: ?*anyopaque, _: *parley.Call, _: ?[]const u8) parley.Call.Error!parley.ToolResult {
+fn wideCall(_: *parley.ToolHandler, _: *parley.Call, _: ?[]const u8) parley.Call.Error!parley.ToolResult {
     return .ofText("ok");
 }
 
@@ -87,13 +87,14 @@ fn serve(gpa: std.mem.Allocator, io: Io, arguments: Arguments) !void {
     defer server.deinit();
     try server.addTool(io, .{ .name = "echo", .description = "Echoes the text it is given" }, echo);
     try server.addTool(io, .{ .name = "sleep", .description = "Answers after ms milliseconds" }, sleep);
+    var wide: parley.ToolHandler = .{ .callFn = wideCall };
     if (arguments.tools != 0) {
         const schema = try wideSchema(gpa, 40);
         defer gpa.free(schema);
         var name_buffer: [32]u8 = undefined;
         for (0..arguments.tools) |t| {
             const name = try std.mem.print(&name_buffer, "tool_{d}", .{t});
-            try server.addDynamicTool(io, .{ .name = name, .description = "One of many tools with a large input schema", .input_schema = schema }, .{ .call = wideCall });
+            try server.addDynamicTool(io, .{ .name = name, .description = "One of many tools with a large input schema", .input_schema = schema }, &wide);
         }
     }
     var err_buffer: [64]u8 = undefined;
