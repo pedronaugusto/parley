@@ -133,7 +133,9 @@ pub fn limitsFor(message: aegis.units.Bytes(u32)) strand.core.Limits {
         .string_bytes = bytes,
         .items = @max(1, m / 2),
         .container_items = @max(1, m / 2),
+        // aegis: no-danger(A004): strand's default allocation and work per input byte, a ratio of its own nonzero defaults, scaled to the message
         .allocation_bytes = bytes.mul(base.allocation_bytes.raw() / base.input_bytes.raw()) catch .fromRaw(std.math.maxInt(usize)),
+        // aegis: no-danger(A004): as above, for the work
         .work = std.math.mul(usize, m, base.work / base.input_bytes.raw()) catch std.math.maxInt(usize),
         .depth = base.depth,
         .key_bytes = base.key_bytes,

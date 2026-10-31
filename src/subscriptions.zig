@@ -36,6 +36,14 @@ pub const Kind = enum(u3) {
 /// id.
 pub const Watch = enum { resource, task };
 
+/// The locks here, in the order one is taken while another is held: a
+/// stream's end, or the hub, before a listener.
+const Locks = aegis.Order(&.{
+    .{ .name = "end" },
+    .{ .name = "hub" },
+    .{ .name = "listener", .after = &.{ 0, 1 } },
+});
+
 /// The names a listener watches of one kind, and which changed.
 const Watched = struct {
     names: std.ArrayList([]const u8) = .empty,
@@ -59,7 +67,7 @@ pub const Listener = struct {
     lists: std.EnumSet(Kind),
     /// Private: what changed and is not yet written, and whether the
     /// stream is over.
-    state: aegis.BlockingGuarded(State) = .init(.{}),
+    state: Locks.Ordered(aegis.BlockingGuarded(State), 2) = .init(.init(.{})),
     /// Private: signaled by every change, for the stream's task.
     changes: aegis.Condition = .init(),
 
@@ -85,7 +93,13 @@ pub const Listener = struct {
     /// writing nothing more. Safe from any task, before the stream starts
     /// too, and more than once.
     pub fn end(l: *Listener, io: Io) void {
-        var held = l.state.acquireUncancelable(io);
+        var order: Locks.Context = .{};
+        l.endIn(io, &order);
+    }
+
+    /// `end`, with the locks `order` holds.
+    fn endIn(l: *Listener, io: Io, order: *Locks.Context) void {
+        var held = l.state.acquireOrderedUncancelable(io, order);
         defer held.deinit(io);
         const st = held.value();
         st.ended = true;
@@ -95,8 +109,8 @@ pub const Listener = struct {
 
     /// The server closed: the stream's task writes what is pending and
     /// returns.
-    fn close(l: *Listener, io: Io) void {
-        var held = l.state.acquireUncancelable(io);
+    fn close(l: *Listener, io: Io, order: *Locks.Context) void {
+        var held = l.state.acquireOrderedUncancelable(io, order);
         defer held.deinit(io);
         const st = held.value();
         st.closed = true;
@@ -106,21 +120,24 @@ pub const Listener = struct {
 
     /// Whether the stream's owner ended it (`end`).
     pub fn ended(l: *Listener, io: Io) bool {
-        var held = l.state.acquireUncancelable(io);
+        var order: Locks.Context = .{};
+        var held = l.state.acquireOrderedUncancelable(io, &order);
         defer held.deinit(io);
         return held.value().ended;
     }
 
     /// Whether the server closed (`Hub.close`).
     pub fn closed(l: *Listener, io: Io) bool {
-        var held = l.state.acquireUncancelable(io);
+        var order: Locks.Context = .{};
+        var held = l.state.acquireOrderedUncancelable(io, &order);
         defer held.deinit(io);
         return held.value().closed;
     }
 
     /// Whether the stream is over: ended by its owner, or its server closed.
     pub fn over(l: *Listener, io: Io) bool {
-        var held = l.state.acquireUncancelable(io);
+        var order: Locks.Context = .{};
+        var held = l.state.acquireOrderedUncancelable(io, &order);
         defer held.deinit(io);
         const st = held.value();
         return st.ended or st.closed;
@@ -138,7 +155,8 @@ pub const Listener = struct {
     /// the version seen, to wait past next time.
     pub fn wait(l: *Listener, io: Io, seen: u32, timeout: Io.Timeout) Io.Cancelable!?u32 {
         const deadline = timeout.toDeadline(io);
-        var held = try l.state.acquire(io);
+        var order: Locks.Context = .{};
+        var held = try l.state.acquireOrdered(io, &order);
         defer held.deinit(io);
         while (true) {
             const st = held.value();
@@ -153,7 +171,8 @@ pub const Listener = struct {
 
     /// The kinds changed since the last call, cleared.
     pub fn takeLists(l: *Listener, io: Io) std.EnumSet(Kind) {
-        var held = l.state.acquireUncancelable(io);
+        var order: Locks.Context = .{};
+        var held = l.state.acquireOrderedUncancelable(io, &order);
         defer held.deinit(io);
         const st = held.value();
         const set = st.pending;
@@ -164,7 +183,8 @@ pub const Listener = struct {
     /// The watched names of `which` changed since the last call, cleared,
     /// as copies on `arena`.
     pub fn takeChanged(l: *Listener, io: Io, arena: Allocator, which: Watch) (Allocator.Error || Io.Cancelable)![]const []const u8 {
-        var held = try l.state.acquire(io);
+        var order: Locks.Context = .{};
+        var held = try l.state.acquireOrdered(io, &order);
         defer held.deinit(io);
         const w = held.value().watched.getPtr(which);
         var out: std.ArrayList([]const u8) = .empty;
@@ -177,7 +197,8 @@ pub const Listener = struct {
     /// Watches `name` too (for resources, also a legacy
     /// `resources/subscribe`), up to `max` of its kind.
     pub fn watch(l: *Listener, io: Io, gpa: Allocator, which: Watch, name: []const u8, max: usize) (Allocator.Error || Io.Cancelable || error{TooMany})!void {
-        var held = try l.state.acquire(io);
+        var order: Locks.Context = .{};
+        var held = try l.state.acquireOrdered(io, &order);
         defer held.deinit(io);
         const w = held.value().watched.getPtr(which);
         for (w.names.items) |n| if (std.mem.eql(u8, n, name)) return;
@@ -193,7 +214,8 @@ pub const Listener = struct {
 
     /// Stops watching `name` (a legacy `resources/unsubscribe`).
     pub fn unwatch(l: *Listener, io: Io, gpa: Allocator, which: Watch, name: []const u8) Io.Cancelable!void {
-        var held = try l.state.acquire(io);
+        var order: Locks.Context = .{};
+        var held = try l.state.acquireOrdered(io, &order);
         defer held.deinit(io);
         const w = held.value().watched.getPtr(which);
         for (w.names.items, 0..) |n, i| if (std.mem.eql(u8, n, name)) {
@@ -218,7 +240,7 @@ pub const Listener = struct {
 /// stream started after its end returns at once.
 pub const End = struct {
     /// Private: whether it ended, and the stream's listener once started.
-    held: aegis.BlockingGuarded(Ending) = .init(.{}),
+    held: Locks.Ordered(aegis.BlockingGuarded(Ending), 0) = .init(.init(.{})),
 
     const Ending = struct {
         ended: bool = false,
@@ -228,17 +250,19 @@ pub const End = struct {
     /// Ends the request's stream, now or as it starts: its task returns on
     /// its own, so the caller awaits it rather than canceling it.
     pub fn end(e: *End, io: Io) void {
-        var held = e.held.acquireUncancelable(io);
+        var order: Locks.Context = .{};
+        var held = e.held.acquireOrderedUncancelable(io, &order);
         defer held.deinit(io);
         const ending = held.value();
         ending.ended = true;
-        if (ending.listener) |l| l.end(io);
+        if (ending.listener) |l| l.endIn(io, &order);
     }
 
     /// The stream's listener, from its start to `detach`; false, attaching
     /// nothing, when the request was ended before it started.
     pub fn attach(e: *End, io: Io, l: *Listener) bool {
-        var held = e.held.acquireUncancelable(io);
+        var order: Locks.Context = .{};
+        var held = e.held.acquireOrderedUncancelable(io, &order);
         defer held.deinit(io);
         const ending = held.value();
         if (ending.ended) return false;
@@ -247,7 +271,8 @@ pub const End = struct {
     }
 
     pub fn detach(e: *End, io: Io) void {
-        var held = e.held.acquireUncancelable(io);
+        var order: Locks.Context = .{};
+        var held = e.held.acquireOrderedUncancelable(io, &order);
         defer held.deinit(io);
         held.value().listener = null;
     }
@@ -255,7 +280,7 @@ pub const End = struct {
 
 /// Every open listener of a server. Its lock comes before a listener's.
 pub const Hub = struct {
-    listeners: aegis.BlockingGuarded(Listeners) = .init(.{}),
+    listeners: Locks.Ordered(aegis.BlockingGuarded(Listeners), 1) = .init(.init(.{})),
 
     const Listeners = struct {
         list: std.ArrayList(*Listener) = .empty,
@@ -268,16 +293,18 @@ pub const Hub = struct {
 
     /// Registers `l`, which the caller keeps until `remove`.
     pub fn add(h: *Hub, io: Io, gpa: Allocator, l: *Listener, max: usize) AddError!void {
-        var held = try h.listeners.acquire(io);
+        var order: Locks.Context = .{};
+        var held = try h.listeners.acquireOrdered(io, &order);
         defer held.deinit(io);
         const ls = held.value();
         if (ls.list.items.len >= max) return error.TooMany;
         try ls.list.append(gpa, l);
-        if (ls.closed) l.close(io);
+        if (ls.closed) l.close(io, &order);
     }
 
     pub fn remove(h: *Hub, io: Io, l: *Listener) void {
-        var held = h.listeners.acquireUncancelable(io);
+        var order: Locks.Context = .{};
+        var held = h.listeners.acquireOrderedUncancelable(io, &order);
         defer held.deinit(io);
         const list = &held.value().list;
         for (list.items, 0..) |x, i| if (x == l) {
@@ -289,10 +316,11 @@ pub const Hub = struct {
     /// A list changed: every listener that asked for `kind` learns it.
     pub fn listChanged(h: *Hub, io: Io, kind: Kind) void {
         aegis.assert.pre(kind != .resource and kind != .task, "a resource's update and a task's change name what changed");
-        var held = h.listeners.acquireUncancelable(io);
+        var order: Locks.Context = .{};
+        var held = h.listeners.acquireOrderedUncancelable(io, &order);
         defer held.deinit(io);
         for (held.value().list.items) |l| if (l.lists.contains(kind)) {
-            var state = l.state.acquireUncancelable(io);
+            var state = l.state.acquireOrderedUncancelable(io, &order);
             defer state.deinit(io);
             l.mark(io, state.value(), kind);
         };
@@ -305,10 +333,11 @@ pub const Hub = struct {
             .resource => .resource,
             .task => .task,
         };
-        var held = h.listeners.acquireUncancelable(io);
+        var order: Locks.Context = .{};
+        var held = h.listeners.acquireOrderedUncancelable(io, &order);
         defer held.deinit(io);
         for (held.value().list.items) |l| {
-            var state = l.state.acquireUncancelable(io);
+            var state = l.state.acquireOrderedUncancelable(io, &order);
             defer state.deinit(io);
             const st = state.value();
             const w = st.watched.getPtr(which);
@@ -321,11 +350,12 @@ pub const Hub = struct {
 
     /// Ends every stream: each listener's task sees it closed and returns.
     pub fn close(h: *Hub, io: Io) void {
-        var held = h.listeners.acquireUncancelable(io);
+        var order: Locks.Context = .{};
+        var held = h.listeners.acquireOrderedUncancelable(io, &order);
         defer held.deinit(io);
         const ls = held.value();
         ls.closed = true;
-        for (ls.list.items) |l| l.close(io);
+        for (ls.list.items) |l| l.close(io, &order);
     }
 
     pub fn deinit(h: *Hub, gpa: Allocator) void {

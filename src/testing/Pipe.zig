@@ -32,7 +32,7 @@ pub fn close(p: *Pipe) void {
 }
 
 fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
-    const p: *Pipe = @fieldParentPtr("reader", r);
+    const p: *Pipe = @alignCast(@fieldParentPtr("reader", r));
     const dest = limit.slice(try w.writableSliceGreedy(1));
     const n = p.queue.get(p.io, dest, 1) catch |err| switch (err) {
         error.Closed => return error.EndOfStream,
@@ -43,7 +43,7 @@ fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!u
 }
 
 fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
-    const p: *Pipe = @fieldParentPtr("writer", w);
+    const p: *Pipe = @alignCast(@fieldParentPtr("writer", w));
     p.queue.putAll(p.io, w.buffered()) catch return error.WriteFailed;
     w.end = 0;
     var n: usize = 0;

@@ -71,11 +71,28 @@ pub const ToolHandler = struct {
     }
 };
 
+/// An entry's handler: a typed one the entry holds (`typedTool`,
+/// `typedPrompt`), or one the application owns and keeps.
+pub fn Handling(comptime Handler: type) type {
+    return union(enum) {
+        typed: Handler,
+        dynamic: *Handler,
+
+        /// The handler, where it stays: the entry's own, or the application's.
+        pub fn handler(h: *@This()) *Handler {
+            return switch (h.*) {
+                .typed => |*own| own,
+                .dynamic => |given| given,
+            };
+        }
+    };
+}
+
 pub const Tool = struct {
     name: []const u8,
     /// The `Tool` object, as `tools/list` writes it.
     listed: []const u8,
-    handler: *ToolHandler,
+    handling: Handling(ToolHandler),
     /// The arguments its schema mirrors into `Mcp-Param-{name}` headers.
     headers: []const HeaderParam = &.{},
     task: TaskSupport = .forbidden,
@@ -283,7 +300,7 @@ pub const Prompt = struct {
     listed: []const u8,
     /// The names of the arguments that must be given.
     required: []const []const u8,
-    handler: *PromptHandler,
+    handling: Handling(PromptHandler),
 };
 
 /// `Tool` JSON for `spec`, on `gpa`.
@@ -405,13 +422,10 @@ pub fn Signature(comptime handler: anytype) type {
 /// `handler` as a `ToolHandler`: its arguments decoded with strand (a
 /// decode failure is an execution error naming the field, which the model
 /// can correct), its result turned into a `ToolResult`, and any error of its
-/// own an execution error naming it. One handler per function, for the
-/// program's life.
-pub fn typedTool(comptime handler: anytype) *ToolHandler {
+/// own an execution error naming it.
+pub fn typedTool(comptime handler: anytype) ToolHandler {
     const S = Signature(handler);
     const Erased = struct {
-        var erased: ToolHandler = .{ .callFn = call };
-
         fn call(_: *ToolHandler, c: *Call, arguments: ?[]const u8) Call.Error!ToolResult {
             const out = if (S.Args == void)
                 handler(c)
@@ -430,7 +444,7 @@ pub fn typedTool(comptime handler: anytype) *ToolHandler {
             return toolResult(c.arena, c.limits, value);
         }
     };
-    return &Erased.erased;
+    return .{ .callFn = Erased.call };
 }
 
 fn invalidArguments(arena: Allocator, err: anyerror, diagnostics: *const strand.core.Diagnostics) Allocator.Error![]const u8 {
@@ -486,14 +500,11 @@ pub fn promptArguments(comptime Args: type) []const types.PromptArgument {
     }
 }
 
-/// `handler` as a `PromptHandler`, its arguments decoded with strand. One
-/// handler per function, for the program's life.
-pub fn typedPrompt(comptime handler: anytype) *PromptHandler {
+/// `handler` as a `PromptHandler`, its arguments decoded with strand.
+pub fn typedPrompt(comptime handler: anytype) PromptHandler {
     const S = Signature(handler);
     const Erased = struct {
-        var erased: PromptHandler = .{ .getFn = getPrompt };
-
-        fn getPrompt(_: *PromptHandler, c: *Call, arguments: ?[]const u8) Call.Error!PromptResult {
+        fn get(_: *PromptHandler, c: *Call, arguments: ?[]const u8) Call.Error!PromptResult {
             const out = if (S.Args == void) handler(c) else blk: {
                 const args = strand.json.parseLeaky(S.Args, c.arena, arguments orelse "{}", types.readOptions(c.limits)) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
@@ -504,7 +515,7 @@ pub fn typedPrompt(comptime handler: anytype) *PromptHandler {
             return out catch |err| ownError(err);
         }
     };
-    return &Erased.erased;
+    return .{ .getFn = Erased.get };
 }
 
 /// A handler's error: the core's pass through; any of its own is

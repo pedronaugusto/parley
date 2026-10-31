@@ -158,7 +158,7 @@ const PipeWriter = struct {
     }
 
     fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
-        const self: *PipeWriter = @fieldParentPtr("writer", w);
+        const self: *PipeWriter = @alignCast(@fieldParentPtr("writer", w));
         self.pipe.write(w.buffered()) catch return error.WriteFailed;
         w.end = 0;
         var n: usize = 0;

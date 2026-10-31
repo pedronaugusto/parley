@@ -89,12 +89,12 @@ pub const Out = struct {
         out: Out = .{ .beginFn = lineBegin, .endFn = lineEnd },
 
         fn lineBegin(o: *Out) Error!*Io.Writer {
-            const l: *Lines = @fieldParentPtr("out", o);
+            const l: *Lines = @alignCast(@fieldParentPtr("out", o));
             return l.writer;
         }
 
         fn lineEnd(o: *Out) Error!void {
-            const l: *Lines = @fieldParentPtr("out", o);
+            const l: *Lines = @alignCast(@fieldParentPtr("out", o));
             try l.writer.writeByte('\n');
             try l.writer.flush();
         }
@@ -385,7 +385,7 @@ pub const Connection = struct {
 
     fn sendLine(t: *Sink.Target, io: Io, message: []const u8) Sink.SendError!void {
         _ = io;
-        const c: *Connection = @fieldParentPtr("target", t);
+        const c: *Connection = @alignCast(@fieldParentPtr("target", t));
         c.send(message) catch |err| return switch (err) {
             error.Canceled => error.Canceled,
             error.WriteFailed => error.Closed,
@@ -691,7 +691,7 @@ const Job = struct {
 
     fn sendFn(t: *Sink.Target, io: Io, message: []const u8) Sink.SendError!void {
         _ = io;
-        const job: *Job = @fieldParentPtr("target", t);
+        const job: *Job = @alignCast(@fieldParentPtr("target", t));
         if (job.canceled.load(.acquire) == .canceled) return error.Canceled;
         job.conn.send(message) catch |err| return switch (err) {
             error.Canceled => error.Canceled,
@@ -768,7 +768,7 @@ pub const Channel = struct {
     }
 
     fn request(t: *Client.Transport, io: Io, arena: Allocator, exchange: *Client.Exchange) Client.RequestError![]const u8 {
-        const ch: *Channel = @fieldParentPtr("transporting", t);
+        const ch: *Channel = @alignCast(@fieldParentPtr("transporting", t));
         var waiter: Waiter = .{ .id = exchange.id };
         {
             var held = try ch.waiting.acquire(io);
@@ -816,7 +816,7 @@ pub const Channel = struct {
     }
 
     fn notify(t: *Client.Transport, io: Io, message: []const u8) Client.RequestError!void {
-        const ch: *Channel = @fieldParentPtr("transporting", t);
+        const ch: *Channel = @alignCast(@fieldParentPtr("transporting", t));
         return ch.write(io, message);
     }
 

@@ -102,20 +102,20 @@ const Session = struct {
     out: parley.stdio.Out = .{ .beginFn = begin, .endFn = end, .keepAliveFn = keepAlive },
 
     fn begin(o: *parley.stdio.Out) parley.stdio.Out.Error!*Io.Writer {
-        const s: *Session = @fieldParentPtr("out", o);
+        const s: *Session = @alignCast(@fieldParentPtr("out", o));
         const w = s.response.writer(s.io) catch return error.WriteFailed;
         s.event = sse.EventWriter.begin(w, &s.buffer, .{ .type = "message" }) catch return error.WriteFailed;
         return &s.event.interface;
     }
 
     fn end(o: *parley.stdio.Out) parley.stdio.Out.Error!void {
-        const s: *Session = @fieldParentPtr("out", o);
+        const s: *Session = @alignCast(@fieldParentPtr("out", o));
         s.event.end() catch return error.WriteFailed;
         s.response.flush(s.io) catch return error.WriteFailed;
     }
 
     fn keepAlive(o: *parley.stdio.Out) parley.stdio.Out.Error!void {
-        const s: *Session = @fieldParentPtr("out", o);
+        const s: *Session = @alignCast(@fieldParentPtr("out", o));
         const w = s.response.writer(s.io) catch return error.WriteFailed;
         w.writeAll(":\n\n") catch return error.WriteFailed;
         s.response.flush(s.io) catch return error.WriteFailed;
@@ -286,5 +286,5 @@ fn lookup(e: *SseEndpoint, io: Io, id: []const u8) ?*Session {
 }
 
 fn release(e: *SseEndpoint, session: *Session) void {
-    if (session.refs.fetchSubWrapping(.fromRaw(1), .acq_rel).raw() == 1) e.gpa.destroy(session);
+    if (session.refs.fetchSubWrapping(.fromRaw(1), .acq_rel).eql(.fromRaw(1))) e.gpa.destroy(session);
 }

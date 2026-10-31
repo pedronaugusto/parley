@@ -51,7 +51,7 @@ const Entry = struct {
     used: aegis.Atomic(Instant),
 
     fn release(entry: *Entry, gpa: Allocator) void {
-        if (entry.refs.fetchSubWrapping(.fromRaw(1), .acq_rel).raw() != 1) return;
+        if (!entry.refs.fetchSubWrapping(.fromRaw(1), .acq_rel).eql(.fromRaw(1))) return;
         entry.session.deinit();
         gpa.destroy(entry);
     }
@@ -727,7 +727,7 @@ const Stream = struct {
 
     fn send(t: *parley.Sink.Target, io: Io, message: []const u8) parley.Sink.SendError!void {
         _ = io;
-        const s: *Stream = @fieldParentPtr("target", t);
+        const s: *Stream = @alignCast(@fieldParentPtr("target", t));
         s.event(message) catch |err| return switch (err) {
             error.Canceled => error.Canceled,
             error.OutOfMemory => error.OutOfMemory,
@@ -737,7 +737,7 @@ const Stream = struct {
 
     fn keepAliveFn(t: *parley.Sink.Target, io: Io) parley.Sink.SendError!void {
         _ = io;
-        const s: *Stream = @fieldParentPtr("target", t);
+        const s: *Stream = @alignCast(@fieldParentPtr("target", t));
         var held = s.out.acquire(s.io) catch return error.Canceled;
         defer held.deinit(s.io);
         const o = held.value();

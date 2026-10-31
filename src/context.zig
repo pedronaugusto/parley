@@ -24,8 +24,8 @@ pub const Context = struct {
 /// an event on the request's HTTP stream. Each is one whole JSON-RPC
 /// message.
 pub const Sink = struct {
-    /// What writes them: the transport's, which embeds it.
-    target: *Target,
+    /// What writes them: the transport's, which embeds it; null drops them.
+    target: ?*Target,
     /// A stream that would close when nothing crosses it for a while (an
     /// HTTP response behind a proxy) is kept open by the target's
     /// `keepAliveFn`, every `keep_alive`, while a long-lived request has
@@ -49,18 +49,16 @@ pub const Sink = struct {
     pub const SendError = error{ Canceled, Closed, OutOfMemory };
 
     pub fn send(s: Sink, io: std.Io, message: []const u8) SendError!void {
-        return s.target.sendFn(s.target, io, message);
+        const t = s.target orelse return;
+        return t.sendFn(t, io, message);
     }
 
     pub fn keepAlive(s: Sink, io: std.Io) SendError!void {
-        if (s.target.keepAliveFn) |f| return f(s.target, io);
+        const t = s.target orelse return;
+        if (t.keepAliveFn) |f| return f(t, io);
     }
 
     /// A sink that drops everything: for a request whose notifications have
     /// nowhere to go.
-    pub const none: Sink = .{ .target = &dropped };
-
-    var dropped: Target = .{ .sendFn = drop };
-
-    fn drop(_: *Target, _: std.Io, _: []const u8) SendError!void {}
+    pub const none: Sink = .{ .target = null };
 };

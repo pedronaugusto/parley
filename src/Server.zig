@@ -121,6 +121,9 @@ pub const Offers = struct {
     prompts: ?bool = null,
 };
 
+/// A size in memory, as strand's limits give them.
+const Bytes = aegis.units.Bytes(usize);
+
 /// The four lists a server keeps.
 pub const List = enum { tools, resources, templates, prompts };
 
@@ -227,16 +230,16 @@ pub const AddError = Allocator.Error || Io.Cancelable || error{ Duplicate, Inval
 /// output schema.
 pub fn addTool(s: *Server, io: Io, spec: registry.ToolSpec, comptime handler: anytype) AddError!void {
     const S = registry.Signature(handler);
-    return s.addToolWith(io, spec, spec.input_schema orelse registry.inputSchema(S.Args), spec.output_schema orelse registry.outputSchema(S.Out), registry.typedTool(handler));
+    return s.addToolWith(io, spec, spec.input_schema orelse registry.inputSchema(S.Args), spec.output_schema orelse registry.outputSchema(S.Out), .{ .typed = registry.typedTool(handler) });
 }
 
 /// Adds a tool with a handler that takes its arguments as JSON; `spec`
 /// must give its input schema.
 pub fn addDynamicTool(s: *Server, io: Io, spec: registry.ToolSpec, handler: *registry.ToolHandler) AddError!void {
-    return s.addToolWith(io, spec, spec.input_schema orelse return error.InvalidSchema, spec.output_schema, handler);
+    return s.addToolWith(io, spec, spec.input_schema orelse return error.InvalidSchema, spec.output_schema, .{ .dynamic = handler });
 }
 
-fn addToolWith(s: *Server, io: Io, spec: registry.ToolSpec, input: []const u8, output: ?[]const u8, handler: *registry.ToolHandler) AddError!void {
+fn addToolWith(s: *Server, io: Io, spec: registry.ToolSpec, input: []const u8, output: ?[]const u8, handling: registry.Handling(registry.ToolHandler)) AddError!void {
     if (spec.task != .forbidden and s.options.tasks == null) return error.TasksNotServed;
     const tool = try s.gpa.create(registry.Tool);
     errdefer s.gpa.destroy(tool);
@@ -246,7 +249,7 @@ fn addToolWith(s: *Server, io: Io, spec: registry.ToolSpec, input: []const u8, o
     errdefer s.gpa.free(listed);
     const params = try registry.headerParams(s.gpa, input, s.jsonLimits());
     errdefer registry.freeHeaderParams(s.gpa, params);
-    tool.* = .{ .name = name, .listed = listed, .handler = handler, .headers = params, .task = spec.task };
+    tool.* = .{ .name = name, .listed = listed, .handling = handling, .headers = params, .task = spec.task };
     try s.insert(io, .tools, tool, name);
 }
 
@@ -305,15 +308,15 @@ pub fn addTemplate(s: *Server, io: Io, spec: registry.TemplateSpec, handler: *re
 /// fields, required unless optional or defaulted).
 pub fn addPrompt(s: *Server, io: Io, spec: registry.PromptSpec, comptime handler: anytype) AddError!void {
     const S = registry.Signature(handler);
-    return s.addPromptWith(io, spec, spec.arguments orelse comptime registry.promptArguments(S.Args), registry.typedPrompt(handler));
+    return s.addPromptWith(io, spec, spec.arguments orelse comptime registry.promptArguments(S.Args), .{ .typed = registry.typedPrompt(handler) });
 }
 
 /// Adds a prompt whose handler takes its arguments as JSON.
 pub fn addDynamicPrompt(s: *Server, io: Io, spec: registry.PromptSpec, handler: *registry.PromptHandler) AddError!void {
-    return s.addPromptWith(io, spec, spec.arguments orelse &.{}, handler);
+    return s.addPromptWith(io, spec, spec.arguments orelse &.{}, .{ .dynamic = handler });
 }
 
-fn addPromptWith(s: *Server, io: Io, spec: registry.PromptSpec, arguments: []const types.PromptArgument, handler: *registry.PromptHandler) AddError!void {
+fn addPromptWith(s: *Server, io: Io, spec: registry.PromptSpec, arguments: []const types.PromptArgument, handling: registry.Handling(registry.PromptHandler)) AddError!void {
     const prompt = try s.gpa.create(registry.Prompt);
     errdefer s.gpa.destroy(prompt);
     const name = try s.gpa.dupe(u8, spec.name);
@@ -326,7 +329,7 @@ fn addPromptWith(s: *Server, io: Io, spec: registry.PromptSpec, arguments: []con
         required.deinit(s.gpa);
     }
     for (arguments) |a| if (a.required orelse false) try required.append(s.gpa, try s.gpa.dupe(u8, a.name));
-    prompt.* = .{ .name = name, .listed = listed, .required = try required.toOwnedSlice(s.gpa), .handler = handler };
+    prompt.* = .{ .name = name, .listed = listed, .required = try required.toOwnedSlice(s.gpa), .handling = handling };
     try s.insert(io, .prompts, prompt, name);
 }
 
@@ -476,7 +479,7 @@ pub const Content = struct {
         var counter: Writer.Discarding = .init(&buffer);
         try c.write(&counter.writer);
         c.len = std.math.cast(usize, counter.fullCount()) orelse return error.TooLong;
-        if (c.len > s.jsonLimits().output_bytes.raw()) return error.TooLong;
+        if (Bytes.fromRaw(c.len).compare(s.jsonLimits().output_bytes) == .gt) return error.TooLong;
         return .{ .content = c };
     }
 
@@ -731,7 +734,7 @@ const Result = struct {
     /// The object made whole (`begin`), ended: past the message limit, refused.
     fn body(r: *Result) BuildError!Body {
         const bytes = r.made.?.written();
-        if (bytes.len > r.limits.output_bytes.raw()) return error.TooLong;
+        if (Bytes.fromRaw(bytes.len).compare(r.limits.output_bytes) == .gt) return error.TooLong;
         return .{ .json = bytes };
     }
 };
@@ -950,7 +953,7 @@ fn callTool(s: *Server, io: Io, arena: Allocator, request: wire.Request, context
     const handler, const task_support = found: {
         var held = s.lists.acquire(io) catch return error.Canceled;
         defer held.deinit(io);
-        for (held.value().tools.items) |t| if (std.mem.eql(u8, t.name, p.name)) break :found .{ t.handler, t.task };
+        for (held.value().tools.items) |t| if (std.mem.eql(u8, t.name, p.name)) break :found .{ t.handling.handler(), t.task };
         break :found null;
     } orelse return try unknown(arena, "Unknown tool: ", p.name);
     if (!s.admitted(context, .tools, p.name)) return try unknown(arena, "Unknown tool: ", p.name);
@@ -1073,7 +1076,7 @@ const Run = struct {
 
     /// Lets go of the round; the last holder frees it.
     fn release(run: *Run) void {
-        if (run.holders.fetchSubWrapping(.fromRaw(1), .acq_rel).raw() != 1) return;
+        if (!run.holders.fetchSubWrapping(.fromRaw(1), .acq_rel).eql(.fromRaw(1))) return;
         const gpa = run.server.gpa;
         run.arena.deinit();
         gpa.destroy(run);
@@ -1408,7 +1411,7 @@ fn toolOf(s: *Server, io: Io, task: *const tasks.Task) (Allocator.Error || Io.Ca
     }) orelse return null;
     var held = try s.lists.acquire(io);
     defer held.deinit(io);
-    for (held.value().tools.items) |t| if (std.mem.eql(u8, t.name, p.name)) return t.handler;
+    for (held.value().tools.items) |t| if (std.mem.eql(u8, t.name, p.name)) return t.handling.handler();
     return null;
 }
 
@@ -1498,7 +1501,7 @@ fn getPrompt(s: *Server, io: Io, arena: Allocator, request: wire.Request, contex
             // Copied out: the prompt may be removed while it runs.
             var required: std.ArrayList([]const u8) = .empty;
             for (item.required) |name| try required.append(arena, try arena.dupe(u8, name));
-            break :found .{ item.handler, required.items };
+            break :found .{ item.handling.handler(), required.items };
         };
         break :found null;
     } orelse return try unknown(arena, "Unknown prompt: ", p.name);
