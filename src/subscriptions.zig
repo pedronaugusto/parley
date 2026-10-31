@@ -57,67 +57,116 @@ pub const Listener = struct {
     id: ?wire.Id,
     /// The kinds of list change asked for.
     lists: std.EnumSet(Kind),
-    /// The resources and the tasks watched, as given. A legacy session adds
-    /// to the resources.
-    watched: std.EnumArray(Watch, Watched) = .initFill(.{}),
-    /// Bumped by every change for this listener: the futex its task waits on.
-    version: std.atomic.Value(u32) = .init(0),
-    /// Kinds changed and not yet written.
-    pending: std.atomic.Value(u8) = .init(0),
-    /// Private: guards `watched`.
-    mutex: Io.Mutex = .init,
-    /// Set by `end`: the stream's task returns at its next wait.
-    ended: std.atomic.Value(bool) = .init(false),
+    /// Private: what changed and is not yet written, and whether the
+    /// stream is over.
+    state: aegis.BlockingGuarded(State) = .init(.{}),
+    /// Private: signaled by every change, for the stream's task.
+    changes: aegis.Condition = .init(),
+
+    const State = struct {
+        /// The resources and the tasks watched, as given. A legacy session
+        /// adds to the resources.
+        watched: std.EnumArray(Watch, Watched) = .initFill(.{}),
+        /// Bumped by every change: what the stream's task waits past.
+        version: u32 = 0,
+        /// Kinds changed and not yet written.
+        pending: std.EnumSet(Kind) = .empty,
+        /// Set by `end`: the stream's task returns at its next wait.
+        ended: bool = false,
+        /// Set when the server closes (`Hub.close`).
+        closed: bool = false,
+
+        fn bump(st: *State) void {
+            st.version +%= 1;
+        }
+    };
 
     /// Ends the stream: its task sees it at its next wait and returns,
     /// writing nothing more. Safe from any task, before the stream starts
     /// too, and more than once.
     pub fn end(l: *Listener, io: Io) void {
-        l.ended.store(true, .release);
-        _ = l.version.fetchAdd(1, .release);
-        io.futexWake(u32, &l.version.raw, 1);
+        var held = l.state.acquireUncancelable(io);
+        defer held.deinit(io);
+        const st = held.value();
+        st.ended = true;
+        st.bump();
+        l.changes.signal(io);
+    }
+
+    /// The server closed: the stream's task writes what is pending and
+    /// returns.
+    fn close(l: *Listener, io: Io) void {
+        var held = l.state.acquireUncancelable(io);
+        defer held.deinit(io);
+        const st = held.value();
+        st.closed = true;
+        st.bump();
+        l.changes.signal(io);
+    }
+
+    /// Whether the stream's owner ended it (`end`).
+    pub fn ended(l: *Listener, io: Io) bool {
+        var held = l.state.acquireUncancelable(io);
+        defer held.deinit(io);
+        return held.value().ended;
+    }
+
+    /// Whether the server closed (`Hub.close`).
+    pub fn closed(l: *Listener, io: Io) bool {
+        var held = l.state.acquireUncancelable(io);
+        defer held.deinit(io);
+        return held.value().closed;
     }
 
     /// Whether the stream is over: ended by its owner, or its server closed.
-    pub fn over(l: *const Listener, hub: *const Hub) bool {
-        return l.ended.load(.acquire) or hub.closed.load(.acquire);
+    pub fn over(l: *Listener, io: Io) bool {
+        var held = l.state.acquireUncancelable(io);
+        defer held.deinit(io);
+        const st = held.value();
+        return st.ended or st.closed;
     }
 
-    fn mark(l: *Listener, io: Io, kind: Kind) void {
-        _ = l.pending.fetchOr(@as(u8, 1) << @backingInt(kind), .release);
-        _ = l.version.fetchAdd(1, .release);
-        io.futexWake(u32, &l.version.raw, 1);
+    /// `kind` changed; `st` is the listener's state, held.
+    fn mark(l: *Listener, io: Io, st: *State, kind: Kind) void {
+        st.pending.insert(kind);
+        st.bump();
+        l.changes.signal(io);
     }
 
-    /// Waits until something is pending, the stream is over (`over`),
-    /// `timeout` passes (null), or the task is canceled. Returns the version
-    /// seen, to wait past next time.
-    pub fn wait(l: *Listener, io: Io, hub: *const Hub, seen: u32, timeout: Io.Timeout) Io.Cancelable!?u32 {
-        const now = l.version.load(.acquire);
-        if (now != seen or l.over(hub)) return now;
-        try io.futexWaitTimeout(u32, &l.version.raw, seen, timeout);
-        const after = l.version.load(.acquire);
-        if (after != seen or l.over(hub)) return after;
-        return null;
+    /// Waits until something changed since `seen`, the stream is over
+    /// (`over`), `timeout` passes (null), or the task is canceled. Returns
+    /// the version seen, to wait past next time.
+    pub fn wait(l: *Listener, io: Io, seen: u32, timeout: Io.Timeout) Io.Cancelable!?u32 {
+        const deadline = timeout.toDeadline(io);
+        var held = try l.state.acquire(io);
+        defer held.deinit(io);
+        while (true) {
+            const st = held.value();
+            if (st.version != seen or st.ended or st.closed) return st.version;
+            l.changes.wait(io, &held, deadline) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                error.Timeout => return null,
+                error.WaiterLimit => unreachable, // unreachable: one task waits on a listener, its stream's
+            };
+        }
     }
 
     /// The kinds changed since the last call, cleared.
-    pub fn takeLists(l: *Listener) std.EnumSet(Kind) {
-        const bits = l.pending.swap(0, .acquire);
-        var set: std.EnumSet(Kind) = .empty;
-        inline for (@typeInfo(Kind).@"enum".field_names) |name| {
-            const k = @field(Kind, name);
-            if (bits & (@as(u8, 1) << @backingInt(k)) != 0) set.insert(k);
-        }
+    pub fn takeLists(l: *Listener, io: Io) std.EnumSet(Kind) {
+        var held = l.state.acquireUncancelable(io);
+        defer held.deinit(io);
+        const st = held.value();
+        const set = st.pending;
+        st.pending = .empty;
         return set;
     }
 
     /// The watched names of `which` changed since the last call, cleared,
     /// as copies on `arena`.
     pub fn takeChanged(l: *Listener, io: Io, arena: Allocator, which: Watch) (Allocator.Error || Io.Cancelable)![]const []const u8 {
-        try l.mutex.lock(io);
-        defer l.mutex.unlock(io);
-        const w = l.watched.getPtr(which);
+        var held = try l.state.acquire(io);
+        defer held.deinit(io);
+        const w = held.value().watched.getPtr(which);
         var out: std.ArrayList([]const u8) = .empty;
         var it = w.changed.iterator(.{});
         while (it.next()) |i| try out.append(arena, try arena.dupe(u8, w.names.items[i]));
@@ -128,9 +177,9 @@ pub const Listener = struct {
     /// Watches `name` too (for resources, also a legacy
     /// `resources/subscribe`), up to `max` of its kind.
     pub fn watch(l: *Listener, io: Io, gpa: Allocator, which: Watch, name: []const u8, max: usize) (Allocator.Error || Io.Cancelable || error{TooMany})!void {
-        try l.mutex.lock(io);
-        defer l.mutex.unlock(io);
-        const w = l.watched.getPtr(which);
+        var held = try l.state.acquire(io);
+        defer held.deinit(io);
+        const w = held.value().watched.getPtr(which);
         for (w.names.items) |n| if (std.mem.eql(u8, n, name)) return;
         if (w.names.items.len >= max) return error.TooMany;
         try w.names.ensureUnusedCapacity(gpa, 1);
@@ -144,9 +193,9 @@ pub const Listener = struct {
 
     /// Stops watching `name` (a legacy `resources/unsubscribe`).
     pub fn unwatch(l: *Listener, io: Io, gpa: Allocator, which: Watch, name: []const u8) Io.Cancelable!void {
-        try l.mutex.lock(io);
-        defer l.mutex.unlock(io);
-        const w = l.watched.getPtr(which);
+        var held = try l.state.acquire(io);
+        defer held.deinit(io);
+        const w = held.value().watched.getPtr(which);
         for (w.names.items, 0..) |n, i| if (std.mem.eql(u8, n, name)) {
             gpa.free(n);
             _ = w.names.orderedRemove(i);
@@ -159,7 +208,7 @@ pub const Listener = struct {
     }
 
     pub fn deinit(l: *Listener, gpa: Allocator) void {
-        for (&l.watched.values) |*w| w.deinit(gpa);
+        for (&l.state.teardown().watched.values) |*w| w.deinit(gpa);
     }
 };
 
@@ -168,59 +217,71 @@ pub const Listener = struct {
 /// ends the stream through it whether or not the stream has started. A
 /// stream started after its end returns at once.
 pub const End = struct {
-    /// Private: guards the two below.
-    mutex: Io.Mutex = .init,
-    ended: bool = false,
-    listener: ?*Listener = null,
+    /// Private: whether it ended, and the stream's listener once started.
+    held: aegis.BlockingGuarded(Ending) = .init(.{}),
+
+    const Ending = struct {
+        ended: bool = false,
+        listener: ?*Listener = null,
+    };
 
     /// Ends the request's stream, now or as it starts: its task returns on
     /// its own, so the caller awaits it rather than canceling it.
     pub fn end(e: *End, io: Io) void {
-        e.mutex.lockUncancelable(io);
-        defer e.mutex.unlock(io);
-        e.ended = true;
-        if (e.listener) |l| l.end(io);
+        var held = e.held.acquireUncancelable(io);
+        defer held.deinit(io);
+        const ending = held.value();
+        ending.ended = true;
+        if (ending.listener) |l| l.end(io);
     }
 
     /// The stream's listener, from its start to `detach`; false, attaching
     /// nothing, when the request was ended before it started.
     pub fn attach(e: *End, io: Io, l: *Listener) bool {
-        e.mutex.lockUncancelable(io);
-        defer e.mutex.unlock(io);
-        if (e.ended) return false;
-        e.listener = l;
+        var held = e.held.acquireUncancelable(io);
+        defer held.deinit(io);
+        const ending = held.value();
+        if (ending.ended) return false;
+        ending.listener = l;
         return true;
     }
 
     pub fn detach(e: *End, io: Io) void {
-        e.mutex.lockUncancelable(io);
-        defer e.mutex.unlock(io);
-        e.listener = null;
+        var held = e.held.acquireUncancelable(io);
+        defer held.deinit(io);
+        held.value().listener = null;
     }
 };
 
-/// Every open listener of a server.
+/// Every open listener of a server. Its lock comes before a listener's.
 pub const Hub = struct {
-    mutex: Io.Mutex = .init,
-    listeners: std.ArrayList(*Listener) = .empty,
-    /// Set when the server closes: every listener's task ends its stream.
-    closed: std.atomic.Value(bool) = .init(false),
+    listeners: aegis.BlockingGuarded(Listeners) = .init(.{}),
+
+    const Listeners = struct {
+        list: std.ArrayList(*Listener) = .empty,
+        /// Set when the server closes: every listener's task ends its
+        /// stream, one added after too.
+        closed: bool = false,
+    };
 
     pub const AddError = Allocator.Error || Io.Cancelable || error{TooMany};
 
     /// Registers `l`, which the caller keeps until `remove`.
     pub fn add(h: *Hub, io: Io, gpa: Allocator, l: *Listener, max: usize) AddError!void {
-        try h.mutex.lock(io);
-        defer h.mutex.unlock(io);
-        if (h.listeners.items.len >= max) return error.TooMany;
-        try h.listeners.append(gpa, l);
+        var held = try h.listeners.acquire(io);
+        defer held.deinit(io);
+        const ls = held.value();
+        if (ls.list.items.len >= max) return error.TooMany;
+        try ls.list.append(gpa, l);
+        if (ls.closed) l.close(io);
     }
 
     pub fn remove(h: *Hub, io: Io, l: *Listener) void {
-        h.mutex.lockUncancelable(io);
-        defer h.mutex.unlock(io);
-        for (h.listeners.items, 0..) |x, i| if (x == l) {
-            _ = h.listeners.swapRemove(i);
+        var held = h.listeners.acquireUncancelable(io);
+        defer held.deinit(io);
+        const list = &held.value().list;
+        for (list.items, 0..) |x, i| if (x == l) {
+            _ = list.swapRemove(i);
             return;
         };
     }
@@ -228,9 +289,13 @@ pub const Hub = struct {
     /// A list changed: every listener that asked for `kind` learns it.
     pub fn listChanged(h: *Hub, io: Io, kind: Kind) void {
         aegis.assert.pre(kind != .resource and kind != .task, "a resource's update and a task's change name what changed");
-        h.mutex.lockUncancelable(io);
-        defer h.mutex.unlock(io);
-        for (h.listeners.items) |l| if (l.lists.contains(kind)) l.mark(io, kind);
+        var held = h.listeners.acquireUncancelable(io);
+        defer held.deinit(io);
+        for (held.value().list.items) |l| if (l.lists.contains(kind)) {
+            var state = l.state.acquireUncancelable(io);
+            defer state.deinit(io);
+            l.mark(io, state.value(), kind);
+        };
     }
 
     /// The resource or task `name` changed: every listener watching it
@@ -240,38 +305,36 @@ pub const Hub = struct {
             .resource => .resource,
             .task => .task,
         };
-        h.mutex.lockUncancelable(io);
-        defer h.mutex.unlock(io);
-        for (h.listeners.items) |l| {
-            l.mutex.lockUncancelable(io);
-            defer l.mutex.unlock(io);
-            const w = l.watched.getPtr(which);
+        var held = h.listeners.acquireUncancelable(io);
+        defer held.deinit(io);
+        for (held.value().list.items) |l| {
+            var state = l.state.acquireUncancelable(io);
+            defer state.deinit(io);
+            const st = state.value();
+            const w = st.watched.getPtr(which);
             for (w.names.items, 0..) |n, i| if (std.mem.eql(u8, n, name)) {
                 w.changed.set(i);
-                l.mark(io, kind);
+                l.mark(io, st, kind);
             };
         }
     }
 
-    /// Ends every stream: each listener's task sees `closed` and returns.
+    /// Ends every stream: each listener's task sees it closed and returns.
     pub fn close(h: *Hub, io: Io) void {
-        h.closed.store(true, .release);
-        h.mutex.lockUncancelable(io);
-        defer h.mutex.unlock(io);
-        for (h.listeners.items) |l| {
-            _ = l.version.fetchAdd(1, .release);
-            io.futexWake(u32, &l.version.raw, 1);
-        }
+        var held = h.listeners.acquireUncancelable(io);
+        defer held.deinit(io);
+        const ls = held.value();
+        ls.closed = true;
+        for (ls.list.items) |l| l.close(io);
     }
 
     pub fn deinit(h: *Hub, gpa: Allocator) void {
-        h.listeners.deinit(gpa);
+        h.listeners.teardown().list.deinit(gpa);
     }
 };
 
 test "a stream's end, before or after it starts, ends its wait" {
     const io = std.testing.io;
-    var hub: Hub = .{};
     var early: End = .{};
     early.end(io);
     var unstarted: Listener = .{ .id = null, .lists = .empty };
@@ -280,9 +343,9 @@ test "a stream's end, before or after it starts, ends its wait" {
     var end: End = .{};
     var listener: Listener = .{ .id = null, .lists = .empty };
     try std.testing.expect(end.attach(io, &listener));
-    try std.testing.expectEqual(@as(?u32, null), try listener.wait(io, &hub, 0, .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } }));
+    try std.testing.expectEqual(@as(?u32, null), try listener.wait(io, 0, .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } }));
     end.end(io);
-    try std.testing.expect(listener.over(&hub));
-    try std.testing.expect(try listener.wait(io, &hub, 0, .none) != null);
+    try std.testing.expect(listener.over(io));
+    try std.testing.expect(try listener.wait(io, 0, .none) != null);
     end.detach(io);
 }

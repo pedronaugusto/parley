@@ -41,7 +41,11 @@ revision: Revision = Revision.latest,
 server_capabilities: ?[]const u8 = null,
 server_info: ?types.Implementation = null,
 instructions: ?[]const u8 = null,
-next_id: std.atomic.Value(i64) = .init(1),
+next_id: aegis.Atomic(Requests) = .init(.fromRaw(1)),
+
+/// The requests the client has sent, which number the next: one at a time,
+/// it never reaches 2^63.
+const Requests = aegis.units.Count(enum { requests }, i64);
 
 /// Which era the server is in, once `connect` has asked.
 pub const Era = enum { unknown, modern, session };
@@ -333,7 +337,7 @@ fn writeCapabilities(c: *const Client, w: *Writer) Writer.Error!void {
 /// Sends `method` with `params` (one JSON object) and returns the answer.
 /// Under 2026-07-28 the params gain the `_meta` every request carries.
 fn send(c: *Client, io: Io, arena: Allocator, method: []const u8, params: []const u8, name: ?[]const u8, arguments: ?[]const u8, era: Era, timeout: Io.Duration) RequestError!wire.Message {
-    const id: wire.Id = .{ .integer = c.next_id.fetchAdd(1, .monotonic) };
+    const id: wire.Id = .{ .integer = c.next_id.fetchAddWrapping(.fromRaw(1), .monotonic).raw() };
     var out: Writer.Allocating = .init(arena);
     const w = &out.writer;
     w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":") catch return error.OutOfMemory;

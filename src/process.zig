@@ -197,40 +197,45 @@ pub const Child = struct {
 
 /// The latest bytes of a stream, up to a limit: a ring.
 const Kept = struct {
-    mutex: Io.Mutex = .init,
-    ring: []u8,
-    /// Bytes ever written; the ring holds the last `ring.len` of them.
-    written: u64 = 0,
+    ring: aegis.BlockingGuarded(Ring),
     task: ?Io.Future(void) = null,
 
+    const Ring = struct {
+        bytes: []u8,
+        /// Bytes ever written; the ring holds the last `bytes.len` of them.
+        written: u64 = 0,
+    };
+
     fn init(gpa: Allocator, limit: u32) Allocator.Error!Kept {
-        return .{ .ring = try gpa.alloc(u8, limit) };
+        return .{ .ring = .init(.{ .bytes = try gpa.alloc(u8, limit) }) };
     }
 
     fn deinit(k: *Kept, gpa: Allocator) void {
-        gpa.free(k.ring);
+        gpa.free(k.ring.teardown().bytes);
     }
 
     fn append(k: *Kept, io: Io, bytes: []const u8) void {
-        if (k.ring.len == 0) return;
-        k.mutex.lockUncancelable(io);
-        defer k.mutex.unlock(io);
-        const keep = bytes[bytes.len -| k.ring.len..];
-        k.written += bytes.len - keep.len;
+        var held = k.ring.acquireUncancelable(io);
+        defer held.deinit(io);
+        const r = held.value();
+        if (r.bytes.len == 0) return;
+        const keep = bytes[bytes.len -| r.bytes.len..];
+        r.written += bytes.len - keep.len;
         for (keep) |b| {
-            k.ring[@intCast(k.written % k.ring.len)] = b;
-            k.written += 1;
+            r.bytes[@intCast(r.written % r.bytes.len)] = b;
+            r.written += 1;
         }
     }
 
     fn tail(k: *Kept, io: Io, buffer: []u8) []u8 {
-        k.mutex.lockUncancelable(io);
-        defer k.mutex.unlock(io);
-        const held: usize = @intCast(@min(k.written, k.ring.len));
-        const n = @min(held, buffer.len);
+        var held = k.ring.acquireUncancelable(io);
+        defer held.deinit(io);
+        const r = held.value();
+        const kept: usize = @intCast(@min(r.written, r.bytes.len));
+        const n = @min(kept, buffer.len);
         for (buffer[0..n], 0..) |*b, i| {
-            const at = k.written - n + i;
-            b.* = k.ring[@intCast(at % k.ring.len)];
+            const at = r.written - n + i;
+            b.* = r.bytes[@intCast(at % r.bytes.len)];
         }
         return buffer[0..n];
     }

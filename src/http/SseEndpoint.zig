@@ -18,6 +18,7 @@ const SseEndpoint = @This();
 const std = @import("std");
 const parley = @import("parley");
 const uplink = @import("uplink");
+const aegis = @import("aegis");
 const guard = @import("guard.zig");
 
 const Io = std.Io;
@@ -35,8 +36,7 @@ options: Options,
 /// endpoint by `@fieldParentPtr`.
 handling: uplink.server.Handler = .{ .handleFn = handled },
 /// Private: the open sessions; `refs` counts who holds each.
-sessions_mutex: Io.Mutex = .init,
-sessions: std.ArrayList(*Session) = .empty,
+sessions: aegis.BlockingGuarded(std.ArrayList(*Session)) = .init(.empty),
 
 pub const Options = struct {
     /// As `Endpoint.Options.loopback`.
@@ -68,8 +68,9 @@ pub fn init(gpa: Allocator, server: *parley.Server, options: Options) SseEndpoin
 /// The server the endpoint is mounted on has stopped, and with it every
 /// stream: no session is left.
 pub fn deinit(e: *SseEndpoint) void {
-    std.debug.assert(e.sessions.items.len == 0);
-    e.sessions.deinit(e.gpa);
+    const sessions = e.sessions.teardown();
+    std.debug.assert(sessions.items.len == 0);
+    sessions.deinit(e.gpa);
 }
 
 /// The endpoint as an uplink handler, for as long as the endpoint stays where
@@ -85,13 +86,15 @@ fn handled(h: *uplink.server.Handler, io: Io, request: *Request, response: *Resp
 
 /// One session: its stream's response, the connection that answers it,
 /// and who holds it. Freed by the last `release`.
+const Holders = aegis.units.Count(enum { holders }, u32);
+
 const Session = struct {
     id: [32]u8,
     io: Io,
     response: *Response,
     connection: parley.stdio.Connection,
-    /// Private, under `sessions_mutex`.
-    refs: u32 = 1,
+    /// Private: who holds it: its stream, and each POST finding it.
+    refs: aegis.Atomic(Holders) = .init(.fromRaw(1)),
     /// The event being written, between `begin` and `end`.
     event: sse.EventWriter = undefined,
     buffer: [256]u8 = undefined,
@@ -160,7 +163,7 @@ fn open(e: *SseEndpoint, io: Io, request: *Request, response: *Response) anyerro
     // stopped first, and a POST still holding the session finds it ended.
     // glint-ignore: Z026 -- the stream was the answer; a client gone before its end needs no more
     defer response.end(io) catch {};
-    defer e.release(io, session);
+    defer e.release(session);
     defer {
         e.forget(io, session);
         session.connection.deinit();
@@ -196,7 +199,7 @@ fn post(e: *SseEndpoint, io: Io, arena: Allocator, request: *Request, response: 
         return refuse(io, response, .unsupported_media_type, null, .invalid_request, "The body is application/json");
     const session = e.lookup(io, id) orelse
         return refuse(io, response, .not_found, null, .invalid_request, "Session not found: open a stream again");
-    defer e.release(io, session);
+    defer e.release(session);
     // The server's message limit bounds the body, read onto `gpa`: the
     // connection keeps it while it is answered.
     const body = request.collect(e.gpa, io, .limited(e.server.options.limits.message.raw())) catch |err| switch (err) {
@@ -252,40 +255,36 @@ fn sessionOf(query: ?[]const u8) ?[]const u8 {
 
 /// Adds `session`, unless the endpoint holds as many as it takes.
 fn admit(e: *SseEndpoint, io: Io, session: *Session) Io.Cancelable!bool {
-    try e.sessions_mutex.lock(io);
-    defer e.sessions_mutex.unlock(io);
-    if (e.sessions.items.len >= e.options.max_sessions) return false;
-    e.sessions.append(e.gpa, session) catch return false;
+    var held = try e.sessions.acquire(io);
+    defer held.deinit(io);
+    const sessions = held.value();
+    if (sessions.items.len >= e.options.max_sessions) return false;
+    sessions.append(e.gpa, session) catch return false;
     return true;
 }
 
 /// Takes `session` out of the open ones: no POST finds it again.
 fn forget(e: *SseEndpoint, io: Io, session: *Session) void {
-    e.sessions_mutex.lockUncancelable(io);
-    defer e.sessions_mutex.unlock(io);
-    for (e.sessions.items, 0..) |s, i| if (s == session) {
-        _ = e.sessions.swapRemove(i);
+    var held = e.sessions.acquireUncancelable(io);
+    defer held.deinit(io);
+    const sessions = held.value();
+    for (sessions.items, 0..) |s, i| if (s == session) {
+        _ = sessions.swapRemove(i);
         return;
     };
 }
 
 /// The session named `id`, held until `release`.
 fn lookup(e: *SseEndpoint, io: Io, id: []const u8) ?*Session {
-    e.sessions_mutex.lockUncancelable(io);
-    defer e.sessions_mutex.unlock(io);
-    for (e.sessions.items) |s| if (std.mem.eql(u8, &s.id, id)) {
-        s.refs += 1;
+    var held = e.sessions.acquireUncancelable(io);
+    defer held.deinit(io);
+    for (held.value().items) |s| if (std.mem.eql(u8, &s.id, id)) {
+        _ = s.refs.fetchAddWrapping(.fromRaw(1), .acq_rel);
         return s;
     };
     return null;
 }
 
-fn release(e: *SseEndpoint, io: Io, session: *Session) void {
-    const last = blk: {
-        e.sessions_mutex.lockUncancelable(io);
-        defer e.sessions_mutex.unlock(io);
-        session.refs -= 1;
-        break :blk session.refs == 0;
-    };
-    if (last) e.gpa.destroy(session);
+fn release(e: *SseEndpoint, session: *Session) void {
+    if (session.refs.fetchSubWrapping(.fromRaw(1), .acq_rel).raw() == 1) e.gpa.destroy(session);
 }

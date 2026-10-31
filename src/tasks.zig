@@ -22,6 +22,15 @@ pub const extension = "io.modelcontextprotocol/tasks";
 /// A span as the extension writes one: whole milliseconds.
 pub const Duration = aegis.units.Duration(.millisecond, u32);
 
+/// A task's times: milliseconds on the real clock, as its `createdAt` and
+/// `lastUpdatedAt` are written.
+pub const Instant = aegis.units.Instant(.real, .millisecond, i64);
+
+/// Now, on the tasks' clock.
+pub fn now(io: Io) Instant {
+    return Instant.fromTimestamp(Io.Timestamp.now(io, .real), .down) catch .fromRaw(std.math.maxInt(i64));
+}
+
 pub const Options = struct {
     /// Tasks held at once, finished ones included until their time is up.
     max: u32 = 256,
@@ -69,8 +78,8 @@ pub const Task = struct {
     /// Why it failed or was cancelled.
     message: ?[]const u8 = null,
     /// Milliseconds since the epoch.
-    created: i64,
-    updated: i64,
+    created: Instant,
+    updated: Instant,
     /// What it waits for, while its status is `input_required`.
     asked: std.ArrayList(Asked) = .empty,
     /// The answers given so far to what it waits for.
@@ -125,16 +134,25 @@ pub const Task = struct {
 /// a `notifications/tasks`.
 pub const Form = enum { created, polled, notified };
 
-/// The tasks a server holds. Every field but `io` and `group` is guarded by
-/// `mutex`.
+/// The tasks a server holds. What is done to a task takes the table's
+/// lock (`held`), whose value each of those calls is given.
 pub const Table = struct {
     gpa: Allocator,
     io: Io,
     options: Options,
-    mutex: Io.Mutex = .init,
-    tasks: std.ArrayList(*Task) = .empty,
+    /// The tasks held, and every task's fields with them.
+    held: aegis.BlockingGuarded(Held) = .init(.{}),
     /// The rounds running, each in a task of its own.
     group: Io.Group = .init,
+
+    pub const Held = struct {
+        tasks: std.ArrayList(*Task) = .empty,
+    };
+
+    /// The table's lock, until the guard's `deinit`.
+    pub fn lock(t: *Table) aegis.BlockingGuarded(Held).Guard {
+        return t.held.acquireUncancelable(t.io);
+    }
 
     pub fn init(gpa: Allocator, io: Io, options: Options) Table {
         return .{ .gpa = gpa, .io = io, .options = options };
@@ -143,13 +161,14 @@ pub const Table = struct {
     /// Stops every round, then frees every task.
     pub fn deinit(t: *Table) void {
         t.group.cancel(t.io);
-        for (t.tasks.items) |task| t.destroy(task);
-        t.tasks.deinit(t.gpa);
+        const h = t.held.teardown();
+        for (h.tasks.items) |task| t.destroy(task);
+        h.tasks.deinit(t.gpa);
     }
 
     /// A task not yet held: the call it is made for may still answer
     /// without it.
-    pub fn create(t: *Table, principal: ?[]const u8, params: []const u8, now: i64) (Allocator.Error || Io.RandomSecureError)!*Task {
+    pub fn create(t: *Table, principal: ?[]const u8, params: []const u8, at: Instant) (Allocator.Error || Io.RandomSecureError)!*Task {
         const task = try t.gpa.create(Task);
         errdefer t.gpa.destroy(task);
         var bytes: [16]u8 = undefined;
@@ -157,7 +176,7 @@ pub const Table = struct {
         const owned_params = try t.gpa.dupe(u8, params);
         errdefer t.gpa.free(owned_params);
         const owned_principal = if (principal) |p| try t.gpa.dupe(u8, p) else null;
-        task.* = .{ .id = std.fmt.bytesToHex(bytes, .lower), .principal = owned_principal, .params = owned_params, .created = now, .updated = now };
+        task.* = .{ .id = std.fmt.bytesToHex(bytes, .lower), .principal = owned_principal, .params = owned_params, .created = at, .updated = at };
         return task;
     }
 
@@ -167,18 +186,18 @@ pub const Table = struct {
     }
 
     /// Holds `task`, unless as many are held as allowed (after the ones
-    /// whose time is up are let go). The caller holds `mutex`.
-    pub fn hold(t: *Table, task: *Task, now: i64) Allocator.Error!bool {
-        t.sweep(now);
-        if (t.tasks.items.len >= t.options.max) return false;
-        try t.tasks.append(t.gpa, task);
+    /// whose time is up are let go).
+    pub fn hold(t: *Table, h: *Held, task: *Task, at: Instant) Allocator.Error!bool {
+        t.sweep(h, at);
+        if (h.tasks.items.len >= t.options.max) return false;
+        try h.tasks.append(t.gpa, task);
         return true;
     }
 
-    /// The task `id` held for `principal`, or null. The caller holds `mutex`.
-    pub fn find(t: *Table, id: []const u8, principal: ?[]const u8, now: i64) ?*Task {
-        t.sweep(now);
-        for (t.tasks.items) |task| if (std.mem.eql(u8, &task.id, id)) {
+    /// The task `id` held for `principal`, or null.
+    pub fn find(t: *Table, h: *Held, id: []const u8, principal: ?[]const u8, at: Instant) ?*Task {
+        t.sweep(h, at);
+        for (h.tasks.items) |task| if (std.mem.eql(u8, &task.id, id)) {
             const same = if (task.principal) |p| (if (principal) |q| std.mem.eql(u8, p, q) else false) else principal == null;
             return if (same) task else null;
         };
@@ -186,12 +205,12 @@ pub const Table = struct {
     }
 
     /// Lets go of the tasks whose time is up; one still running is told to
-    /// stop, and goes once it has. The caller holds `mutex`.
-    pub fn sweep(t: *Table, now: i64) void {
+    /// stop, and goes once it has.
+    pub fn sweep(t: *Table, h: *Held, at: Instant) void {
         var i: usize = 0;
-        while (i < t.tasks.items.len) {
-            const task = t.tasks.items[i];
-            if (now < task.created + @as(i64, t.options.ttl.raw())) {
+        while (i < h.tasks.items.len) {
+            const task = h.tasks.items[i];
+            if (at.compare(task.created.saturatingAdd(t.options.ttl.convert(.millisecond, i64, .exact))) == .lt) {
                 i += 1;
                 continue;
             }
@@ -200,16 +219,17 @@ pub const Table = struct {
                 i += 1;
                 continue;
             }
-            _ = t.tasks.swapRemove(i);
+            _ = h.tasks.swapRemove(i);
             t.destroy(task);
         }
     }
 
-    // What happens to a task. The caller holds `mutex`; each takes copies.
+    // What happens to a task, under the table's lock (`h`); each takes
+    // copies.
 
     /// The handler asks for `asked` (keys and requests as JSON), keeping
     /// `state`.
-    pub fn ask(t: *Table, task: *Task, now: i64, asked: []const Asked, state: ?[]const u8) Allocator.Error!void {
+    pub fn ask(t: *Table, h: *Held, task: *Task, at: Instant, asked: []const Asked, state: ?[]const u8) Allocator.Error!void {
         task.clearAsked(t.gpa);
         task.clearAnswers(t.gpa);
         for (asked) |a| {
@@ -218,13 +238,13 @@ pub const Table = struct {
             errdefer t.gpa.free(key);
             task.asked.appendAssumeCapacity(.{ .key = key, .request = try t.gpa.dupe(u8, a.request) });
         }
-        try t.keepState(task, state);
+        try t.keepState(h, task, state);
         _ = task.lifecycle.step(.ask) catch unreachable; // unreachable: a round runs only while the task is working
-        task.updated = now;
+        task.updated = at;
     }
 
     /// Keeps `state` for the next round, replacing the one before.
-    pub fn keepState(t: *Table, task: *Task, state: ?[]const u8) Allocator.Error!void {
+    pub fn keepState(t: *Table, _: *Held, task: *Task, state: ?[]const u8) Allocator.Error!void {
         const copy = if (state) |s| try t.gpa.dupe(u8, s) else null;
         if (task.state) |old| t.gpa.free(old);
         task.state = copy;
@@ -235,17 +255,17 @@ pub const Table = struct {
     /// is answered the task works again, and the answers are returned as
     /// one `inputResponses` object for its next round, on `arena`; `responses`
     /// is read within `limits` (the server's).
-    pub fn answer(t: *Table, task: *Task, now: i64, arena: Allocator, responses: []const u8, limits: strand.core.Limits) error{ OutOfMemory, Invalid }!?[]const u8 {
+    pub fn answer(t: *Table, _: *Held, task: *Task, at: Instant, arena: Allocator, responses: []const u8, limits: strand.core.Limits) error{ OutOfMemory, Invalid }!?[]const u8 {
         if (task.status() != .input_required) return null;
         var members: strand.json.Members = undefined;
         members.init(responses, .{ .limits = limits });
         while (members.next() catch return error.Invalid) |m| {
-            const at = for (task.asked.items, 0..) |a, i| {
+            const index = for (task.asked.items, 0..) |a, i| {
                 if (m.is(a.key)) break i;
             } else continue;
             try task.answers.ensureUnusedCapacity(t.gpa, 1);
             const value = try t.gpa.dupe(u8, m.value);
-            const asked = task.asked.orderedRemove(at);
+            const asked = task.asked.orderedRemove(index);
             t.gpa.free(asked.request);
             task.answers.appendAssumeCapacity(.{ .key = asked.key, .value = value });
         }
@@ -262,18 +282,18 @@ pub const Table = struct {
         w.writeByte('}') catch return error.OutOfMemory;
         task.clearAnswers(t.gpa);
         _ = task.lifecycle.step(.@"resume") catch unreachable; // unreachable: the status was checked above
-        task.updated = now;
+        task.updated = at;
         return out.written();
     }
 
-    pub fn complete(t: *Table, task: *Task, now: i64, result: []const u8) Allocator.Error!void {
+    pub fn complete(t: *Table, _: *Held, task: *Task, at: Instant, result: []const u8) Allocator.Error!void {
         task.outcome = try t.gpa.dupe(u8, result);
         _ = task.lifecycle.step(.complete) catch unreachable; // unreachable: a round runs only while the task is working
-        task.updated = now;
+        task.updated = at;
     }
 
     /// Fails with `failure`, a JSON-RPC error object, and its message.
-    pub fn fail(t: *Table, task: *Task, now: i64, failure: []const u8, message: []const u8) Allocator.Error!void {
+    pub fn fail(t: *Table, _: *Held, task: *Task, at: Instant, failure: []const u8, message: []const u8) Allocator.Error!void {
         if (task.lifecycle.isTerminal()) return;
         const owned = try t.gpa.dupe(u8, failure);
         errdefer t.gpa.free(owned);
@@ -282,16 +302,16 @@ pub const Table = struct {
         task.message = text;
         task.outcome = owned;
         _ = task.lifecycle.step(.fail) catch unreachable; // unreachable: not terminal, checked above
-        task.updated = now;
+        task.updated = at;
     }
 
-    pub fn cancelled(t: *Table, task: *Task, now: i64, message: []const u8) Allocator.Error!void {
+    pub fn cancelled(t: *Table, _: *Held, task: *Task, at: Instant, message: []const u8) Allocator.Error!void {
         if (task.lifecycle.isTerminal()) return;
         const owned = try t.gpa.dupe(u8, message);
         if (task.message) |old| t.gpa.free(old);
         task.message = owned;
         _ = task.lifecycle.step(.cancel) catch unreachable; // unreachable: not terminal, checked above
-        task.updated = now;
+        task.updated = at;
     }
 };
 
@@ -335,9 +355,9 @@ pub fn write(w: *Writer, task: *const Task, form: Form, ttl: Duration, poll: Dur
     try w.writeByte('}');
 }
 
-/// `ms` (since the epoch) as ISO 8601 in UTC, to the millisecond, quoted.
-pub fn writeTime(w: *Writer, ms: i64) Writer.Error!void {
-    const clamped: u64 = @intCast(@max(ms, 0)); // safe: clamped to zero and up
+/// `at` as ISO 8601 in UTC, to the millisecond, quoted.
+pub fn writeTime(w: *Writer, at: Instant) Writer.Error!void {
+    const clamped: u64 = @intCast(@max(at.raw(), 0)); // safe: clamped to zero and up
     const seconds: std.time.epoch.EpochSeconds = .{ .secs = clamped / 1000 };
     const day = seconds.getEpochDay().calculateYearDay();
     const month_day = day.calculateMonthDay();
@@ -356,10 +376,10 @@ pub fn writeTime(w: *Writer, ms: i64) Writer.Error!void {
 test "a time is written as ISO 8601 to the millisecond" {
     var buffer: [64]u8 = undefined;
     var w: Writer = .fixed(&buffer);
-    try writeTime(&w, 1_791_206_906_669);
+    try writeTime(&w, .fromRaw(1_791_206_906_669));
     try std.testing.expectEqualStrings("\"2026-10-05T13:28:26.669Z\"", w.buffered());
     w = .fixed(&buffer);
-    try writeTime(&w, 0);
+    try writeTime(&w, .fromRaw(0));
     try std.testing.expectEqualStrings("\"1970-01-01T00:00:00.000Z\"", w.buffered());
 }
 

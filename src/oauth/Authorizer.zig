@@ -33,6 +33,7 @@ const std = @import("std");
 const uplink = @import("uplink");
 const oauth = @import("clearance.oauth");
 const http = @import("parley.http");
+const aegis = @import("aegis");
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -44,19 +45,10 @@ web: *uplink.Client,
 /// The MCP server's URL: the resource the tokens are for.
 resource: []const u8,
 options: Options,
-/// Private: one renewal at a time; guards everything below.
-mutex: Io.Mutex = .init,
-/// Private: the tokens requests carry, once there are some.
-active: ?TokenSet = null,
-/// Private: the authorization server they came from, owned.
-issuer: ?[]u8 = null,
-/// Private: the client registered with it now, owned.
-registered: ?Registered = null,
+/// Private: one renewal at a time, and what renewals gave.
+held: aegis.BlockingGuarded(Held) = .init(.{}),
 /// Private: where tokens are kept when the options name no store.
 memory: oauth.store.Memory,
-/// Why the last refusal stood (a server that cannot be discovered, a
-/// sign-in refused); null once a renewal succeeds.
-failure: ?anyerror = null,
 /// Private: the authorizer as a transport's, `authorization()`.
 authorizing: http.Transport.Authorization = .{ .vtable = &.{ .credentials = credentials, .refused = refused } },
 
@@ -170,18 +162,28 @@ pub const SignIn = struct {
 /// `Declined`: the user did not sign in.
 pub const SignInError = error{ Declined, Canceled, OutOfMemory };
 
+/// What renewals gave.
+const Held = struct {
+    /// The tokens requests carry, once there are some.
+    active: ?TokenSet = null,
+    /// The authorization server they came from, owned.
+    issuer: ?[]u8 = null,
+    /// The client registered with it now, owned.
+    registered: ?Registered = null,
+    /// Why the last refusal stood; null once a renewal succeeds.
+    failure: ?anyerror = null,
+};
+
 /// A client registered with the server now, owned.
 const Registered = struct {
     id: []u8,
-    secret: ?[]u8,
+    /// Erased as it is freed.
+    secret: ?aegis.SecretBytes,
     method: Method,
 
     fn deinit(r: *Registered, gpa: Allocator) void {
         gpa.free(r.id);
-        if (r.secret) |s| {
-            std.crypto.secureZero(u8, s);
-            gpa.free(s);
-        }
+        if (r.secret) |*s| s.deinit(gpa);
         r.* = undefined;
     }
 };
@@ -193,11 +195,20 @@ pub fn init(gpa: Allocator, web: *uplink.Client, resource: []const u8, options: 
 }
 
 pub fn deinit(a: *Authorizer) void {
-    if (a.active) |*set| set.deinit();
-    if (a.issuer) |i| a.gpa.free(i);
-    if (a.registered) |*r| r.deinit(a.gpa);
+    const h = a.held.teardown();
+    if (h.active) |*set| set.deinit();
+    if (h.issuer) |i| a.gpa.free(i);
+    if (h.registered) |*r| r.deinit(a.gpa);
     a.memory.deinit();
     a.* = undefined;
+}
+
+/// Why the last refusal stood (a server that cannot be discovered, a
+/// sign-in refused); null once a renewal succeeds.
+pub fn failure(a: *Authorizer, io: Io) ?anyerror {
+    var held = a.held.acquireUncancelable(io);
+    defer held.deinit(io);
+    return held.value().failure;
 }
 
 /// The authorizer as the HTTP transport's `authorization`. The authorizer
@@ -212,33 +223,34 @@ fn store(a: *Authorizer) *oauth.TokenStore {
 
 fn credentials(auth: *http.Transport.Authorization, io: Io, arena: Allocator) http.Transport.Authorization.Error!?[]const u8 {
     const a: *Authorizer = @alignCast(@fieldParentPtr("authorizing", auth));
-    try a.mutex.lock(io);
-    defer a.mutex.unlock(io);
-    const set = a.active orelse return null;
+    var held = try a.held.acquire(io);
+    defer held.deinit(io);
+    const set = held.value().active orelse return null;
     return try std.mem.concat(arena, u8, &.{ "Bearer ", set.access_token });
 }
 
 fn refused(auth: *http.Transport.Authorization, io: Io, sent: ?[]const u8, status: u16, challenges: []const []const u8) http.Transport.Authorization.Error!bool {
     const a: *Authorizer = @alignCast(@fieldParentPtr("authorizing", auth));
-    try a.mutex.lock(io);
-    defer a.mutex.unlock(io);
+    var held = try a.held.acquire(io);
+    defer held.deinit(io);
+    const h = held.value();
     // Another request renewed the tokens since this one was sent.
-    if (a.active) |set| {
+    if (h.active) |set| {
         const was = sent orelse return true;
         if (!std.mem.eql(u8, was["Bearer ".len..], set.access_token)) return true;
     }
     var arena_state: std.heap.ArenaAllocator = .init(a.gpa);
     defer arena_state.deinit();
-    a.renew(io, arena_state.allocator(), status, challenges) catch |err| switch (err) {
+    a.renew(h, io, arena_state.allocator(), status, challenges) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         error.OutOfMemory => return error.OutOfMemory,
         else => {
-            a.failure = err;
+            h.failure = err;
             std.log.scoped(.parley_oauth).warn("the server's refusal stands: {t}", .{err});
             return false;
         },
     };
-    a.failure = null;
+    h.failure = null;
     return true;
 }
 
@@ -270,7 +282,7 @@ const RenewError = oauth.DiscoverError || oauth.RefreshError || oauth.RegisterEr
 
 /// New tokens, as MCP's authorization asks, for a request refused with
 /// `status` and `challenges`.
-fn renew(a: *Authorizer, io: Io, arena: Allocator, status: u16, challenges: []const []const u8) RenewError!void {
+fn renew(a: *Authorizer, h: *Held, io: Io, arena: Allocator, status: u16, challenges: []const []const u8) RenewError!void {
     const challenge = (try oauth.challenge.read(arena, challenges)) orelse return error.NotBearer;
     if (status == 403 and challenge.@"error" != .insufficient_scope) return error.Forbidden;
     var prm = try oauth.discoverResource(a.gpa, io, a.web, a.resource, challenge.resource_metadata, .ancestor, .{ .fetch = a.options.fetch });
@@ -281,30 +293,30 @@ fn renew(a: *Authorizer, io: Io, arena: Allocator, status: u16, challenges: []co
     defer server.deinit();
     const as = &server.value;
     // Another server: nothing the old one issued goes to it (SEP-2352).
-    if (a.issuer) |old| if (!std.mem.eql(u8, old, as.issuer)) a.forgetServer(io, arena);
-    if (a.issuer == null) a.issuer = try a.gpa.dupe(u8, as.issuer);
-    const key = try a.storeKey(arena);
+    if (h.issuer) |old| if (!std.mem.eql(u8, old, as.issuer)) a.forgetServer(h, io, arena);
+    if (h.issuer == null) h.issuer = try a.gpa.dupe(u8, as.issuer);
+    const key = try a.storeKey(h, arena);
     const resource = prm.value.resource;
 
     // A first refusal: tokens kept from before (another run) are sent next,
     // unless they lack the scope the challenge asks for or have expired, in
     // which case they are what a refresh starts from.
-    if (a.active == null) if (try a.store().load(io, a.gpa, key)) |kept| {
-        a.active = kept;
+    if (h.active == null) if (try a.store().load(io, a.gpa, key)) |kept| {
+        h.active = kept;
         if (covers(kept.scope, challenge.scope) and !kept.expiresWithin(Io.Clock.real.now(io), .literal("0s"))) return;
     };
     // A workload's token is its own credential: a client only when one was
     // registered beforehand.
-    const client: ?oauth.Client = if (a.options.grant == .jwt_bearer) try a.registeredWith(as) else try a.clientFor(io, as);
+    const client: ?oauth.Client = if (a.options.grant == .jwt_bearer) try a.registeredWith(as) else try a.clientFor(h, io, as);
     // Refused tokens that can be refreshed, and no more scope asked for:
     // a refresh first, a sign-in only if it is refused.
-    if (a.active) |*set| if (client != null and set.refresh_token != null and covers(set.scope, challenge.scope)) {
+    if (h.active) |*set| if (client != null and set.refresh_token != null and covers(set.scope, challenge.scope)) {
         switch (try oauth.refresh(a.gpa, io, a.web, as, client.?, set, .{ .resources = &.{resource}, .fetch = a.options.fetch })) {
-            .tokens => |renewed| return a.keep(io, key, renewed),
+            .tokens => |renewed| return a.keep(h, io, key, renewed),
             .refused => {},
         }
     };
-    const scope = try a.scopeFor(arena, challenge.scope, prm.value.scopes_supported, as);
+    const scope = try a.scopeFor(h, arena, challenge.scope, prm.value.scopes_supported, as);
     const response = switch (a.options.grant) {
         .authorization_code => try a.signIn(io, arena, as, client.?, scope, resource),
         .client_credentials => try oauth.clientCredentials(a.gpa, io, a.web, as, client.?, scope, .{ .resources = &.{resource}, .fetch = a.options.fetch }),
@@ -316,7 +328,7 @@ fn renew(a: *Authorizer, io: Io, arena: Allocator, status: u16, challenges: []co
         },
     };
     switch (response) {
-        .tokens => |set| return a.keep(io, key, set),
+        .tokens => |set| return a.keep(h, io, key, set),
         .refused => |e| {
             std.log.scoped(.parley_oauth).warn("the token endpoint refused: {f}", .{e});
             return error.TokenRefused;
@@ -375,39 +387,39 @@ fn enterpriseGrant(a: *Authorizer, io: Io, arena: Allocator, as: *const oauth.me
 }
 
 /// Keeps `set` as the tokens in use, and in the store.
-fn keep(a: *Authorizer, io: Io, key: []const u8, set: TokenSet) RenewError!void {
+fn keep(a: *Authorizer, h: *Held, io: Io, key: []const u8, set: TokenSet) RenewError!void {
     var owned = set;
     errdefer owned.deinit();
     try a.store().save(io, key, &owned);
-    if (a.active) |*old| old.deinit();
-    a.active = owned;
+    if (h.active) |*old| old.deinit();
+    h.active = owned;
 }
 
 /// Forgets the server: its tokens, here and kept, and the client it
 /// registered.
-fn forgetServer(a: *Authorizer, io: Io, arena: Allocator) void {
-    if (a.storeKey(arena)) |k| a.store().forget(io, k) else |_| {}
-    if (a.active) |*set| set.deinit();
-    a.active = null;
-    if (a.registered) |*r| r.deinit(a.gpa);
-    a.registered = null;
-    if (a.issuer) |i| a.gpa.free(i);
-    a.issuer = null;
+fn forgetServer(a: *Authorizer, h: *Held, io: Io, arena: Allocator) void {
+    if (a.storeKey(h, arena)) |k| a.store().forget(io, k) else |_| {}
+    if (h.active) |*set| set.deinit();
+    h.active = null;
+    if (h.registered) |*r| r.deinit(a.gpa);
+    h.registered = null;
+    if (h.issuer) |i| a.gpa.free(i);
+    h.issuer = null;
 }
 
 /// Where tokens are kept: the server and the resource they are for.
-fn storeKey(a: *const Authorizer, arena: Allocator) Allocator.Error![]const u8 {
-    return std.mem.concat(arena, u8, &.{ a.issuer orelse "", " ", a.resource });
+fn storeKey(a: *const Authorizer, h: *const Held, arena: Allocator) Allocator.Error![]const u8 {
+    return std.mem.concat(arena, u8, &.{ h.issuer orelse "", " ", a.resource });
 }
 
 /// The client as `as` knows it.
-fn clientFor(a: *Authorizer, io: Io, as: *const oauth.metadata.AuthorizationServer) RenewError!oauth.Client {
+fn clientFor(a: *Authorizer, h: *Held, io: Io, as: *const oauth.metadata.AuthorizationServer) RenewError!oauth.Client {
     if (try a.registeredWith(as)) |client| return client;
     if (a.options.grant == .client_credentials or a.options.grant == .enterprise) return error.NotRegistered;
     if (a.options.metadata_url) |url| if (as.client_id_metadata_document_supported) return .{ .id = url };
-    if (a.registered == null) a.registered = try a.register(io, as);
-    const r = a.registered.?;
-    return .{ .id = r.id, .credentials = withSecret(r.method, r.secret orelse "") };
+    if (h.registered == null) h.registered = try a.register(io, as);
+    const r = h.registered.?;
+    return .{ .id = r.id, .credentials = withSecret(r.method, if (r.secret) |*s| s.expose() else "") };
 }
 
 /// The client registered beforehand with `as`, if one was.
@@ -465,7 +477,11 @@ fn register(a: *Authorizer, io: Io, as: *const oauth.metadata.AuthorizationServe
             if (method != .none and r.client_secret == null) return error.RegistrationRefused;
             const id = try a.gpa.dupe(u8, r.client_id);
             errdefer a.gpa.free(id);
-            const secret = if (method == .none) null else try a.gpa.dupe(u8, r.client_secret.?);
+            if (method == .none) return .{ .id = id, .secret = null, .method = method };
+            const given = r.client_secret.?;
+            var secret: aegis.SecretBytes = try .init(a.gpa, given.len);
+            errdefer secret.deinit(a.gpa);
+            secret.replace(given) catch unreachable; // unreachable: allocated to its length, and apart from it
             return .{ .id = id, .secret = secret, .method = method };
         },
     }
@@ -474,9 +490,9 @@ fn register(a: *Authorizer, io: Io, as: *const oauth.metadata.AuthorizationServe
 /// The scope to ask for: what was granted before, and what the challenge
 /// names (else what the resource lists), each once; `offline_access` added
 /// where the server lists it and refresh tokens are wanted. Null: none.
-fn scopeFor(a: *const Authorizer, arena: Allocator, challenged: ?[]const u8, listed: ?[]const []const u8, as: *const oauth.metadata.AuthorizationServer) Allocator.Error!?[]const u8 {
+fn scopeFor(a: *const Authorizer, h: *const Held, arena: Allocator, challenged: ?[]const u8, listed: ?[]const []const u8, as: *const oauth.metadata.AuthorizationServer) Allocator.Error!?[]const u8 {
     const needed = challenged orelse if (listed) |l| try std.mem.join(arena, " ", l) else "";
-    const granted = if (a.active) |set| set.scope else null;
+    const granted = if (h.active) |set| set.scope else null;
     var out: Io.Writer.Allocating = .init(arena);
     oauth.challenge.writeStepUp(&out.writer, granted, needed) catch return error.OutOfMemory;
     if (a.options.offline and a.options.grant == .authorization_code and as.supportsScope("offline_access") and !oauth.challenge.contains(out.written(), "offline_access")) {

@@ -51,41 +51,61 @@ pub const Session = struct {
     gpa: Allocator,
     server: *Server,
     options: Options,
-    /// Private: what the handshake gave, kept for the session's life.
-    arena: std.heap.ArenaAllocator,
-    mutex: Io.Mutex = .init,
-    lifecycle: Lifecycle.Runtime(void) = .init({}),
-    revision: Revision = Revision.latest_legacy,
-    client: types.ClientCapabilities = .{},
-    client_info: ?types.Implementation = null,
-    log_level: ?types.LoggingLevel = null,
+    /// Private: what the handshake set, and the server's requests waiting
+    /// for their answers.
+    held: aegis.BlockingGuarded(Held),
     /// The session's change stream: every list, and the resources the
     /// client subscribed to.
     listener: subscriptions.Listener,
-    /// Private: requests of the server's that wait for their answers.
-    outgoing: std.ArrayList(*Outgoing) = .empty,
-    next_id: std.atomic.Value(u64) = .init(1),
+    /// Private: the server's requests sent, which number the next.
+    next_id: aegis.Atomic(Asked) = .init(.fromRaw(1)),
+
+    const Held = struct {
+        /// What the handshake gave, kept for the session's life.
+        arena: std.heap.ArenaAllocator,
+        lifecycle: Lifecycle.Runtime(void) = .init({}),
+        revision: Revision = Revision.latest_legacy,
+        client: types.ClientCapabilities = .{},
+        client_info: ?types.Implementation = null,
+        log_level: ?types.LoggingLevel = null,
+        outgoing: std.ArrayList(*Outgoing) = .empty,
+    };
+
+    /// The server's requests to the client: one at a time, they never
+    /// reach 2^64.
+    const Asked = aegis.units.Count(enum { asked }, u64);
 
     pub fn init(gpa: Allocator, server: *Server, options: Options) Session {
         var lists: std.EnumSet(subscriptions.Kind) = .empty;
         lists.insert(.tools);
         lists.insert(.prompts);
         lists.insert(.resources);
-        return .{ .gpa = gpa, .server = server, .options = options, .arena = .init(gpa), .listener = .{ .id = null, .lists = lists } };
+        return .{ .gpa = gpa, .server = server, .options = options, .held = .init(.{ .arena = .init(gpa) }), .listener = .{ .id = null, .lists = lists } };
     }
 
     pub fn deinit(s: *Session) void {
         s.listener.deinit(s.gpa);
-        s.outgoing.deinit(s.gpa);
-        s.arena.deinit();
+        const h = s.held.teardown();
+        h.outgoing.deinit(s.gpa);
+        h.arena.deinit();
     }
 
     /// Whether `initialize` has been answered.
-    pub fn open(s: *Session) bool {
-        return switch (s.lifecycle.current()) {
+    pub fn open(s: *Session, io: Io) bool {
+        var guard = s.held.acquireUncancelable(io);
+        defer guard.deinit(io);
+        return switch (guard.value().lifecycle.current()) {
             .initializing, .ready => true,
             .awaiting, .closed => false,
         };
+    }
+
+    /// The revision the session speaks: the session era's newest until
+    /// `initialize` names one.
+    pub fn revision(s: *Session, io: Io) Revision {
+        var guard = s.held.acquireUncancelable(io);
+        defer guard.deinit(io);
+        return guard.value().revision;
     }
 
     /// Answers a request of the session's era. `sink` takes what belongs
@@ -104,7 +124,7 @@ pub const Session = struct {
             4 => s.subscribe(io, arena, request, false),
             else => unreachable,
         };
-        if (!s.open()) return failure(.invalid_request, "the session is not initialized: send initialize first");
+        if (!s.open(io)) return failure(.invalid_request, "the session is not initialized: send initialize first");
         if (std.mem.eql(u8, request.method, "server/discover") or std.mem.eql(u8, request.method, "subscriptions/listen"))
             return failure(.method_not_found, "Method not found");
 
@@ -113,13 +133,14 @@ pub const Session = struct {
             error.Malformed => return failure(.invalid_params, "params or _meta are not what the schema says"),
         };
         const context: Context = blk: {
-            s.mutex.lockUncancelable(io);
-            defer s.mutex.unlock(io);
+            var guard = s.held.acquireUncancelable(io);
+            defer guard.deinit(io);
+            const h = guard.value();
             break :blk .{
-                .revision = s.revision,
-                .client = s.client,
-                .client_info = s.client_info,
-                .log_level = s.log_level,
+                .revision = h.revision,
+                .client = h.client,
+                .client_info = h.client_info,
+                .log_level = h.log_level,
                 .progress_token = m.progress_token,
                 .meta = m.raw,
             };
@@ -154,9 +175,9 @@ pub const Session = struct {
             .integer => |n| n,
             .string => return,
         };
-        s.mutex.lockUncancelable(io);
-        defer s.mutex.unlock(io);
-        for (s.outgoing.items) |o| if (o.id == n and !o.done) {
+        var guard = s.held.acquireUncancelable(io);
+        defer guard.deinit(io);
+        for (guard.value().outgoing.items) |o| if (o.id == n and !o.done) {
             o.outcome = switch (outcome) {
                 // Copied on the session's allocator: the asking task owns its
                 // arena, and is waiting.
@@ -186,12 +207,12 @@ pub const Session = struct {
         defer s.server.hub.remove(io, &s.listener);
         var seen: u32 = 0;
         while (true) {
-            seen = (s.listener.wait(io, &s.server.hub, seen, .none) catch return error.Canceled) orelse continue;
-            if (s.listener.over(&s.server.hub)) return;
+            seen = (s.listener.wait(io, seen, .none) catch return error.Canceled) orelse continue;
+            if (s.listener.over(io)) return;
             var turn: std.heap.ArenaAllocator = .init(s.gpa);
             defer turn.deinit();
             const a = turn.allocator();
-            const changed = s.listener.takeLists();
+            const changed = s.listener.takeLists(io);
             if (changed.contains(.tools)) try s.server.notify(io, a, sink, "notifications/tools/list_changed", .{}, "");
             if (changed.contains(.prompts)) try s.server.notify(io, a, sink, "notifications/prompts/list_changed", .{}, "");
             if (changed.contains(.resources)) try s.server.notify(io, a, sink, "notifications/resources/list_changed", .{}, "");
@@ -205,12 +226,13 @@ pub const Session = struct {
         }
     }
 
-    /// `notifications/initialized`.
-    pub fn initialized(s: *Session, io: Io) void {
-        s.mutex.lockUncancelable(io);
-        defer s.mutex.unlock(io);
-        // glint-ignore: Z026 -- an initialized notice outside the handshake changes nothing; the session goes on as it is
-        _ = s.lifecycle.step(.initialized) catch {};
+    /// `notifications/initialized`: true when it ended the handshake, false
+    /// for one outside it, which changes nothing.
+    pub fn initialized(s: *Session, io: Io) bool {
+        var guard = s.held.acquireUncancelable(io);
+        defer guard.deinit(io);
+        _ = guard.value().lifecycle.step(.initialized) catch return false;
+        return true;
     }
 
     fn initialize(s: *Session, io: Io, arena: Allocator, request: wire.Request) Server.HandleError!Server.Reply {
@@ -219,10 +241,11 @@ pub const Session = struct {
             capabilities: types.ClientCapabilities = .{},
             clientInfo: ?types.Implementation = null,
         };
-        s.mutex.lockUncancelable(io);
-        defer s.mutex.unlock(io);
-        if (s.lifecycle.current() != .awaiting) return failure(.invalid_request, "the session is initialized already");
-        const owned = s.arena.allocator();
+        var guard = s.held.acquireUncancelable(io);
+        defer guard.deinit(io);
+        const h = guard.value();
+        if (h.lifecycle.current() != .awaiting) return failure(.invalid_request, "the session is initialized already");
+        const owned = h.arena.allocator();
         const params = try owned.dupe(u8, request.params orelse return failure(.invalid_params, "initialize has no params"));
         const p = strand.json.parseLeaky(Params, owned, params, types.readOptions(s.server.jsonLimits())) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -230,13 +253,13 @@ pub const Session = struct {
         };
         // The client's version when this server speaks it; else the newest
         // of the session era, which the client may refuse.
-        s.revision = if (Revision.named(p.protocolVersion)) |r| (if (r.stateless()) Revision.latest_legacy else r) else Revision.latest_legacy;
-        s.client = p.capabilities;
-        s.client_info = p.clientInfo;
-        _ = s.lifecycle.step(.initialize) catch unreachable; // unreachable: awaiting was checked above
+        h.revision = if (Revision.named(p.protocolVersion)) |r| (if (r.stateless()) Revision.latest_legacy else r) else Revision.latest_legacy;
+        h.client = p.capabilities;
+        h.client_info = p.clientInfo;
+        _ = h.lifecycle.step(.initialize) catch unreachable; // unreachable: awaiting was checked above
         var out: Writer.Allocating = .init(arena);
         const w = &out.writer;
-        w.print("{{\"protocolVersion\":\"{s}\",\"capabilities\":", .{s.revision.text()}) catch return error.OutOfMemory;
+        w.print("{{\"protocolVersion\":\"{s}\",\"capabilities\":", .{h.revision.text()}) catch return error.OutOfMemory;
         w.writeAll(try s.server.capabilitiesJson(io, arena)) catch return error.OutOfMemory;
         w.writeAll(",\"serverInfo\":") catch return error.OutOfMemory;
         strand.json.write(w, s.server.options.info, types.writeOptions(s.server.jsonLimits())) catch return error.OutOfMemory;
@@ -253,9 +276,9 @@ pub const Session = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => return failure(.invalid_params, "level is not a logging level"),
         };
-        s.mutex.lockUncancelable(io);
-        defer s.mutex.unlock(io);
-        s.log_level = p.level;
+        var guard = s.held.acquireUncancelable(io);
+        defer guard.deinit(io);
+        guard.value().log_level = p.level;
         return .{ .result = .{ .json = "{}" } };
     }
 
@@ -283,11 +306,11 @@ pub const Session = struct {
         defer for (pending.items) |o| s.retire(io, o);
         for (requests) |r| {
             const o = try arena.create(Outgoing);
-            o.* = .{ .id = s.next_id.fetchAdd(1, .monotonic) };
+            o.* = .{ .id = s.next_id.fetchAddWrapping(.fromRaw(1), .monotonic).raw() };
             {
-                s.mutex.lockUncancelable(io);
-                defer s.mutex.unlock(io);
-                try s.outgoing.append(s.gpa, o);
+                var guard = s.held.acquireUncancelable(io);
+                defer guard.deinit(io);
+                try guard.value().outgoing.append(s.gpa, o);
             }
             try pending.append(arena, o);
             var out: Writer.Allocating = .init(arena);
@@ -322,14 +345,15 @@ pub const Session = struct {
     }
 
     fn retire(s: *Session, io: Io, o: *Outgoing) void {
-        s.mutex.lockUncancelable(io);
-        defer s.mutex.unlock(io);
+        var guard = s.held.acquireUncancelable(io);
+        defer guard.deinit(io);
         switch (o.outcome) {
             .result => |bytes| s.gpa.free(bytes),
             .failure => {},
         }
-        for (s.outgoing.items, 0..) |x, i| if (x == o) {
-            _ = s.outgoing.swapRemove(i);
+        const outgoing = &guard.value().outgoing;
+        for (outgoing.items, 0..) |x, i| if (x == o) {
+            _ = outgoing.swapRemove(i);
             return;
         };
     }

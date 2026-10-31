@@ -29,10 +29,10 @@ pub const Sealer = struct {
     /// in it. A cluster that retries on another member gives every member
     /// one key, with `withKey`.
     pub fn init(io: Io, ttl: Io.Duration) Io.RandomSecureError!Sealer {
-        var key: [Aead.key_length]u8 = undefined;
-        defer std.crypto.secureZero(u8, &key);
-        try io.randomSecure(&key);
-        return withKey(key, ttl);
+        var sealer: Sealer = .{ .key = .init(@splat(0)), .ttl = ttl };
+        errdefer sealer.deinit();
+        try io.randomSecure(sealer.key.exposeMut());
+        return sealer;
     }
 
     pub fn withKey(key: [Aead.key_length]u8, ttl: Io.Duration) Sealer {
@@ -45,19 +45,21 @@ pub const Sealer = struct {
 
     /// `payload` sealed for the request `binding` names, on `arena`.
     pub fn seal(s: *const Sealer, io: Io, arena: Allocator, binding: Binding, payload: []const u8) SealError![]const u8 {
-        const expiry = Io.Timestamp.now(io, .real).addDuration(s.ttl).toMilliseconds();
+        const expiry = Expiry.fromTimestamp(Io.Timestamp.now(io, .real).addDuration(s.ttl), .down) catch Expiry.fromRaw(std.math.maxInt(i64));
         const raw = try arena.alloc(u8, overhead + payload.len);
         raw[0] = version;
         const nonce = raw[1..][0..Aead.nonce_length];
         try io.randomSecure(nonce);
-        var plain = try arena.alloc(u8, 8 + payload.len);
-        std.mem.writeInt(i64, plain[0..8], expiry, .big);
+        var plain_owner: aegis.SecretBytes = try .init(arena, 8 + payload.len);
+        defer plain_owner.deinit(arena);
+        plain_owner.resizeWithinCapacity(8 + payload.len) catch unreachable; // unreachable: allocated to this length
+        const plain = plain_owner.exposeMut();
+        std.mem.writeInt(i64, plain[0..8], expiry.raw(), .big);
         @memcpy(plain[8..], payload);
         const sealed = raw[1 + Aead.nonce_length ..][0..plain.len];
         const tag = raw[raw.len - Aead.tag_length ..][0..Aead.tag_length];
         var ad: AssociatedData = .{};
         Aead.encrypt(sealed, tag, plain, ad.of(binding), nonce.*, s.key.expose().*);
-        std.crypto.secureZero(u8, plain);
         const text = try arena.alloc(u8, base64.Encoder.calcSize(raw.len));
         return base64.Encoder.encode(text, raw);
     }
@@ -76,13 +78,18 @@ pub const Sealer = struct {
         const plain = try arena.alloc(u8, cipher.len);
         var ad: AssociatedData = .{};
         Aead.decrypt(plain, cipher, tag.*, ad.of(binding), nonce.*, s.key.expose().*) catch return error.Tampered;
-        const expiry = std.mem.readInt(i64, plain[0..8], .big);
-        if (Io.Timestamp.now(io, .real).toMilliseconds() >= expiry) return error.Expired;
+        const expiry: Expiry = .fromRaw(std.mem.readInt(i64, plain[0..8], .big));
+        const now = Expiry.fromTimestamp(Io.Timestamp.now(io, .real), .down) catch Expiry.fromRaw(std.math.maxInt(i64));
+        if (now.compare(expiry) != .lt) return error.Expired;
         return plain[8..];
     }
 };
 
 pub const SealError = Allocator.Error || Io.RandomSecureError;
+
+/// When sealed state stops opening: milliseconds on the real clock, as the
+/// sealed bytes carry it.
+const Expiry = aegis.units.Instant(.real, .millisecond, i64);
 
 /// `Tampered`: not sealed by this key for this request (changed, forged, or
 /// from another request or principal). `Expired`: sealed, but too long ago.

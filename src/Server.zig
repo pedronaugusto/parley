@@ -34,16 +34,9 @@ sealer: state.Sealer,
 /// Private: `"io.modelcontextprotocol/serverInfo":{...}`, written in every
 /// 2026-07-28 result's `_meta`.
 identity: []const u8,
-/// Private: guards the four lists and their generations.
-lock: Io.RwLock = .init,
-tools: std.ArrayList(*registry.Tool) = .empty,
-resources: std.ArrayList(*registry.Resource) = .empty,
-templates: std.ArrayList(*registry.Template) = .empty,
-prompts: std.ArrayList(*registry.Prompt) = .empty,
+/// Private: the four lists and their generations.
+lists: aegis.BlockingGuarded(Lists) = .init(.{}),
 completer: ?*Completer = null,
-/// Private: bumped when a list changes, so a cursor into an older list is
-/// refused rather than read against the new one.
-generations: std.EnumArray(List, u32) = .initFill(0),
 /// The open change streams.
 hub: subscriptions.Hub = .{},
 /// The tasks held, when the server serves the tasks extension. Whether it
@@ -131,6 +124,17 @@ pub const Offers = struct {
 /// The four lists a server keeps.
 pub const List = enum { tools, resources, templates, prompts };
 
+/// The lists, each field named as its `List`.
+const Lists = struct {
+    tools: std.ArrayList(*registry.Tool) = .empty,
+    resources: std.ArrayList(*registry.Resource) = .empty,
+    templates: std.ArrayList(*registry.Template) = .empty,
+    prompts: std.ArrayList(*registry.Prompt) = .empty,
+    /// Bumped when a list changes, so a cursor into an older list is
+    /// refused rather than read against the new one.
+    generations: std.EnumArray(List, u32) = .initFill(0),
+};
+
 /// What a request may see and use. Its owner embeds it and recovers itself
 /// with `@fieldParentPtr`.
 pub const Filter = struct {
@@ -175,18 +179,19 @@ pub fn init(gpa: Allocator, io: Io, options: Options) InitError!Server {
 /// Stops the tasks' handlers first: every task ends with the server.
 pub fn deinit(s: *Server) void {
     if (s.task_table) |*t| t.deinit();
-    for (s.tools.items) |t| s.freeEntry(t);
-    for (s.resources.items) |r| s.freeEntry(r);
-    for (s.templates.items) |t| s.freeEntry(t);
-    for (s.prompts.items) |p| {
+    const l = s.lists.teardown();
+    for (l.tools.items) |t| s.freeEntry(t);
+    for (l.resources.items) |r| s.freeEntry(r);
+    for (l.templates.items) |t| s.freeEntry(t);
+    for (l.prompts.items) |p| {
         for (p.required) |r| s.gpa.free(r);
         s.gpa.free(p.required);
         s.freeEntry(p);
     }
-    s.tools.deinit(s.gpa);
-    s.resources.deinit(s.gpa);
-    s.templates.deinit(s.gpa);
-    s.prompts.deinit(s.gpa);
+    l.tools.deinit(s.gpa);
+    l.resources.deinit(s.gpa);
+    l.templates.deinit(s.gpa);
+    l.prompts.deinit(s.gpa);
     s.hub.deinit(s.gpa);
     s.gpa.free(s.identity);
     s.sealer.deinit();
@@ -242,15 +247,15 @@ fn addToolWith(s: *Server, io: Io, spec: registry.ToolSpec, input: []const u8, o
     const params = try registry.headerParams(s.gpa, input, s.jsonLimits());
     errdefer registry.freeHeaderParams(s.gpa, params);
     tool.* = .{ .name = name, .listed = listed, .handler = handler, .headers = params, .task = spec.task };
-    try s.insert(io, .tools, &s.tools, tool, name);
+    try s.insert(io, .tools, tool, name);
 }
 
 /// The `x-mcp-header` marks of the tool named `name`, copied onto `arena`;
 /// null when there is no such tool.
 pub fn toolHeaders(s: *Server, io: Io, arena: Allocator, name: []const u8) (Allocator.Error || Io.Cancelable)!?[]const registry.HeaderParam {
-    try s.lock.lockShared(io);
-    defer s.lock.unlockShared(io);
-    for (s.tools.items) |t| if (std.mem.eql(u8, t.name, name)) {
+    var held = try s.lists.acquire(io);
+    defer held.deinit(io);
+    for (held.value().tools.items) |t| if (std.mem.eql(u8, t.name, name)) {
         const out = try arena.alloc(registry.HeaderParam, t.headers.len);
         for (out, t.headers) |*o, h| {
             const path = try arena.alloc([]const u8, h.path.len);
@@ -264,7 +269,7 @@ pub fn toolHeaders(s: *Server, io: Io, arena: Allocator, name: []const u8) (Allo
 
 /// Removes the tool named `name`; false when there is none.
 pub fn removeTool(s: *Server, io: Io, name: []const u8) Io.Cancelable!bool {
-    return s.remove(io, .tools, &s.tools, name);
+    return s.remove(io, .tools, name);
 }
 
 /// Adds a resource read by `read`.
@@ -276,11 +281,11 @@ pub fn addResource(s: *Server, io: Io, spec: registry.ResourceSpec, handler: *re
     const listed = try registry.listResource(s.gpa, s.jsonLimits(), spec);
     errdefer s.gpa.free(listed);
     resource.* = .{ .uri = uri, .listed = listed, .handler = handler };
-    try s.insert(io, .resources, &s.resources, resource, uri);
+    try s.insert(io, .resources, resource, uri);
 }
 
 pub fn removeResource(s: *Server, io: Io, uri: []const u8) Io.Cancelable!bool {
-    return s.remove(io, .resources, &s.resources, uri);
+    return s.remove(io, .resources, uri);
 }
 
 /// Adds a resource template: a URI that matches it (RFC 6570, `{name}` a
@@ -293,7 +298,7 @@ pub fn addTemplate(s: *Server, io: Io, spec: registry.TemplateSpec, handler: *re
     const listed = try registry.listTemplate(s.gpa, s.jsonLimits(), spec);
     errdefer s.gpa.free(listed);
     template.* = .{ .uri_template = pattern, .listed = listed, .handler = handler };
-    try s.insert(io, .templates, &s.templates, template, pattern);
+    try s.insert(io, .templates, template, pattern);
 }
 
 /// Adds a prompt whose arguments are `handler`'s argument struct (string
@@ -322,11 +327,11 @@ fn addPromptWith(s: *Server, io: Io, spec: registry.PromptSpec, arguments: []con
     }
     for (arguments) |a| if (a.required orelse false) try required.append(s.gpa, try s.gpa.dupe(u8, a.name));
     prompt.* = .{ .name = name, .listed = listed, .required = try required.toOwnedSlice(s.gpa), .handler = handler };
-    try s.insert(io, .prompts, &s.prompts, prompt, name);
+    try s.insert(io, .prompts, prompt, name);
 }
 
 pub fn removePrompt(s: *Server, io: Io, name: []const u8) Io.Cancelable!bool {
-    return s.remove(io, .prompts, &s.prompts, name);
+    return s.remove(io, .prompts, name);
 }
 
 /// Completes prompt and template arguments with `completer`, which
@@ -347,28 +352,32 @@ fn keyOf(entry: anytype) []const u8 {
     return entry.name;
 }
 
-fn insert(s: *Server, io: Io, comptime which: List, items: anytype, entry: anytype, key: []const u8) AddError!void {
+fn insert(s: *Server, io: Io, comptime which: List, entry: anytype, key: []const u8) AddError!void {
     {
-        try s.lock.lock(io);
-        defer s.lock.unlock(io);
+        var held = try s.lists.acquire(io);
+        defer held.deinit(io);
+        const l = held.value();
+        const items = &@field(l, @tagName(which));
         for (items.items) |e| if (std.mem.eql(u8, keyOf(e), key)) return error.Duplicate;
         try items.append(s.gpa, entry);
-        s.generations.getPtr(which).* +%= 1;
+        l.generations.getPtr(which).* +%= 1;
     }
     s.hub.listChanged(io, changeOf(which));
 }
 
-fn remove(s: *Server, io: Io, comptime which: List, items: anytype, key: []const u8) Io.Cancelable!bool {
+fn remove(s: *Server, io: Io, comptime which: List, key: []const u8) Io.Cancelable!bool {
     const gone = found: {
-        try s.lock.lock(io);
-        defer s.lock.unlock(io);
+        var held = try s.lists.acquire(io);
+        defer held.deinit(io);
+        const l = held.value();
+        const items = &@field(l, @tagName(which));
         for (items.items, 0..) |e, i| if (std.mem.eql(u8, keyOf(e), key)) {
+            l.generations.getPtr(which).* +%= 1;
             // Order kept: a list is written in the order it was made.
             break :found items.orderedRemove(i);
         };
         return false;
     };
-    s.generations.getPtr(which).* +%= 1;
     // A handler running now holds no pointer into the entry: it was copied out.
     if (which == .prompts) {
         for (gone.required) |r| s.gpa.free(r);
@@ -586,7 +595,7 @@ fn route(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *
         if (std.mem.eql(u8, request.method, name)) break i;
     } else return failure(.method_not_found, "Method not found");
     return switch (index) {
-        0 => s.discover(arena, context),
+        0 => s.discover(io, arena, context),
         1 => s.listPage(io, arena, .tools, request.params, context),
         2 => s.callTool(io, arena, request, context, sink),
         3 => s.listPage(io, arena, .resources, request.params, context),
@@ -730,16 +739,17 @@ const Result = struct {
 /// The extension objects `server/discover` names (2026-07-28).
 const extensions_json = "{\"" ++ tasks.extension ++ "\":{}}";
 
-fn capabilities(s: *Server) types.ServerCapabilities {
+/// What the server offers, by what `l` holds now.
+fn capabilities(s: *const Server, l: *const Lists) types.ServerCapabilities {
     const offered = struct {
         fn of(given: ?bool, have: bool) bool {
             return given orelse have;
         }
     }.of;
     return .{
-        .tools = if (offered(s.options.offers.tools, s.tools.items.len != 0)) .{ .list_changed = true } else null,
-        .resources = if (offered(s.options.offers.resources, s.resources.items.len + s.templates.items.len != 0)) .{ .subscribe = true, .list_changed = true } else null,
-        .prompts = if (offered(s.options.offers.prompts, s.prompts.items.len != 0)) .{ .list_changed = true } else null,
+        .tools = if (offered(s.options.offers.tools, l.tools.items.len != 0)) .{ .list_changed = true } else null,
+        .resources = if (offered(s.options.offers.resources, l.resources.items.len + l.templates.items.len != 0)) .{ .subscribe = true, .list_changed = true } else null,
+        .prompts = if (offered(s.options.offers.prompts, l.prompts.items.len != 0)) .{ .list_changed = true } else null,
         .completions = if (s.completer != null) .{} else null,
         .logging = if (s.options.logging) .{} else null,
     };
@@ -747,14 +757,19 @@ fn capabilities(s: *Server) types.ServerCapabilities {
 
 /// The server's capabilities as `initialize` and `server/discover` write them.
 pub fn capabilitiesJson(s: *Server, io: Io, arena: Allocator) HandleError![]const u8 {
-    s.lock.lockShared(io) catch return error.Canceled;
-    defer s.lock.unlockShared(io);
     var out: Writer.Allocating = .init(arena);
-    strand.json.write(&out.writer, s.capabilities(), types.writeOptions(s.jsonLimits())) catch return error.OutOfMemory;
+    strand.json.write(&out.writer, try s.capabilitiesNow(io), types.writeOptions(s.jsonLimits())) catch return error.OutOfMemory;
     return out.written();
 }
 
-fn discover(s: *Server, arena: Allocator, context: *const Context) BuildError!Reply {
+/// What the server offers now.
+fn capabilitiesNow(s: *Server, io: Io) Io.Cancelable!types.ServerCapabilities {
+    var held = try s.lists.acquire(io);
+    defer held.deinit(io);
+    return s.capabilities(held.value());
+}
+
+fn discover(s: *Server, io: Io, arena: Allocator, context: *const Context) BuildError!Reply {
     var r: Result = .begin(s, arena, context.revision);
     const versions = comptime blk: {
         var names: []const []const u8 = &.{};
@@ -762,7 +777,7 @@ fn discover(s: *Server, arena: Allocator, context: *const Context) BuildError!Re
         break :blk names;
     };
     try r.field("supportedVersions", versions);
-    var caps = s.capabilities();
+    var caps = try s.capabilitiesNow(io);
     if (s.options.tasks != null) caps.extensions = .{ .bytes = extensions_json };
     try r.field("capabilities", caps);
     if (s.options.instructions) |text| try r.field("instructions", text);
@@ -786,21 +801,17 @@ fn parseParams(s: *const Server, comptime T: type, arena: Allocator, params: ?[]
 /// a cursor into a list that changed since is refused.
 fn listPage(s: *Server, io: Io, arena: Allocator, comptime which: List, params: ?[]const u8, context: *const Context) BuildError!Reply {
     const p = try s.parseParams(types.PaginatedParams, arena, params) orelse return failure(.invalid_params, "params are not what the schema says");
-    s.lock.lockShared(io) catch return error.Canceled;
-    defer s.lock.unlockShared(io);
-    const generation = s.generations.get(which);
+    var held = s.lists.acquire(io) catch return error.Canceled;
+    defer held.deinit(io);
+    const l = held.value();
+    const generation = l.generations.get(which);
     var start: usize = 0;
     if (p.cursor) |cursor| {
         const at = parseCursor(cursor) orelse return failure(.invalid_params, "the cursor is not one this server made");
         if (at.generation != generation) return failure(.invalid_params, "the list changed since the cursor was made: list again from the start");
         start = at.offset;
     }
-    const items = switch (which) {
-        .tools => s.tools.items,
-        .resources => s.resources.items,
-        .templates => s.templates.items,
-        .prompts => s.prompts.items,
-    };
+    const items = @field(l, @tagName(which)).items;
     const name, const hint = switch (which) {
         .tools => .{ "tools", s.options.cache.tools },
         .resources => .{ "resources", s.options.cache.resources },
@@ -937,9 +948,9 @@ fn callTool(s: *Server, io: Io, arena: Allocator, request: wire.Request, context
     const p = try s.parseParams(types.CallToolParams, arena, request.params) orelse return failure(.invalid_params, "params are not what the schema says");
     if (p.arguments) |a| if (a.bytes[0] != '{') return failure(.invalid_params, "arguments is not an object");
     const handler, const task_support = found: {
-        s.lock.lockShared(io) catch return error.Canceled;
-        defer s.lock.unlockShared(io);
-        for (s.tools.items) |t| if (std.mem.eql(u8, t.name, p.name)) break :found .{ t.handler, t.task };
+        var held = s.lists.acquire(io) catch return error.Canceled;
+        defer held.deinit(io);
+        for (held.value().tools.items) |t| if (std.mem.eql(u8, t.name, p.name)) break :found .{ t.handler, t.task };
         break :found null;
     } orelse return try unknown(arena, "Unknown tool: ", p.name);
     if (!s.admitted(context, .tools, p.name)) return try unknown(arena, "Unknown tool: ", p.name);
@@ -979,6 +990,9 @@ fn missingTasks() Reply {
 }
 
 /// One round of a task's handler.
+/// Who holds a round: the round itself, and the call waiting on it.
+const Holders = aegis.units.Count(enum { holders }, u8);
+
 const Run = struct {
     server: *Server,
     task: *tasks.Task,
@@ -998,7 +1012,7 @@ const Run = struct {
     outcome: ?(Call.Error!registry.ToolResult) = null,
     /// Who holds the round: the round itself, and the call waiting on it.
     /// The last to let go frees it.
-    holders: std.atomic.Value(u8),
+    holders: aegis.Atomic(Holders),
     /// How the call becomes a task: the call's `task`.
     hook: Call.TaskHook = .{ .becomeFn = become },
 
@@ -1015,7 +1029,7 @@ const Run = struct {
             .call = undefined,
             .arguments = null,
             .attached = attached,
-            .holders = .init(if (attached) 2 else 1),
+            .holders = .init(.fromRaw(if (attached) 2 else 1)),
         };
         errdefer run.arena.deinit();
         const a = run.arena.allocator();
@@ -1059,7 +1073,7 @@ const Run = struct {
 
     /// Lets go of the round; the last holder frees it.
     fn release(run: *Run) void {
-        if (run.holders.fetchSub(1, .acq_rel) != 1) return;
+        if (run.holders.fetchSubWrapping(.fromRaw(1), .acq_rel).raw() != 1) return;
         const gpa = run.server.gpa;
         run.arena.deinit();
         gpa.destroy(run);
@@ -1068,7 +1082,7 @@ const Run = struct {
 
 fn callAsTask(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink, handler: *registry.ToolHandler, name: []const u8, r: Round) BuildError!Reply {
     const table = &s.task_table.?;
-    const task = table.create(context.principal, request.params orelse "{}", now(io)) catch |err| switch (err) {
+    const task = table.create(context.principal, request.params orelse "{}", tasks.now(io)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Canceled => return error.Canceled,
         error.EntropyUnavailable => return failure(.internal_error, "no entropy for a task's id"),
@@ -1086,24 +1100,27 @@ fn callAsTask(s: *Server, io: Io, arena: Allocator, request: wire.Request, conte
     run.decided.wait(io) catch {
         // The call was canceled: its handler stops, unless it runs as a
         // task already.
-        table.mutex.lockUncancelable(table.io);
-        const attached = run.attached;
-        if (attached) task.cancel.set(table.io);
-        table.mutex.unlock(table.io);
+        const attached = attached: {
+            var held = table.lock();
+            defer held.deinit(table.io);
+            if (run.attached) task.cancel.set(table.io);
+            break :attached run.attached;
+        };
         if (attached) {
             run.decided.waitUncancelable(io);
             table.destroy(task);
         }
         return error.Canceled;
     };
-    table.mutex.lockUncancelable(table.io);
-    if (!run.attached) {
-        defer table.mutex.unlock(table.io);
-        var out: Writer.Allocating = .init(arena);
-        tasks.write(&out.writer, task, .created, table.options.ttl, table.options.poll_interval, s.identityMembers()) catch return error.OutOfMemory;
-        return .{ .result = .{ .json = out.written() } };
+    {
+        var held = table.lock();
+        defer held.deinit(table.io);
+        if (!run.attached) {
+            var out: Writer.Allocating = .init(arena);
+            tasks.write(&out.writer, task, .created, table.options.ttl, table.options.poll_interval, s.identityMembers()) catch return error.OutOfMemory;
+            return .{ .result = .{ .json = out.written() } };
+        }
     }
-    table.mutex.unlock(table.io);
     // Answered as asked: the reply is written on the call's arena before the
     // round's goes.
     defer table.destroy(task);
@@ -1121,10 +1138,6 @@ fn identityMembers(s: *const Server) ?[]const u8 {
     return if (s.options.identify) s.identity else null;
 }
 
-fn now(io: Io) i64 {
-    return Io.Timestamp.now(io, .real).toMilliseconds();
-}
-
 /// `Call.runAsTask` for a round: the task is held, and the waiting call
 /// answers with it.
 fn become(hook: *Call.TaskHook) Call.Error!bool {
@@ -1134,11 +1147,11 @@ fn become(hook: *Call.TaskHook) Call.Error!bool {
     const s = run.server;
     const table = &s.task_table.?;
     {
-        table.mutex.lockUncancelable(table.io);
-        defer table.mutex.unlock(table.io);
+        var held = table.lock();
+        defer held.deinit(table.io);
         // A call canceled while it waited takes its task with it.
         if (run.task.cancel.isSet()) return error.Canceled;
-        if (!try table.hold(run.task, now(table.io))) return false;
+        if (!try table.hold(held.value(), run.task, tasks.now(table.io))) return false;
         run.task.running = true;
         run.attached = false;
     }
@@ -1191,52 +1204,57 @@ fn waitCancel(event: *Io.Event, io: Io) Io.Cancelable!void {
 fn recordRound(s: *Server, run: *Run, returned: Call.Error!registry.ToolResult) void {
     const table = &s.task_table.?;
     const io = table.io;
-    table.mutex.lockUncancelable(io);
-    if (run.attached) {
-        run.outcome = returned;
-        table.mutex.unlock(io);
+    const task = run.task;
+    const Next = struct { again: bool, state: ?[]const u8, id: tasks.Id };
+    const next: ?Next = recorded: {
+        var held = table.lock();
+        defer held.deinit(io);
+        if (run.attached) {
+            run.outcome = returned;
+            break :recorded null;
+        }
+        const again = s.recordOutcome(table, held.value(), run, returned) catch blk: {
+            // glint-ignore: Z026 -- out of memory while recording: the task fails with what fits, or stays as it was
+            table.fail(held.value(), task, tasks.now(io), "{\"code\":-32603,\"message\":\"out of memory\"}", "out of memory") catch {};
+            break :blk false;
+        };
+        task.running = again;
+        // Copied: a task no round runs may be let go once the lock is.
+        break :recorded .{ .again = again, .state = task.state, .id = task.id };
+    };
+    // Attached: the waiting call answers with the outcome.
+    const n = next orelse {
         run.decided.set(io);
         run.release();
         return;
-    }
-    const task = run.task;
-    const again = s.recordOutcome(table, run, returned) catch blk: {
-        // glint-ignore: Z026 -- out of memory while recording: the task fails with what fits, or stays as it was
-        table.fail(task, now(io), "{\"code\":-32603,\"message\":\"out of memory\"}", "out of memory") catch {};
-        break :blk false;
     };
-    task.running = again;
-    const state_for_next = task.state;
-    // Copied: a task no round runs may be let go once the lock is.
-    const id = task.id;
-    table.mutex.unlock(io);
-    s.hub.changed(io, .task, &id);
+    s.hub.changed(io, .task, &n.id);
     const handler = run.handler;
     run.release();
-    if (again) s.startRound(task, handler, null, state_for_next);
+    if (n.again) s.startRound(task, handler, null, n.state);
 }
 
 /// Records `returned` on the run's task (the caller holds the table's lock):
 /// true when the handler is to run again at once.
-fn recordOutcome(s: *Server, table: *tasks.Table, run: *Run, returned: Call.Error!registry.ToolResult) Allocator.Error!bool {
+fn recordOutcome(s: *Server, table: *tasks.Table, h: *tasks.Table.Held, run: *Run, returned: Call.Error!registry.ToolResult) Allocator.Error!bool {
     const task = run.task;
-    const at = now(table.io);
+    const at = tasks.now(table.io);
     const a = run.arena.allocator();
     const result = returned catch |err| switch (err) {
         error.Canceled => {
-            try table.cancelled(task, at, "The task was cancelled");
+            try table.cancelled(h, task, at, "The task was cancelled");
             return false;
         },
         error.InputRequired => {
             const call = &run.call;
             if (task.cancel.isSet()) {
-                try table.cancelled(task, at, "The task was cancelled");
+                try table.cancelled(h, task, at, "The task was cancelled");
                 return false;
             }
             if (call.state_out) |payload| {
                 const size: aegis.units.Bytes(u32) = .fromRaw(std.math.cast(u32, payload.len) orelse std.math.maxInt(u32));
                 if (size.compare(s.options.limits.state) == .gt) {
-                    try table.fail(task, at, "{\"code\":-32603,\"message\":\"the handler's state is past the server's limit\"}", "the handler's state is past the server's limit");
+                    try table.fail(h, task, at, "{\"code\":-32603,\"message\":\"the handler's state is past the server's limit\"}", "the handler's state is past the server's limit");
                     return false;
                 }
             }
@@ -1245,14 +1263,14 @@ fn recordOutcome(s: *Server, table: *tasks.Table, run: *Run, returned: Call.Erro
                 // few times at most.
                 task.quiet_rounds += 1;
                 if (task.quiet_rounds > s.options.limits.quiet_rounds) {
-                    try table.fail(task, at, "{\"code\":-32603,\"message\":\"the handler kept asking for nothing\"}", "the handler kept asking for nothing");
+                    try table.fail(h, task, at, "{\"code\":-32603,\"message\":\"the handler kept asking for nothing\"}", "the handler kept asking for nothing");
                     return false;
                 }
-                try table.keepState(task, call.state_out);
+                try table.keepState(h, task, call.state_out);
                 return true;
             }
             if (call.pending.items.len > s.options.limits.input_requests) {
-                try table.fail(task, at, "{\"code\":-32603,\"message\":\"the handler asked for more input than the server allows at once\"}", "the handler asked for more input than the server allows at once");
+                try table.fail(h, task, at, "{\"code\":-32603,\"message\":\"the handler asked for more input than the server allows at once\"}", "the handler asked for more input than the server allows at once");
                 return false;
             }
             task.quiet_rounds = 0;
@@ -1262,7 +1280,7 @@ fn recordOutcome(s: *Server, table: *tasks.Table, run: *Run, returned: Call.Erro
                 strand.json.write(&out.writer, pending.request, types.writeOptions(s.jsonLimits())) catch return error.OutOfMemory;
                 x.* = .{ .key = pending.key, .request = out.written() };
             }
-            try table.ask(task, at, asked, call.state_out);
+            try table.ask(h, task, at, asked, call.state_out);
             return false;
         },
         else => |e| {
@@ -1278,12 +1296,12 @@ fn recordOutcome(s: *Server, table: *tasks.Table, run: *Run, returned: Call.Erro
             wire.writeString(w, f.message) catch return error.OutOfMemory;
             if (f.data) |data| w.print(",\"data\":{s}", .{data}) catch return error.OutOfMemory;
             w.writeByte('}') catch return error.OutOfMemory;
-            try table.fail(task, at, out.written(), f.message);
+            try table.fail(h, task, at, out.written(), f.message);
             return false;
         },
     };
     const body = Content.body(s, a, .@"2026-07-28", .{ .tool = .{ .result = result, .identify = false } }) catch return error.OutOfMemory;
-    try table.complete(task, at, try body.whole(a));
+    try table.complete(h, task, at, try body.whole(a));
     return false;
 }
 
@@ -1292,11 +1310,11 @@ fn recordOutcome(s: *Server, table: *tasks.Table, run: *Run, returned: Call.Erro
 fn startRound(s: *Server, task: *tasks.Task, handler: *registry.ToolHandler, responses: ?[]const u8, state_in: ?[]const u8) void {
     const table = &s.task_table.?;
     const run = Run.create(s, task, handler, false, .{ .string = &task.id }, .none, responses, state_in) catch {
-        table.mutex.lockUncancelable(table.io);
+        var held = table.lock();
+        defer held.deinit(table.io);
         // glint-ignore: Z026 -- out of memory: the task fails if that fits, and is let go at its time either way
-        table.fail(task, now(table.io), "{\"code\":-32603,\"message\":\"out of memory\"}", "out of memory") catch {};
+        table.fail(held.value(), task, tasks.now(table.io), "{\"code\":-32603,\"message\":\"out of memory\"}", "out of memory") catch {};
         task.running = false;
-        table.mutex.unlock(table.io);
         return;
     };
     table.group.concurrent(table.io, runRound, .{run}) catch runRound(run);
@@ -1320,9 +1338,10 @@ fn taskRequest(s: *Server, io: Io, arena: Allocator, request: wire.Request, cont
     var task: *tasks.Task = undefined;
     var id: tasks.Id = undefined;
     {
-        table.mutex.lockUncancelable(table.io);
-        defer table.mutex.unlock(table.io);
-        task = table.find(task_id, context.principal, now(io)) orelse return failure(.invalid_params, "Failed to retrieve task: Task not found");
+        var held = table.lock();
+        defer held.deinit(table.io);
+        const h = held.value();
+        task = table.find(h, task_id, context.principal, tasks.now(io)) orelse return failure(.invalid_params, "Failed to retrieve task: Task not found");
         // Copied: a task no round runs may be let go once the lock is.
         id = task.id;
         switch (method) {
@@ -1334,7 +1353,7 @@ fn taskRequest(s: *Server, io: Io, arena: Allocator, request: wire.Request, cont
             .update => {
                 const p = (try s.parseParams(types.UpdateTaskParams, arena, request.params)).?;
                 if (p.input_responses.bytes[0] != '{') return failure(.invalid_params, "inputResponses is not an object");
-                next = table.answer(task, now(io), arena, p.input_responses.bytes, s.jsonLimits()) catch |err| switch (err) {
+                next = table.answer(h, task, tasks.now(io), arena, p.input_responses.bytes, s.jsonLimits()) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.Invalid => return failure(.invalid_params, "inputResponses is not an object"),
                 };
@@ -1344,7 +1363,7 @@ fn taskRequest(s: *Server, io: Io, arena: Allocator, request: wire.Request, cont
                         error.OutOfMemory => return error.OutOfMemory,
                     };
                     if (handler == null) {
-                        try table.fail(task, now(io), "{\"code\":-32602,\"message\":\"the task's tool is gone\"}", "the task's tool is gone");
+                        try table.fail(h, task, tasks.now(io), "{\"code\":-32602,\"message\":\"the task's tool is gone\"}", "the task's tool is gone");
                         next = null;
                     } else task.running = true;
                     changed = true;
@@ -1355,7 +1374,7 @@ fn taskRequest(s: *Server, io: Io, arena: Allocator, request: wire.Request, cont
                     // The round sees it and ends the task cancelled.
                     task.cancel.set(table.io);
                 } else {
-                    try table.cancelled(task, now(io), "The task was cancelled");
+                    try table.cancelled(h, task, tasks.now(io), "The task was cancelled");
                     changed = true;
                 }
             },
@@ -1371,9 +1390,9 @@ fn taskRequest(s: *Server, io: Io, arena: Allocator, request: wire.Request, cont
 /// The task `id` as `form` writes it, or null when it is not held.
 fn taskJson(s: *Server, io: Io, arena: Allocator, id: []const u8, principal: ?[]const u8, form: tasks.Form) BuildError!?[]const u8 {
     const table = &s.task_table.?;
-    table.mutex.lockUncancelable(table.io);
-    defer table.mutex.unlock(table.io);
-    const task = table.find(id, principal, now(io)) orelse return null;
+    var held = table.lock();
+    defer held.deinit(table.io);
+    const task = table.find(held.value(), id, principal, tasks.now(io)) orelse return null;
     var out: Writer.Allocating = .init(arena);
     tasks.write(&out.writer, task, form, table.options.ttl, table.options.poll_interval, s.identityMembers()) catch return error.OutOfMemory;
     return out.written();
@@ -1387,9 +1406,9 @@ fn toolOf(s: *Server, io: Io, task: *const tasks.Task) (Allocator.Error || Io.Ca
         error.OutOfMemory => return error.OutOfMemory,
         error.Canceled => return error.Canceled,
     }) orelse return null;
-    try s.lock.lockShared(io);
-    defer s.lock.unlockShared(io);
-    for (s.tools.items) |t| if (std.mem.eql(u8, t.name, p.name)) return t.handler;
+    var held = try s.lists.acquire(io);
+    defer held.deinit(io);
+    for (held.value().tools.items) |t| if (std.mem.eql(u8, t.name, p.name)) return t.handler;
     return null;
 }
 
@@ -1400,13 +1419,14 @@ fn unknown(arena: Allocator, comptime what: []const u8, name: []const u8) Alloca
 fn readResource(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink) BuildError!Reply {
     const p = try s.parseParams(types.ReadResourceParams, arena, request.params) orelse return failure(.invalid_params, "params are not what the schema says");
     const handler = found: {
-        s.lock.lockShared(io) catch return error.Canceled;
-        defer s.lock.unlockShared(io);
-        for (s.resources.items) |res| if (std.mem.eql(u8, res.uri, p.uri)) {
+        var held = s.lists.acquire(io) catch return error.Canceled;
+        defer held.deinit(io);
+        const l = held.value();
+        for (l.resources.items) |res| if (std.mem.eql(u8, res.uri, p.uri)) {
             if (!s.admitted(context, .resources, res.uri)) break :found null;
             break :found res.handler;
         };
-        for (s.templates.items) |t| if (matches(t.uri_template, p.uri)) {
+        for (l.templates.items) |t| if (matches(t.uri_template, p.uri)) {
             if (!s.admitted(context, .templates, t.uri_template)) break :found null;
             break :found t.handler;
         };
@@ -1472,9 +1492,9 @@ pub fn matches(pattern: []const u8, uri: []const u8) bool {
 fn getPrompt(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink) BuildError!Reply {
     const p = try s.parseParams(types.GetPromptParams, arena, request.params) orelse return failure(.invalid_params, "params are not what the schema says");
     const prompt = found: {
-        s.lock.lockShared(io) catch return error.Canceled;
-        defer s.lock.unlockShared(io);
-        for (s.prompts.items) |item| if (std.mem.eql(u8, item.name, p.name)) {
+        var held = s.lists.acquire(io) catch return error.Canceled;
+        defer held.deinit(io);
+        for (held.value().prompts.items) |item| if (std.mem.eql(u8, item.name, p.name)) {
             // Copied out: the prompt may be removed while it runs.
             var required: std.ArrayList([]const u8) = .empty;
             for (item.required) |name| try required.append(arena, try arena.dupe(u8, name));
@@ -1535,7 +1555,7 @@ fn complete(s: *Server, io: Io, arena: Allocator, request: wire.Request, context
 /// closes (answered `complete`).
 fn listen(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink) BuildError!Reply {
     const p = try s.parseParams(types.ListenParams, arena, request.params) orelse return failure(.invalid_params, "params are not what the schema says");
-    const caps = s.capabilities();
+    const caps = try s.capabilitiesNow(io);
     var listener: subscriptions.Listener = .{ .id = request.id, .lists = .empty };
     defer listener.deinit(s.gpa);
     var agreed: types.SubscriptionFilter = .{};
@@ -1566,9 +1586,9 @@ fn listen(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: 
         var held: std.ArrayList([]const u8) = .empty;
         for (ids) |id| {
             const known = known: {
-                table.mutex.lockUncancelable(table.io);
-                defer table.mutex.unlock(table.io);
-                break :known table.find(id, context.principal, now(io)) != null;
+                var guard = table.lock();
+                defer guard.deinit(table.io);
+                break :known table.find(guard.value(), id, context.principal, tasks.now(io)) != null;
             };
             if (!known) continue;
             listener.watch(io, s.gpa, .task, id, s.options.limits.watched) catch |err| switch (err) {
@@ -1595,17 +1615,17 @@ fn listen(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: 
     var seen: u32 = 0;
     while (true) {
         const timeout: Io.Timeout = if (sink.keep_alive) |every| .{ .duration = .{ .raw = every, .clock = .awake } } else .none;
-        seen = (listener.wait(io, &s.hub, seen, timeout) catch return error.Canceled) orelse {
+        seen = (listener.wait(io, seen, timeout) catch return error.Canceled) orelse {
             // Quiet for a while: a comment keeps the stream open, and a
             // stream the client left fails to take it.
             sink.keepAlive(io) catch return error.Canceled;
             continue;
         };
         // Ended by its client: nothing more is written, and nothing answered.
-        if (listener.ended.load(.acquire)) return error.Canceled;
+        if (listener.ended(io)) return error.Canceled;
         var turn: std.heap.ArenaAllocator = .init(s.gpa);
         defer turn.deinit();
-        const changed = listener.takeLists();
+        const changed = listener.takeLists(io);
         if (changed.contains(.tools)) try s.notify(io, turn.allocator(), sink, "notifications/tools/list_changed", .{}, tag);
         if (changed.contains(.prompts)) try s.notify(io, turn.allocator(), sink, "notifications/prompts/list_changed", .{}, tag);
         if (changed.contains(.resources)) try s.notify(io, turn.allocator(), sink, "notifications/resources/list_changed", .{}, tag);
@@ -1625,7 +1645,7 @@ fn listen(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: 
                 try s.notify(io, turn.allocator(), sink, "notifications/tasks", Raw{ .bytes = json }, tag);
             };
         }
-        if (s.hub.closed.load(.acquire)) break;
+        if (listener.closed(io)) break;
     }
     var out: Writer.Allocating = .init(arena);
     out.writer.print("{{\"resultType\":\"complete\",\"_meta\":{{{s}}}}}", .{tag}) catch return error.OutOfMemory;

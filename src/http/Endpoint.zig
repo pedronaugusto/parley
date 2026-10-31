@@ -20,6 +20,7 @@ const std = @import("std");
 const parley = @import("parley");
 const uplink = @import("uplink");
 const strand = @import("strand");
+const aegis = @import("aegis");
 const headers = @import("headers.zig");
 const guard = @import("guard.zig");
 
@@ -36,26 +37,32 @@ options: Options,
 /// endpoint by `@fieldParentPtr`.
 handling: uplink.server.Handler = .{ .handleFn = handled },
 /// Private: the open sessions, each named by its `Mcp-Session-Id`.
-sessions_mutex: Io.Mutex = .init,
-sessions: std.ArrayList(*Entry) = .empty,
+sessions: aegis.BlockingGuarded(std.ArrayList(*Entry)) = .init(.empty),
 
 /// A session, and who is using it: one ended while a request is under way
 /// is freed when that request is done.
 const Entry = struct {
     id: [32]u8,
     session: parley.compat.Session,
-    refs: std.atomic.Value(u32) = .init(1),
+    refs: aegis.Atomic(Holders) = .init(.fromRaw(1)),
     /// Whether its GET stream is open (one at a time).
-    streaming: std.atomic.Value(bool) = .init(false),
-    /// Milliseconds on the real clock when it was last used.
-    used: std.atomic.Value(i64),
+    streaming: aegis.Atomic(Streaming) = .init(.closed),
+    /// When it was last used.
+    used: aegis.Atomic(Instant),
 
     fn release(entry: *Entry, gpa: Allocator) void {
-        if (entry.refs.fetchSub(1, .acq_rel) != 1) return;
+        if (entry.refs.fetchSubWrapping(.fromRaw(1), .acq_rel).raw() != 1) return;
         entry.session.deinit();
         gpa.destroy(entry);
     }
 };
+
+/// Who holds an entry: the table, and each request using it.
+const Holders = aegis.units.Count(enum { holders }, u32);
+const Streaming = enum(u8) { closed, open };
+/// A session's last use, on the awake clock: a clock set back or forward
+/// ends no session early or late.
+const Instant = aegis.units.Instant(.awake, .millisecond, i64);
 
 pub const Options = struct {
     /// Serve requests whose `Host` and `Origin` are this machine's
@@ -97,8 +104,9 @@ pub fn init(gpa: Allocator, server: *parley.Server, options: Options) Endpoint {
 
 /// Ends every session. The server the endpoint is mounted on has stopped.
 pub fn deinit(e: *Endpoint) void {
-    for (e.sessions.items) |entry| entry.release(e.gpa);
-    e.sessions.deinit(e.gpa);
+    const sessions = e.sessions.teardown();
+    for (sessions.items) |entry| entry.release(e.gpa);
+    sessions.deinit(e.gpa);
 }
 
 /// The endpoint as an uplink handler, for as long as the endpoint stays where
@@ -150,7 +158,7 @@ fn handle(e: *Endpoint, io: Io, request: *Request, response: *Response) anyerror
     // 2024-11-05); anywhere else the decode refuses it.
     if (wire.isBatch(body)) if (session_id) |id| if (e.lookup(io, id)) |entry| {
         defer entry.release(e.gpa);
-        if (entry.session.revision.batches()) return e.serveBatch(io, arena, request, response, entry, body);
+        if (entry.session.revision(io).batches()) return e.serveBatch(io, arena, request, response, entry, body);
     };
 
     var fault: wire.Fault = .{};
@@ -185,7 +193,7 @@ fn handle(e: *Endpoint, io: Io, request: *Request, response: *Response) anyerror
         return refuse(io, response, .bad_request, req.id, .header_mismatch, why);
 
     const principal = admitted.principal;
-    var stream: Stream = .{ .io = io, .response = response };
+    var stream: Stream = .init(io, response);
     const reply = serveWatched(e, io, arena, request, req, principal, stream.sink(e)) catch |err| switch (err) {
         // The client left, or the server is going away: nothing to answer.
         error.Canceled => return,
@@ -242,7 +250,7 @@ fn answer(e: *Endpoint, io: Io, arena: Allocator, response: *Response, stream: *
         .failure => |f| {
             var out: Io.Writer.Allocating = .init(arena);
             try wire.writeFailure(&out.writer, id, f.code, f.message, f.data);
-            if (stream.events) return stream.last(out.written());
+            if (stream.events()) return stream.last(out.written());
             response.status = statusOf(f);
             try response.header("Content-Type", "application/json");
             return response.send(io, out.written());
@@ -250,9 +258,11 @@ fn answer(e: *Endpoint, io: Io, arena: Allocator, response: *Response, stream: *
     };
     var head: Io.Writer.Allocating = .init(arena);
     try wire.beginResult(&head.writer, id);
-    if (stream.events) {
+    if (stream.events()) {
+        var held = try stream.out.acquire(io);
+        defer held.deinit(io);
         var buffer: [256]u8 = undefined;
-        var event: uplink.wire.sse.EventWriter = try .begin(try stream.begin(), &buffer, .{ .type = "message" });
+        var event: uplink.wire.sse.EventWriter = try .begin(try held.value().begin(io), &buffer, .{ .type = "message" });
         try event.interface.writeAll(head.written());
         try body.write(&event.interface);
         try wire.endResult(&event.interface);
@@ -292,7 +302,7 @@ fn openSession(e: *Endpoint, io: Io, arena: Allocator, response: *Response, req:
     var random: [16]u8 = undefined;
     try io.randomSecure(&random);
     entry.* = .{ .id = std.fmt.bytesToHex(random, .lower), .session = .init(e.gpa, e.server, e.options.session), .used = .init(now(io)) };
-    var stream: Stream = .{ .io = io, .response = response };
+    var stream: Stream = .init(io, response);
     const reply = try entry.session.handle(io, arena, req, stream.sink(e));
     if (reply == .result) {
         try e.admit(io, entry);
@@ -304,26 +314,27 @@ fn openSession(e: *Endpoint, io: Io, arena: Allocator, response: *Response, req:
 /// Adds `entry`, ending sessions idle too long, and the one idle longest
 /// when there is no room.
 fn admit(e: *Endpoint, io: Io, entry: *Entry) Io.Cancelable!void {
-    try e.sessions_mutex.lock(io);
-    defer e.sessions_mutex.unlock(io);
-    const idle_ms: i64 = e.options.session_idle.raw();
+    var held = try e.sessions.acquire(io);
+    defer held.deinit(io);
+    const sessions = held.value();
+    const idle = e.options.session_idle.convert(.millisecond, i64, .exact);
     const t = now(io);
     var i: usize = 0;
-    while (i < e.sessions.items.len) {
-        const old = e.sessions.items[i];
-        if (t - old.used.load(.monotonic) > idle_ms and !old.streaming.load(.acquire)) {
-            _ = e.sessions.swapRemove(i);
+    while (i < sessions.items.len) {
+        const old = sessions.items[i];
+        if (old.used.load(.monotonic).saturatingDurationTo(t).compare(idle) == .gt and old.streaming.load(.acquire) == .closed) {
+            _ = sessions.swapRemove(i);
             old.release(e.gpa);
         } else i += 1;
     }
-    if (e.sessions.items.len >= e.options.max_sessions) {
+    if (sessions.items.len >= e.options.max_sessions) {
         var oldest: usize = 0;
-        for (e.sessions.items, 0..) |x, k| if (x.used.load(.monotonic) < e.sessions.items[oldest].used.load(.monotonic)) {
+        for (sessions.items, 0..) |x, k| if (x.used.load(.monotonic).compare(sessions.items[oldest].used.load(.monotonic)) == .lt) {
             oldest = k;
         };
-        e.sessions.swapRemove(oldest).release(e.gpa);
+        sessions.swapRemove(oldest).release(e.gpa);
     }
-    e.sessions.append(e.gpa, entry) catch {
+    sessions.append(e.gpa, entry) catch {
         entry.release(e.gpa);
         return;
     };
@@ -331,18 +342,18 @@ fn admit(e: *Endpoint, io: Io, entry: *Entry) Io.Cancelable!void {
 
 /// The session named `id`, held until `release`.
 fn lookup(e: *Endpoint, io: Io, id: []const u8) ?*Entry {
-    e.sessions_mutex.lockUncancelable(io);
-    defer e.sessions_mutex.unlock(io);
-    for (e.sessions.items) |entry| if (std.mem.eql(u8, &entry.id, id)) {
-        _ = entry.refs.fetchAdd(1, .acq_rel);
+    var held = e.sessions.acquireUncancelable(io);
+    defer held.deinit(io);
+    for (held.value().items) |entry| if (std.mem.eql(u8, &entry.id, id)) {
+        _ = entry.refs.fetchAddWrapping(.fromRaw(1), .acq_rel);
         entry.used.store(now(io), .monotonic);
         return entry;
     };
     return null;
 }
 
-fn now(io: Io) i64 {
-    return Io.Timestamp.now(io, .real).toMilliseconds();
+fn now(io: Io) Instant {
+    return Instant.fromTimestamp(Io.Clock.awake.now(io), .down) catch .fromRaw(std.math.maxInt(i64));
 }
 
 /// A message on a session: its requests answered as their revision
@@ -352,17 +363,19 @@ fn serveSession(e: *Endpoint, io: Io, arena: Allocator, request: *Request, respo
     switch (message) {
         .request => |req| {
             if (request.headers.get(headers.protocol_version)) |version| {
-                if (!std.mem.eql(u8, version, session.revision.text()))
+                if (!std.mem.eql(u8, version, session.revision(io).text()))
                     return refuse(io, response, .bad_request, req.id, .invalid_request, "MCP-Protocol-Version is not the session's version");
             }
-            var stream: Stream = .{ .io = io, .response = response };
+            var stream: Stream = .init(io, response);
             const reply = session.handle(io, arena, req, stream.sink(e)) catch |err| switch (err) {
                 error.Canceled => return,
                 error.OutOfMemory => return err,
             };
             return e.answer(io, arena, response, &stream, req.id, reply);
         },
-        .notification => |n| if (std.mem.eql(u8, n.method, "notifications/initialized")) session.initialized(io),
+        .notification => |n| if (std.mem.eql(u8, n.method, "notifications/initialized")) {
+            _ = session.initialized(io);
+        },
         .result, .failure => session.deliver(io, message),
     }
     response.status = .accepted;
@@ -384,7 +397,7 @@ fn serveBatch(e: *Endpoint, io: Io, arena: Allocator, request: *Request, respons
         _ = try guard.checkAccess(e.options.access, io, arena, request, response, element.read.message) orelse return;
     };
     if (request.headers.get(headers.protocol_version)) |version| {
-        if (!std.mem.eql(u8, version, session.revision.text()))
+        if (!std.mem.eql(u8, version, session.revision(io).text()))
             return refuse(io, response, .bad_request, null, .invalid_request, "MCP-Protocol-Version is not the session's version");
     }
     // Each request on an arena of its own (they run at once, and an arena
@@ -392,7 +405,7 @@ fn serveBatch(e: *Endpoint, io: Io, arena: Allocator, request: *Request, respons
     const answers = try arena.alloc(Answered, elements.len);
     for (answers) |*a| a.* = .{ .arena = .init(e.gpa) };
     defer for (answers) |*a| a.arena.deinit();
-    var stream: Stream = .{ .io = io, .response = response };
+    var stream: Stream = .init(io, response);
     {
         var group: Io.Group = .init;
         defer group.cancel(io);
@@ -407,7 +420,9 @@ fn serveBatch(e: *Endpoint, io: Io, arena: Allocator, request: *Request, respons
                     a.request = req;
                     group.concurrent(io, Answered.run, .{ a, io, session, stream.sink(e) }) catch a.run(io, session, stream.sink(e));
                 },
-                .notification => |n| if (std.mem.eql(u8, n.method, "notifications/initialized")) session.initialized(io),
+                .notification => |n| if (std.mem.eql(u8, n.method, "notifications/initialized")) {
+                    _ = session.initialized(io);
+                },
                 .result, .failure => session.deliver(io, message),
             },
         };
@@ -435,7 +450,7 @@ fn serveBatch(e: *Endpoint, io: Io, arena: Allocator, request: *Request, respons
                 try e.writeReply(a.arena.allocator(), &one.writer, a.request.id, reply);
             },
         }
-        if (stream.events) {
+        if (stream.events()) {
             try stream.event(one.written());
             continue;
         }
@@ -443,7 +458,7 @@ fn serveBatch(e: *Endpoint, io: Io, arena: Allocator, request: *Request, respons
         first = false;
         try out.writer.writeAll(one.written());
     }
-    if (stream.events) return response.end(io);
+    if (stream.events()) return response.end(io);
     if (first) {
         response.status = .accepted;
         return response.end(io);
@@ -491,9 +506,9 @@ fn openStream(e: *Endpoint, io: Io, response: *Response, session_id: ?[]const u8
         return refuse(io, response, .not_acceptable, null, .invalid_request, "Accept must list text/event-stream");
     const entry = e.lookup(io, id) orelse return refuse(io, response, .not_found, null, .invalid_request, "Session not found: initialize again");
     defer entry.release(e.gpa);
-    if (entry.streaming.swap(true, .acq_rel)) return refuse(io, response, .conflict, null, .invalid_request, "The session's stream is open already");
-    defer entry.streaming.store(false, .release);
-    var stream: Stream = .{ .io = io, .response = response };
+    if (entry.streaming.swap(.open, .acq_rel) == .open) return refuse(io, response, .conflict, null, .invalid_request, "The session's stream is open already");
+    defer entry.streaming.store(.closed, .release);
+    var stream: Stream = .init(io, response);
     // The head goes now: the client learns the stream is open.
     stream.keepAlive(io) catch return;
     // glint-ignore: Z026 -- the stream ends when its client leaves or the server closes; either way there is nothing to answer
@@ -506,9 +521,10 @@ fn openStream(e: *Endpoint, io: Io, response: *Response, session_id: ?[]const u8
 fn endSession(e: *Endpoint, io: Io, response: *Response, session_id: ?[]const u8) anyerror!void {
     const id = session_id orelse return refuse(io, response, .bad_request, null, .invalid_request, "DELETE ends a session: name it in Mcp-Session-Id");
     const gone = found: {
-        e.sessions_mutex.lockUncancelable(io);
-        defer e.sessions_mutex.unlock(io);
-        for (e.sessions.items, 0..) |entry, i| if (std.mem.eql(u8, &entry.id, id)) break :found e.sessions.swapRemove(i);
+        var held = e.sessions.acquireUncancelable(io);
+        defer held.deinit(io);
+        const sessions = held.value();
+        for (sessions.items, 0..) |entry, i| if (std.mem.eql(u8, &entry.id, id)) break :found sessions.swapRemove(i);
         break :found null;
     } orelse return refuse(io, response, .not_found, null, .invalid_request, "Session not found");
     // Its stream, if one is open, ends with it.
@@ -652,34 +668,53 @@ fn accepts(accept: ?[]const u8) bool {
 /// A response that becomes an event stream at the first notification.
 const Stream = struct {
     io: Io,
-    response: *Response,
-    events: bool = false,
     /// One event at a time: a batch's requests write to one stream.
-    mutex: Io.Mutex = .init,
+    out: aegis.BlockingGuarded(Out),
     target: parley.Sink.Target = .{ .sendFn = send, .keepAliveFn = keepAliveFn },
 
-    fn begin(s: *Stream) Response.Error!*Io.Writer {
-        if (!s.events) {
-            s.events = true;
-            try s.response.header("Content-Type", "text/event-stream");
-            try s.response.header("Cache-Control", "no-cache");
-            try s.response.header("X-Accel-Buffering", "no");
+    const Out = struct {
+        response: *Response,
+        /// Whether the response is an event stream: something went out
+        /// before the answer.
+        events: bool = false,
+
+        fn begin(o: *Out, io: Io) Response.Error!*Io.Writer {
+            if (!o.events) {
+                o.events = true;
+                try o.response.header("Content-Type", "text/event-stream");
+                try o.response.header("Cache-Control", "no-cache");
+                try o.response.header("X-Accel-Buffering", "no");
+            }
+            return o.response.writer(io);
         }
-        return s.response.writer(s.io);
+    };
+
+    fn init(io: Io, response: *Response) Stream {
+        return .{ .io = io, .out = .init(.{ .response = response }) };
+    }
+
+    /// Whether the response became an event stream.
+    fn events(s: *Stream) bool {
+        var held = s.out.acquireUncancelable(s.io);
+        defer held.deinit(s.io);
+        return held.value().events;
     }
 
     fn event(s: *Stream, message: []const u8) anyerror!void {
-        try s.mutex.lock(s.io);
-        defer s.mutex.unlock(s.io);
-        const w = try s.begin();
-        try uplink.wire.sse.writeEvent(w, .{ .type = "message", .data = message });
-        try s.response.flush(s.io);
+        var held = try s.out.acquire(s.io);
+        defer held.deinit(s.io);
+        const o = held.value();
+        try uplink.wire.sse.writeEvent(try o.begin(s.io), .{ .type = "message", .data = message });
+        try o.response.flush(s.io);
     }
 
     /// The stream's last event, and its end.
     fn last(s: *Stream, message: []const u8) anyerror!void {
-        try uplink.wire.sse.writeEvent(try s.begin(), .{ .type = "message", .data = message });
-        return s.response.end(s.io);
+        var held = s.out.acquireUncancelable(s.io);
+        defer held.deinit(s.io);
+        const o = held.value();
+        try uplink.wire.sse.writeEvent(try o.begin(s.io), .{ .type = "message", .data = message });
+        return o.response.end(s.io);
     }
 
     fn sink(s: *Stream, e: *const Endpoint) parley.Sink {
@@ -703,14 +738,15 @@ const Stream = struct {
     fn keepAliveFn(t: *parley.Sink.Target, io: Io) parley.Sink.SendError!void {
         _ = io;
         const s: *Stream = @fieldParentPtr("target", t);
-        s.mutex.lock(s.io) catch return error.Canceled;
-        defer s.mutex.unlock(s.io);
-        const w = s.begin() catch |err| return switch (err) {
+        var held = s.out.acquire(s.io) catch return error.Canceled;
+        defer held.deinit(s.io);
+        const o = held.value();
+        const w = o.begin(s.io) catch |err| return switch (err) {
             error.Canceled => error.Canceled,
             else => error.Closed,
         };
         w.writeAll(":\n\n") catch return error.Closed;
-        s.response.flush(s.io) catch |err| return switch (err) {
+        o.response.flush(s.io) catch |err| return switch (err) {
             error.Canceled => error.Canceled,
             else => error.Closed,
         };

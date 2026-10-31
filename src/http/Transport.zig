@@ -19,6 +19,7 @@ const std = @import("std");
 const parley = @import("parley");
 const uplink = @import("uplink");
 const strand = @import("strand");
+const aegis = @import("aegis");
 const headers = @import("headers.zig");
 
 const Io = std.Io;
@@ -36,8 +37,7 @@ session: ?[]u8 = null,
 stream: ?Io.Future(Io.Cancelable!void) = null,
 client: ?*Client = null,
 /// Private: the tools' `x-mcp-header` marks, from the last `tools/list`.
-marks_mutex: Io.Mutex = .init,
-marks: std.ArrayList(Marked) = .empty,
+marks: aegis.BlockingGuarded(std.ArrayList(Marked)) = .init(.empty),
 /// Private: the transport the client holds, `transport()`.
 transporting: Client.Transport = .{ .vtable = &.{ .request = request, .notify = notify, .opened = opened, .listed = listedFn } },
 
@@ -128,8 +128,9 @@ pub fn close(t: *Transport, io: Io) void {
 
 pub fn deinit(t: *Transport) void {
     if (t.session) |s| t.gpa.free(s);
-    for (t.marks.items) |m| t.free(m);
-    t.marks.deinit(t.gpa);
+    const marks = t.marks.teardown();
+    for (marks.items) |m| t.free(m);
+    marks.deinit(t.gpa);
 }
 
 fn free(t: *Transport, m: Marked) void {
@@ -201,8 +202,9 @@ pub fn listed(t: *Transport, io: Io, limits: strand.core.Limits, arena: Allocato
     const l = strand.json.parseLeaky(Listed, arena, result, parley.types.readOptions(limits)) catch return result;
     var kept: std.ArrayList([]const u8) = .empty;
     var dropped = false;
-    t.marks_mutex.lockUncancelable(io);
-    defer t.marks_mutex.unlock(io);
+    var guard = t.marks.acquireUncancelable(io);
+    defer guard.deinit(io);
+    const known = guard.value();
     for (l.tools) |tool| {
         const Tool = struct { name: []const u8, inputSchema: strand.json.Raw = .{ .bytes = "{}" } };
         const parsed = strand.json.parseLeaky(Tool, arena, tool.bytes, parley.types.readOptions(limits)) catch continue;
@@ -214,11 +216,11 @@ pub fn listed(t: *Transport, io: Io, limits: strand.core.Limits, arena: Allocato
                 continue;
             },
         };
-        for (t.marks.items, 0..) |m, i| if (std.mem.eql(u8, m.tool, parsed.name)) {
-            t.free(t.marks.swapRemove(i));
+        for (known.items, 0..) |m, i| if (std.mem.eql(u8, m.tool, parsed.name)) {
+            t.free(known.swapRemove(i));
             break;
         };
-        try t.marks.append(t.gpa, .{ .tool = try t.gpa.dupe(u8, parsed.name), .params = marks });
+        try known.append(t.gpa, .{ .tool = try t.gpa.dupe(u8, parsed.name), .params = marks });
         try kept.append(arena, tool.bytes);
     }
     if (!dropped) return result;
@@ -386,9 +388,9 @@ fn notify(ct: *Client.Transport, io: Io, message: []const u8) Client.RequestErro
 fn mirror(t: *Transport, io: Io, arena: Allocator, exchange: *const Client.Exchange, fields: *std.ArrayList(std.http.Header)) Allocator.Error!void {
     const tool = exchange.name orelse return;
     const arguments = exchange.arguments orelse return;
-    t.marks_mutex.lockUncancelable(io);
-    defer t.marks_mutex.unlock(io);
-    const marked = for (t.marks.items) |m| {
+    var guard = t.marks.acquireUncancelable(io);
+    defer guard.deinit(io);
+    const marked = for (guard.value().items) |m| {
         if (std.mem.eql(u8, m.tool, tool)) break m;
     } else return;
     const limits = exchange.client.jsonLimits();
