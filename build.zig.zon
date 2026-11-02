@@ -26,20 +26,20 @@
         },
 
         .uplink = .{
-            .url = "git+https://github.com/pedronaugusto/uplink#33900d2400990aa01e669d27eeafb5268a6362cb",
-            .hash = "uplink-0.10.1-0eVSJm0nGQB6n46eowFdL_K7g7UYaeAPx6epz_jQg7nE",
+            .url = "git+https://github.com/pedronaugusto/uplink?ref=preflight-0.18#22e0613a574a0ded7e2bcfa986eadff96dee02ff",
+            .hash = "uplink-0.10.2-0eVSJiYbGgBhWZFMfAv-9mIBnzTrv12JjunxOrVbWOdo",
             .lazy = true,
         },
 
         .clearance = .{
-            .url = "git+https://github.com/pedronaugusto/clearance#e50c880d4eb3e16fb47b3a2e9b22d14774ddedaf",
-            .hash = "clearance-0.4.0--QKm-MDRFQDsuSjvebbVwgc4md_l2pPbWPpw42wXfQpE",
+            .url = "git+https://github.com/pedronaugusto/clearance#92cd1414fe1baf5b19488227d8599ab4167b312b",
+            .hash = "clearance-0.4.0--QKm-FbSFQAOxvWrljL7RYHVyJhLCi3uz_AnPcADK332",
             .lazy = true,
         },
 
         .conduit = .{
-            .url = "git+https://github.com/pedronaugusto/conduit#38d5488f0858a7422114c81122c65b7d758ba743",
-            .hash = "conduit-0.10.6-4rIA7_qxFQCUHvVtfnVaVKuU28UfAoCqepAKAe3VpwOb",
+            .url = "git+https://github.com/pedronaugusto/conduit?ref=wave-b#872f39f671096a1573ca609ac5f86304b0e1bb57",
+            .hash = "conduit-0.10.6-4rIA79WzFQBQPqlKC72nPr2c21bESnwo6yJnthyBCsL9",
             .lazy = true,
         },
     },
