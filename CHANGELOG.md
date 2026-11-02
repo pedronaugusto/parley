@@ -14,6 +14,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - Mixed operators are parenthesized where Zig master refuses them as ambiguous (`x catch … orelse y`): the parentheses say what Zig 0.17 already did, and nothing changes at runtime.
+### Fixed
+
+- HTTP+SSE: a POST arriving while its stream's `endpoint` event was still being flushed answered on the stream at the same time as the GET's flush (a data race ThreadSanitizer found); a POST now waits until that event is written.
 
 ## [0.8.0] - 2026-10-28
 
