@@ -161,7 +161,7 @@ pub const Listener = struct {
         while (true) {
             const st = held.value();
             if (st.version != seen or st.ended or st.closed) return st.version;
-            l.changes.wait(io, &held, deadline) catch |err| switch (err) {
+            held.wait(&l.changes, io, deadline) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 error.Timeout => return null,
                 error.WaiterLimit => unreachable, // unreachable: one task waits on a listener, its stream's
@@ -315,7 +315,7 @@ pub const Hub = struct {
 
     /// A list changed: every listener that asked for `kind` learns it.
     pub fn listChanged(h: *Hub, io: Io, kind: Kind) void {
-        aegis.assert.pre(kind != .resource and kind != .task, "a resource's update and a task's change name what changed");
+        aegis.assert.invariant(kind != .resource and kind != .task, "a resource's update and a task's change name what changed");
         var order: Locks.Context = .{};
         var held = h.listeners.acquireOrderedUncancelable(io, &order);
         defer held.deinit(io);

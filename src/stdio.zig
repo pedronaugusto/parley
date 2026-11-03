@@ -221,7 +221,7 @@ pub const Connection = struct {
                 error.ReadFailed => return error.ReadFailed,
                 error.EndOfStream => break :blk true,
             };
-            aegis.assert.post(next == '\n', "a line stops at its break");
+            aegis.assert.invariant(next == '\n', "a line stops at its break");
             in.toss(1);
             break :blk false;
         };

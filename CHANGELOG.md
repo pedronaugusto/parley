@@ -13,6 +13,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- aegis 0.3: contracts are `assert.invariant` where `assert.pre` and `assert.post` were, and a listener waits on its ordered guard (`held.wait(&condition, io, deadline)`). Pins aegis breaking-0.3 (7bdb587), and strand, uplink, clearance, conduit and shakedown on it. A child's stderr, which conduit now lends as the `std.Io.File` itself, is read without `.get()`.
 - Mixed operators are parenthesized where Zig master refuses them as ambiguous (`x catch … orelse y`): the parentheses say what Zig 0.17 already did, and nothing changes at runtime.
 ### Fixed
 
