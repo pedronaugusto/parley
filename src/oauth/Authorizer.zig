@@ -293,7 +293,7 @@ fn renew(a: *Authorizer, h: *Held, io: Io, arena: Allocator, status: u16, challe
     defer server.deinit();
     const as = &server.value;
     // Another server: nothing the old one issued goes to it (SEP-2352).
-    if (h.issuer) |old| if (!std.mem.eql(u8, old, as.issuer)) a.forgetServer(h, io, arena);
+    if (h.issuer) |old| if (!std.mem.eql(u8, old, as.issuer)) try a.forgetServer(h, io, arena);
     if (h.issuer == null) h.issuer = try a.gpa.dupe(u8, as.issuer);
     const key = try a.storeKey(h, arena);
     const resource = prm.value.resource;
@@ -397,8 +397,8 @@ fn keep(a: *Authorizer, h: *Held, io: Io, key: []const u8, set: TokenSet) RenewE
 
 /// Forgets the server: its tokens, here and kept, and the client it
 /// registered.
-fn forgetServer(a: *Authorizer, h: *Held, io: Io, arena: Allocator) void {
-    if (a.storeKey(h, arena)) |k| a.store().forget(io, k) else |_| {}
+fn forgetServer(a: *Authorizer, h: *Held, io: Io, arena: Allocator) Allocator.Error!void {
+    a.store().forget(io, try a.storeKey(h, arena));
     if (h.active) |*set| set.deinit();
     h.active = null;
     if (h.registered) |*r| r.deinit(a.gpa);

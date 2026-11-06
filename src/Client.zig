@@ -615,7 +615,7 @@ fn followTask(c: *Client, io: Io, arena: Allocator, created: []const u8, diagnos
     }
     const timeout = c.options.timeout.toIoDuration();
     while (true) {
-        io.sleep(.fromMilliseconds(interval), .awake) catch return error.Canceled;
+        io.sleep(aegis.units.Duration(.millisecond, u32).fromRaw(interval).toIoDuration(), .awake) catch return error.Canceled;
         // Each poll on its own arena: a long task is polled many times.
         var scratch: std.heap.ArenaAllocator = .init(c.gpa);
         defer scratch.deinit();

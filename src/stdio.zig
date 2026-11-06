@@ -789,6 +789,7 @@ pub const Channel = struct {
             var buffer: [128]u8 = undefined;
             var w: Io.Writer = .fixed(&buffer);
             w.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":") catch unreachable; // unreachable: the buffer holds it
+            // glint-ignore: Z026 -- an id the buffer cannot hold sends no notice; the request ends either way
             if (exchange.id.write(&w)) |_| {
                 w.writeAll("}}") catch unreachable; // unreachable: an integer id fits the buffer
                 // glint-ignore: Z026 -- the request ends either way; a notice the server cannot take changes nothing

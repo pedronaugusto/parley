@@ -338,7 +338,7 @@ fn events(t: *Transport, io: Io, arena: Allocator, exchange: *Client.Exchange, f
         // wait the server set (2025-11-25); a 2026-07-28 stream is not.
         if (exchange.revision.stateless() or last_id.len == 0 or attempts >= 8) return error.Closed;
         attempts += 1;
-        io.sleep(.fromMilliseconds(@intCast(retry orelse 1000)), .awake) catch return error.Canceled;
+        io.sleep(aegis.units.Duration(.millisecond, u64).fromRaw(retry orelse 1000).toIoDuration(), .awake) catch return error.Canceled;
         var fields: std.ArrayList(std.http.Header) = .empty;
         try fields.appendSlice(arena, &.{
             .{ .name = "Accept", .value = "text/event-stream" },
