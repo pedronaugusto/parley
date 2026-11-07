@@ -326,8 +326,11 @@ const Client = struct {
         };
         defer response.deinit(io);
         _ = c.arena.reset(.retain_capacity);
-        // glint-ignore: Z026 -- the answer to a DELETE has no body worth reading; a failure here is the next request's
-        _ = response.collect(c.arena.allocator(), io, .limited(1 << 20)) catch {};
+        // The answer to a DELETE has no body worth reading, but its failure is the row's.
+        _ = response.collect(c.arena.allocator(), io, .limited(1 << 20)) catch |err| return switch (err) {
+            error.Canceled => error.Canceled,
+            else => error.HttpFailed,
+        };
     }
 
     fn echoCall(c: *Client, io: Io, era: Era) WorkloadError!void {
@@ -600,15 +603,17 @@ const Bench = struct {
     }
 
     fn endHttp(b: *Bench) WorkloadError!void {
+        // The session's end is returned after the server is stopped, whichever way it went.
+        var closed: WorkloadError!void = {};
         if (b.http) |c| {
-            // glint-ignore: Z026 -- the session's end is the server's to answer; the row has its numbers
-            c.close(b.io) catch {};
+            closed = c.close(b.io);
             c.deinit(b.io);
             b.gpa.destroy(c);
             b.http = null;
         }
         b.stopProcess();
         b.url = "";
+        return closed;
     }
 
     fn listHttp(comptime era: Era) Row.Step {
@@ -706,14 +711,15 @@ const Bench = struct {
 
     fn endUnderLoad(b: *Bench) WorkloadError!void {
         b.stopping.store(true, .release);
-        // glint-ignore: Z026 -- the loaders end on the flag; canceled, they end as well
-        b.loaders.await(b.io) catch {};
+        // The loaders end on the flag; a cancel of the bench is returned once the load is ended.
+        const awaited = b.loaders.await(b.io);
         b.http = null;
         var failed: ?WorkloadError = null;
         for (b.clients[1..]) |c| if (c.failed) |err| {
             failed = err;
         };
         try b.endLoad();
+        try awaited;
         if (failed) |err| return err;
     }
 

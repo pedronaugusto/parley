@@ -189,8 +189,11 @@ fn sessionStream(t: *Transport, io: Io) Io.Cancelable!void {
             .refused => {},
         };
         const answer = (replies.message() catch continue) orelse continue;
-        // glint-ignore: Z026 -- an answer the server cannot take leaves its request unanswered, which it times out
-        t.postAnswer(io, a, client.revision, answer) catch {};
+        t.postAnswer(io, a, client.revision, answer) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            // glint-ignore: Z026 -- an answer the server cannot take leaves its request unanswered, which it times out
+            else => {},
+        };
     }
 }
 

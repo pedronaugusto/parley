@@ -511,10 +511,10 @@ fn openStream(e: *Endpoint, io: Io, response: *Response, session_id: ?[]const u8
     var stream: Stream = .init(io, response);
     // The head goes now: the client learns the stream is open.
     stream.keepAlive(io) catch return;
-    // glint-ignore: Z026 -- the stream ends when its client leaves or the server closes; either way there is nothing to answer
-    entry.session.stream(io, stream.sink(e)) catch {};
     // glint-ignore: Z026 -- the stream was the answer; a client gone before its end needs no more
-    response.end(io) catch {};
+    defer response.end(io) catch {};
+    // The stream ends when its client leaves or the server closes; a cancel or a lack of memory is the caller's.
+    try entry.session.stream(io, stream.sink(e));
 }
 
 /// DELETE: the session ends.
