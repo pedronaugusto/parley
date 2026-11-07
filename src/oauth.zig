@@ -17,6 +17,8 @@
 //! - `ResourceMetadata`: the resource's metadata document, served where a
 //!   client looks for it.
 
+/// A client's DPoP key and the nonces its servers gave: `Authorizer.Options.dpop`.
+pub const dpop = @import("clearance.oauth").dpop;
 pub const Authorizer = @import("oauth/Authorizer.zig");
 pub const Guard = @import("oauth/Guard.zig");
 pub const ResourceMetadata = @import("oauth/ResourceMetadata.zig");

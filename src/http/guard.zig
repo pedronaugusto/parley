@@ -41,6 +41,8 @@ pub const Refusal = struct {
     challenge: []const u8,
     /// The body, JSON (an OAuth error object), or empty.
     body: []const u8 = "",
+    /// The `DPoP-Nonce` to answer with (RFC 9449 §9).
+    dpop_nonce: ?[]const u8 = null,
 };
 
 /// The hosts and origins an endpoint serves.
@@ -101,6 +103,7 @@ pub fn checkAccess(access_: ?*Access, io: Io, arena: Allocator, request: *const 
         .refused => |r| {
             response.status = r.status;
             try response.header("WWW-Authenticate", r.challenge);
+            if (r.dpop_nonce) |value| try response.header("DPoP-Nonce", value);
             if (r.body.len != 0) try response.header("Content-Type", "application/json");
             try response.send(io, r.body);
             return null;

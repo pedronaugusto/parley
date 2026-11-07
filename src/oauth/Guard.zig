@@ -48,10 +48,25 @@ pub fn access(g: *Guard) *Endpoint.Access {
     return &g.checking;
 }
 
+/// Every `DPoP` field the request carries: more than one is the verifier's to
+/// refuse (RFC 9449 §4.3).
+fn proofsOf(arena: Allocator, request: *const uplink.server.Request) Allocator.Error![]const []const u8 {
+    var proofs: std.ArrayList([]const u8) = .empty;
+    var it = request.headers.iterator();
+    while (it.next()) |f| if (std.ascii.eqlIgnoreCase(f.name, "DPoP")) try proofs.append(arena, f.value);
+    return proofs.items;
+}
+
 fn check(a: *Endpoint.Access, io: Io, arena: Allocator, request: *const uplink.server.Request, message: ?parley.wire.Message) Endpoint.Access.Error!Endpoint.Verdict {
     const g: *const Guard = @alignCast(@fieldParentPtr("checking", a));
     const scopes = if (g.needs) |n| try std.mem.concat(arena, []const u8, &.{ g.scopes, try n.scopes(arena, message) }) else g.scopes;
-    const outcome = g.verifier.check(io, g.web, arena, .{ .authorization = request.headers.get("Authorization") }, scopes) catch |err| return switch (err) {
+    const outcome = g.verifier.check(io, g.web, arena, .{
+        .authorization = request.headers.get("Authorization"),
+        .dpop = try proofsOf(arena, request),
+        .method = request.method.name,
+        // What a proof names: the endpoint, as the verifier knows itself.
+        .url = g.verifier.resource,
+    }, scopes) catch |err| return switch (err) {
         error.Unavailable => error.Unavailable,
         error.Canceled => error.Canceled,
         error.OutOfMemory => error.OutOfMemory,
@@ -80,7 +95,7 @@ fn check(a: *Endpoint.Access, io: Io, arena: Allocator, request: *const uplink.s
                 }
                 body.writer.writeByte('}') catch return error.OutOfMemory;
             }
-            return .{ .refused = .{ .status = r.status, .challenge = challenge.written(), .body = body.written() } };
+            return .{ .refused = .{ .status = r.status, .challenge = challenge.written(), .body = body.written(), .dpop_nonce = r.dpop_nonce } };
         },
     }
 }

@@ -50,7 +50,7 @@ held: aegis.BlockingGuarded(Held) = .init(.{}),
 /// Private: where tokens are kept when the options name no store.
 memory: oauth.store.Memory,
 /// Private: the authorizer as a transport's, `authorization()`.
-authorizing: http.Transport.Authorization = .{ .vtable = &.{ .credentials = credentials, .refused = refused } },
+authorizing: http.Transport.Authorization = .{ .vtable = &.{ .credentials = credentials, .nonce = nonce, .refused = refused } },
 
 pub const Options = struct {
     /// How the user signs in: open the authorization URL (in a browser),
@@ -83,6 +83,12 @@ pub const Options = struct {
     /// null: in this process's memory. Outlives the authorizer.
     store: ?*oauth.TokenStore = null,
     fetch: oauth.fetch.Options = .{},
+    /// Ask for tokens bound to this key (RFC 9449): every token request and
+    /// every request a bound token goes on carries a proof of it, and a nonce
+    /// a server asks for is kept and sent. Null: bearer tokens. Tokens kept in
+    /// `store` are bound to the key: keep them together. Outlives the
+    /// authorizer.
+    dpop: ?*oauth.dpop.Session = null,
 };
 
 pub const Grant = enum {
@@ -221,12 +227,30 @@ fn store(a: *Authorizer) *oauth.TokenStore {
     return a.options.store orelse &a.memory.store;
 }
 
-fn credentials(auth: *http.Transport.Authorization, io: Io, arena: Allocator) http.Transport.Authorization.Error!?[]const u8 {
+fn credentials(auth: *http.Transport.Authorization, io: Io, arena: Allocator, method: []const u8, url: []const u8) http.Transport.Authorization.Error!?http.Transport.Authorization.Credentials {
     const a: *Authorizer = @alignCast(@fieldParentPtr("authorizing", auth));
     var held = try a.held.acquire(io);
     defer held.deinit(io);
-    const set = held.value().active orelse return null;
-    return try std.mem.concat(arena, u8, &.{ "Bearer ", set.access_token });
+    const h = held.value();
+    const set = if (h.active) |*active| active else return null;
+    if (set.token_type != .dpop) return .{ .authorization = try std.mem.concat(arena, u8, &.{ "Bearer ", set.access_token }) };
+    // A bound token goes with its proof or not at all: the server's refusal
+    // then starts what would get another.
+    const session = a.options.dpop orelse return null;
+    const fields = session.headers(arena, io, method, url, set) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            h.failure = err;
+            std.log.scoped(.parley_oauth).warn("no DPoP proof for this request: {t}", .{err});
+            return null;
+        },
+    };
+    return .{ .authorization = fields.authorization.expose(), .dpop = fields.dpop };
+}
+
+fn nonce(auth: *http.Transport.Authorization, io: Io, url: []const u8, value: []const u8) void {
+    const a: *Authorizer = @alignCast(@fieldParentPtr("authorizing", auth));
+    if (a.options.dpop) |session| session.remember(io, url, value);
 }
 
 fn refused(auth: *http.Transport.Authorization, io: Io, sent: ?[]const u8, status: u16, challenges: []const []const u8) http.Transport.Authorization.Error!bool {
@@ -237,7 +261,9 @@ fn refused(auth: *http.Transport.Authorization, io: Io, sent: ?[]const u8, statu
     // Another request renewed the tokens since this one was sent.
     if (h.active) |set| {
         const was = sent orelse return true;
-        if (!std.mem.eql(u8, was["Bearer ".len..], set.access_token)) return true;
+        // After the scheme: `Bearer ` or `DPoP `.
+        const scheme_end = std.mem.findScalar(u8, was, ' ') orelse return true;
+        if (!std.mem.eql(u8, was[scheme_end + 1 ..], set.access_token)) return true;
     }
     var arena_state: std.heap.ArenaAllocator = .init(a.gpa);
     defer arena_state.deinit();
@@ -311,7 +337,7 @@ fn renew(a: *Authorizer, h: *Held, io: Io, arena: Allocator, status: u16, challe
     // Refused tokens that can be refreshed, and no more scope asked for:
     // a refresh first, a sign-in only if it is refused.
     if (h.active) |*set| if (client != null and set.refresh_token != null and covers(set.scope, challenge.scope)) {
-        switch (try oauth.refresh(a.gpa, io, a.web, as, client.?, set, .{ .resources = &.{resource}, .fetch = a.options.fetch })) {
+        switch (try oauth.refresh(a.gpa, io, a.web, as, client.?, set, .{ .resources = &.{resource}, .dpop = a.options.dpop, .fetch = a.options.fetch })) {
             .tokens => |renewed| return a.keep(h, io, key, renewed),
             .refused => {},
         }
@@ -319,12 +345,12 @@ fn renew(a: *Authorizer, h: *Held, io: Io, arena: Allocator, status: u16, challe
     const scope = try a.scopeFor(h, arena, challenge.scope, prm.value.scopes_supported, as);
     const response = switch (a.options.grant) {
         .authorization_code => try a.signIn(io, arena, as, client.?, scope, resource),
-        .client_credentials => try oauth.clientCredentials(a.gpa, io, a.web, as, client.?, scope, .{ .resources = &.{resource}, .fetch = a.options.fetch }),
+        .client_credentials => try oauth.clientCredentials(a.gpa, io, a.web, as, client.?, scope, .{ .dpop = a.options.dpop, .resources = &.{resource}, .fetch = a.options.fetch }),
         .enterprise => try a.enterpriseGrant(io, arena, as, client.?, scope, resource),
         .jwt_bearer => blk: {
             const source = a.options.assertion orelse return error.NotConfigured;
             const assertion = try source.get(io, arena);
-            break :blk try oauth.jwtBearer(a.gpa, io, a.web, as, client, assertion, scope, .{ .resources = &.{resource}, .fetch = a.options.fetch });
+            break :blk try oauth.jwtBearer(a.gpa, io, a.web, as, client, assertion, scope, .{ .resources = &.{resource}, .dpop = a.options.dpop, .fetch = a.options.fetch });
         },
     };
     switch (response) {
@@ -347,10 +373,11 @@ fn signIn(a: *Authorizer, io: Io, arena: Allocator, as: *const oauth.metadata.Au
         .resources = &.{resource},
         // MCP: a server that does not list S256 is not one to sign in with.
         .require_pkce_listed = true,
+        .dpop = a.options.dpop,
     }, &url.writer);
     defer flow.deinit();
     const redirect = try sign_in.open(io, arena, url.written());
-    return flow.finish(a.gpa, io, a.web, as, client, redirect, .{ .fetch = a.options.fetch });
+    return flow.finish(a.gpa, io, a.web, as, client, redirect, .{ .fetch = a.options.fetch, .dpop = a.options.dpop });
 }
 
 /// MCP's enterprise-managed authorization: the user's token at the
@@ -383,7 +410,7 @@ fn enterpriseGrant(a: *Authorizer, io: Io, arena: Allocator, as: *const oauth.me
         .granted => |*g| g,
     };
     defer grant.deinit();
-    return oauth.redeemIdJag(a.gpa, io, a.web, as, client, grant, resource, .{ .fetch = a.options.fetch });
+    return oauth.redeemIdJag(a.gpa, io, a.web, as, client, grant, resource, .{ .fetch = a.options.fetch, .dpop = a.options.dpop });
 }
 
 /// Keeps `set` as the tokens in use, and in the store.

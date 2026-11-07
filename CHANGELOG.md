@@ -8,6 +8,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Breaking
 
+- `http.Transport.Authorization`'s `credentials` takes the request's method and URL and returns `Credentials` (`authorization`, and a `dpop` proof), and its vtable gains `nonce`: what a DPoP-bound token needs per request.
 - Every interface is embedded: its owner holds it as a field and recovers itself with `@fieldParentPtr`, where a `context: *anyopaque` was cast back. The interface's functions take a pointer to it, an option or a call takes that pointer, and the owner gives it from an accessor (`Stream.sink`, `Channel.transport`, `http.Transport.transport`, `oauth.Authorizer.authorization`, `oauth.Guard.access`). So it goes for `Sink` (its `Target`), `stdio.Out`, `Client.Transport`, `Client.Handlers` (`Client.Options.handlers` is `?*Handlers`), `http.Transport.Authorization`, `http.Endpoint.Access` (`access: ?*Access`), `oauth.Guard.Needs`, `oauth.Authorizer.TokenSource` and `SignIn` (the options hold pointers), `Server.Filter`, `Server.Completer` (`setCompleter(*Completer)`), `Call.TaskHook`, and `ToolHandler`, `ReadHandler` and `PromptHandler` (`addDynamicTool`, `addResource`, `addTemplate` and `addDynamicPrompt` take a pointer the server keeps; `typedTool` and `typedPrompt` give one that lives as long as the program). Each function is named for what it does with `Fn` after it (`sendFn`, `checkFn`, `callFn`), and a method of the same name calls it.
 - The endpoints' uplink `Handler`s are embedded the same way, as uplink's `Server.init` takes `*Handler`.
 
@@ -19,6 +20,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - HTTP+SSE: a POST arriving while its stream's `endpoint` event was still being flushed answered on the stream at the same time as the GET's flush (a data race ThreadSanitizer found); a POST now waits until that event is written.
 
+
+### Added
+
+- DPoP (RFC 9449), MCP's `auth/dpop` and `auth/dpop-nonce`: `Authorizer.Options.dpop` asks for tokens bound to a key, with a proof on every token request and on every request a bound token goes on, and a nonce a token endpoint or MCP server asks for sent back. `oauth.Guard` takes DPoP tokens when its verifier does, answering with `DPoP-Nonce`.
 ## [0.8.0] - 2026-10-28
 
 ### Breaking

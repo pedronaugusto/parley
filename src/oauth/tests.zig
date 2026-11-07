@@ -46,6 +46,12 @@ const Provider = struct {
     refreshes: u32 = 0,
     /// JWT-bearer grants given.
     grants: u32 = 0,
+    /// How the token endpoint takes DPoP: not at all, with a proof, or with a
+    /// proof carrying the nonce it gives.
+    dpop: enum { off, proof, nonce } = .off,
+    /// Proofs it took, and the nonces it asked for.
+    proofs: u32 = 0,
+    nonces_asked: u32 = 0,
     exchanges: u32 = 0,
 
     fn start(p: *Provider, io: Io) !void {
@@ -165,6 +171,26 @@ const Provider = struct {
         const body = try request.collect(arena, io, .limited(8192));
         p.mutex.lockUncancelable(io);
         defer p.mutex.unlock(io);
+        var jkt: ?[]const u8 = null;
+        if (p.dpop != .off) {
+            const nonce: ?[]const u8 = if (p.dpop == .nonce) "as-nonce" else null;
+            const proof = request.headers.get("DPoP") orelse "";
+            const scratch = try arena.alloc(u8, clearance.jws.scratchLength(proof.len));
+            const proved = try arena.create(clearance.dpop.Verified);
+            const htu = try arena.print("{s}/token", .{p.base});
+            clearance.dpop.verifyProof(io, proof, .{ .algorithms = &.{.eddsa}, .htm = "POST", .htu = htu, .nonce = nonce }, Io.Clock.real.now(io), scratch, proved) catch |err| {
+                response.status = .bad_request;
+                if (err == error.UseNonce) {
+                    p.nonces_asked += 1;
+                    try response.header("DPoP-Nonce", nonce.?);
+                    return response.send(io, "{\"error\":\"use_dpop_nonce\"}");
+                }
+                return response.send(io, "{\"error\":\"invalid_dpop_proof\"}");
+            };
+            p.proofs += 1;
+            const encoded = try arena.alloc(u8, std.base64.url_safe_no_pad.Encoder.calcSize(32));
+            jkt = std.base64.url_safe_no_pad.Encoder.encode(encoded, &proved.thumbprint);
+        }
         const grant = field(arena, body, "grant_type") orelse "";
         if (std.mem.eql(u8, grant, "urn:ietf:params:oauth:grant-type:jwt-bearer")) return jwtBearer(p, io, arena, request, body, response);
         if (std.mem.eql(u8, grant, "refresh_token")) p.refreshes += 1 else {
@@ -177,6 +203,10 @@ const Provider = struct {
         }
         const now: i64 = @intCast(@divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
         var jwt: std.Io.Writer.Allocating = .init(arena);
+        if (jkt) |thumbprint| {
+            try signClaims(p.gpa, io, &jwt.writer, .{ .iss = p.base, .aud = p.resource, .sub = "user-1", .client_id = "registered-1", .scope = p.scope, .exp = now + 600, .iat = now, .jti = "j", .cnf = .{ .jkt = thumbprint } });
+            return response.send(io, try arena.print("{{\"access_token\":\"{s}\",\"token_type\":\"DPoP\",\"expires_in\":600}}", .{jwt.written()}));
+        }
         try signClaims(p.gpa, io, &jwt.writer, .{ .iss = p.base, .aud = p.resource, .sub = "user-1", .client_id = "registered-1", .scope = p.scope, .exp = now + 600, .iat = now, .jti = "j" });
         return response.send(io, try arena.print("{{\"access_token\":\"{s}\",\"token_type\":\"Bearer\",\"expires_in\":600,\"refresh_token\":\"rt\",\"scope\":\"{s}\"}}", .{ jwt.written(), p.scope }));
     }
@@ -411,6 +441,55 @@ const Workload = struct {
 fn workloadToken(s: *Authorizer.TokenSource, _: Io, _: std.mem.Allocator) Authorizer.SourceError![]const u8 {
     const w: *Workload = @alignCast(@fieldParentPtr("source", s));
     return w.token;
+}
+
+/// RFC 8037 A.1's key as a private JWK: the client's DPoP key.
+const dpop_jwk = "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"d\":\"" ++ ed25519_d ++ "\",\"x\":\"" ++ ed25519_x ++ "\"}";
+
+/// A client with a DPoP key signs in and calls a tool; the token endpoint and
+/// the MCP server take proofs of it, and, with `nonces`, each asks for its own.
+fn dpopRound(nonces: bool) !void {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var provider: Provider = undefined;
+    try provider.start(io);
+    defer provider.stop(io);
+    provider.dpop = if (nonces) .nonce else .proof;
+    var web: uplink.Client = .init(gpa, .{});
+    defer web.deinit(io);
+    var mcp: Guarded = undefined;
+    try mcp.start(gpa, io, &web, provider.base);
+    defer mcp.stop(io);
+    // Set before the first request, so the server's tasks see it.
+    mcp.verifier.dpop = .{ .algorithms = &.{.eddsa}, .nonce = if (nonces) "rs-nonce" else null };
+
+    var private = try clearance.jwk.PrivateKey.parse(gpa, dpop_jwk, .{});
+    defer private.deinit();
+    var session: oauth.dpop.Session = .init(try .fromJwk(&private, .eddsa));
+    var browser: Browser = .{ .web = &web };
+    var authorizer: Authorizer = .init(gpa, &web, mcp.url, .{ .sign_in = &browser.sign_in, .client_name = "parley-test", .dpop = &session });
+    defer authorizer.deinit();
+    var remote: http.Transport = .init(gpa, &web, mcp.url, .{ .authorization = authorizer.authorization() });
+    defer remote.deinit();
+    defer remote.close(io);
+    var client: parley.Client = .init(gpa, remote.transport(), .{ .info = .{ .name = "parley-test", .version = "0" } });
+    defer client.deinit();
+    try client.connect(io);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    _ = try client.callTool(io, arena_state.allocator(), "read", .{}, null);
+    provider.mutex.lockUncancelable(io);
+    defer provider.mutex.unlock(io);
+    try testing.expectEqual(@as(u32, 1), provider.proofs);
+    try testing.expectEqual(@as(u32, if (nonces) 1 else 0), provider.nonces_asked);
+}
+
+test "a DPoP-bound token: a proof at the token endpoint and on every request to the MCP server" {
+    try dpopRound(false);
+}
+
+test "DPoP nonces: the token endpoint's and the MCP server's each asked for, and each sent back" {
+    try dpopRound(true);
 }
 
 test "enterprise-managed authorization: no sign-in; the identity provider's ID-JAG redeemed, again for a step-up" {

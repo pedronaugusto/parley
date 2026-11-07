@@ -30,6 +30,11 @@ const Raw = strand.json.Raw;
 /// limit the default.
 const read_options = types.readOptions(parley.wire.limitsFor(parley.wire.default_message));
 
+/// RFC 7515 A.3's P-256 key as a private JWK.
+const dpop_jwk =
+    \\{"kty":"EC","crv":"P-256","x":"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU","y":"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0","d":"jpsQnnGQmL-YBIffH1136cspYG6-0iY7X1fCE9-E9LI"}
+;
+
 /// The client's answers to the server's requests, as the scenario asks.
 const Answers = struct {
     scenario: []const u8,
@@ -170,6 +175,15 @@ pub fn main(init: std.process.Init) !void {
         workload.token = jwt;
         assertion = &workload.source;
     }
+    // MCP's `auth/dpop` and `auth/dpop-nonce`: tokens bound to a key, RFC 7515
+    // A.3's, which is public, as a program for a test suite may have.
+    var dpop_key: ?clearance.jwk.PrivateKey = null;
+    defer if (dpop_key) |*k| k.deinit();
+    var dpop_session: oauth.dpop.Session = undefined;
+    if (std.mem.startsWith(u8, scenario, "auth/dpop")) {
+        dpop_key = try clearance.jwk.PrivateKey.parse(gpa, dpop_jwk, .{});
+        dpop_session = .init(try .fromJwk(&dpop_key.?, .es256));
+    }
     var browser: Browser = .{ .web = &web };
     var authorizer: oauth.Authorizer = .init(gpa, &web, url, .{
         .sign_in = &browser.sign_in,
@@ -183,6 +197,7 @@ pub fn main(init: std.process.Init) !void {
         .grant = if (std.mem.startsWith(u8, scenario, "auth/client-credentials")) .client_credentials else if (enterprise != null) .enterprise else if (assertion != null) .jwt_bearer else .authorization_code,
         .enterprise = enterprise,
         .assertion = assertion,
+        .dpop = if (dpop_key != null) &dpop_session else null,
     });
     defer authorizer.deinit();
     var remote: http.Transport = .init(gpa, &web, url, .{ .authorization = authorizer.authorization() });

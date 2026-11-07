@@ -60,11 +60,23 @@ pub const Authorization = struct {
 
     pub const Error = error{ Canceled, OutOfMemory };
 
+    /// What a request carries, on the arena it was asked for with.
+    pub const Credentials = struct {
+        /// The `Authorization` value.
+        authorization: []const u8,
+        /// The `DPoP` value, a proof of this request (RFC 9449 §7), for a
+        /// token bound to a key.
+        dpop: ?[]const u8 = null,
+    };
+
     pub const VTable = struct {
-        /// The `Authorization` value to send, on `arena`; null when there
-        /// is none yet (the first request goes without, and its refusal
-        /// says where to get one).
-        credentials: *const fn (a: *Authorization, io: Io, arena: Allocator) Error!?[]const u8,
+        /// What to send with a request of `method` to `url`, on `arena`;
+        /// null when there is nothing yet (the first request goes without,
+        /// and its refusal says where to get it).
+        credentials: *const fn (a: *Authorization, io: Io, arena: Allocator, method: []const u8, url: []const u8) Error!?Credentials,
+        /// The server at `url` gave this `DPoP-Nonce` (RFC 9449 §9), for its
+        /// next proof.
+        nonce: *const fn (a: *Authorization, io: Io, url: []const u8, value: []const u8) void,
         /// The server answered `status` (401 or 403) with these
         /// `WWW-Authenticate` values to a request sent with `sent`: true
         /// when there are better credentials now, and the request is sent
@@ -72,8 +84,12 @@ pub const Authorization = struct {
         refused: *const fn (a: *Authorization, io: Io, sent: ?[]const u8, status: u16, challenges: []const []const u8) Error!bool,
     };
 
-    pub fn credentials(a: *Authorization, io: Io, arena: Allocator) Error!?[]const u8 {
-        return a.vtable.credentials(a, io, arena);
+    pub fn credentials(a: *Authorization, io: Io, arena: Allocator, method: []const u8, url: []const u8) Error!?Credentials {
+        return a.vtable.credentials(a, io, arena, method, url);
+    }
+
+    pub fn nonce(a: *Authorization, io: Io, url: []const u8, value: []const u8) void {
+        a.vtable.nonce(a, io, url, value);
     }
 
     pub fn refused(a: *Authorization, io: Io, sent: ?[]const u8, status: u16, challenges: []const []const u8) Error!bool {
@@ -88,27 +104,47 @@ pub fn init(gpa: Allocator, http: *uplink.Client, url: []const u8, options: Opti
 
 /// Sends `request` with the credentials there are, and once more with
 /// better ones when the server refuses them and the authorization gets
-/// some. A refusal that stands is the answer, for the caller to read.
+/// some. A refusal that asks a DPoP proof to carry a nonce it gives is
+/// answered once besides, whichever send it came to (RFC 9449 §9). A refusal
+/// that stands is the answer, for the caller to read.
 fn send(t: *Transport, io: Io, arena: Allocator, req: uplink.Request) (uplink.Client.SendError || Authorization.Error)!uplink.Response {
     const auth = t.options.authorization orelse return t.http.send(io, req);
     var asked = req;
     var tried = false;
+    var nonce_tried = false;
     while (true) {
-        const sent = try auth.credentials(io, arena);
-        if (sent) |value| {
-            const fields = try arena.alloc(std.http.Header, req.headers.len + 1);
+        const sent = try auth.credentials(io, arena, req.method.name, req.url);
+        if (sent) |carried| {
+            const fields = try arena.alloc(std.http.Header, req.headers.len + 2);
             @memcpy(fields[0..req.headers.len], req.headers);
-            fields[req.headers.len] = .{ .name = "Authorization", .value = value };
-            asked.headers = fields;
+            fields[req.headers.len] = .{ .name = "Authorization", .value = carried.authorization };
+            var n = req.headers.len + 1;
+            if (carried.dpop) |proof| {
+                fields[n] = .{ .name = "DPoP", .value = proof };
+                n += 1;
+            }
+            asked.headers = fields[0..n];
         }
         var response = try t.http.send(io, asked);
         const code = @backingInt(response.status);
-        if (tried or (code != 401 and code != 403)) return response;
-        tried = true;
+        const nonce = response.headers.get("DPoP-Nonce");
+        if (nonce) |value| auth.nonce(io, req.url, value);
+        if (code != 401 and code != 403) return response;
         var challenges: std.ArrayList([]const u8) = .empty;
         var it = response.headers.iterator();
-        while (it.next()) |f| if (std.ascii.eqlIgnoreCase(f.name, "WWW-Authenticate")) try challenges.append(arena, try arena.dupe(u8, f.value));
-        const again = auth.refused(io, sent, code, challenges.items) catch |err| {
+        var asks_nonce = false;
+        while (it.next()) |f| if (std.ascii.eqlIgnoreCase(f.name, "WWW-Authenticate")) {
+            try challenges.append(arena, try arena.dupe(u8, f.value));
+            if (std.mem.find(u8, f.value, "use_dpop_nonce") != null) asks_nonce = true;
+        };
+        if (asks_nonce and nonce != null and !nonce_tried) {
+            nonce_tried = true;
+            response.deinit(io);
+            continue;
+        }
+        if (tried) return response;
+        tried = true;
+        const again = auth.refused(io, if (sent) |carried| carried.authorization else null, code, challenges.items) catch |err| {
             response.deinit(io);
             return err;
         };
