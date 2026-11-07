@@ -206,6 +206,8 @@ test "the limits of a small message bound nothing its bytes admit" {
     const l = wire.limitsFor(.fromRaw(64));
     try testing.expectEqual(@as(usize, 64), l.input_bytes.raw());
     try testing.expectEqual(@as(usize, 32), l.items);
+    // strand's default work per byte of input, 128 Mi over 16 MiB.
+    try testing.expectEqual(@as(usize, 64 * 8), l.work);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const dense = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"m\",\"params\":[1,2,3,4,5,6,7]}";

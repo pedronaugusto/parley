@@ -135,8 +135,8 @@ pub fn limitsFor(message: aegis.units.Bytes(u32)) strand.core.Limits {
         .container_items = @max(1, m / 2),
         // strand's default allocation per input byte, scaled to the message; past the range, the most there is.
         .allocation_bytes = if (base.allocation_bytes.ratio(base.input_bytes)) |per| bytes.mul(per) catch .fromRaw(std.math.maxInt(usize)) else |_| .fromRaw(std.math.maxInt(usize)),
-        // As above for the work, a count strand holds beside its sizes: its proportion to the input.
-        .work = if (@TypeOf(bytes).fromRaw(base.work).ratio(base.input_bytes)) |per| std.math.mul(usize, m, per) catch std.math.maxInt(usize) else |_| std.math.maxInt(usize),
+        // As above for the work, a count and no size: so many steps per byte of input.
+        .work = std.math.mul(usize, m, base.work / base.input_bytes.raw()) catch std.math.maxInt(usize),
         .depth = base.depth,
         .key_bytes = base.key_bytes,
         .numeric_bytes = base.numeric_bytes,
