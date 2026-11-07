@@ -36,8 +36,10 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "parley", .module = parley },
             },
         });
-        // glint-ignore: Z026 -- a lazy dependency not fetched yet adds no import: the build fetches it and runs again
-        if (b.dependencyLazy("conduit", .{ .target = target, .optimize = optimize })) |conduit| process.addImport("conduit", conduit.module("conduit")) else |_| {}
+        // A lazy dependency not fetched yet adds no import: the build fetches it and runs again.
+        if (b.dependencyLazy("conduit", .{ .target = target, .optimize = optimize })) |conduit| process.addImport("conduit", conduit.module("conduit")) else |err| switch (err) {
+            error.LazyDependencyNeeded => {},
+        }
     }
     if (!with_http) return;
     // Declared before uplink is fetched: a consumer's first pass must find
@@ -63,17 +65,21 @@ pub fn build(b: *std.Build) void {
             .{ .name = "parley.http", .module = http },
         },
     }) else null;
-    // glint-ignore: Z026 -- a lazy dependency not fetched yet adds no import: the build fetches it and runs again
+    // A lazy dependency not fetched yet adds no import: the build fetches it and runs again.
     if (b.dependencyLazy("uplink", .{ .target = target, .optimize = optimize })) |uplink| {
         http.addImport("uplink", uplink.module("uplink"));
         if (oauth) |o| o.addImport("uplink", uplink.module("uplink"));
-    } else |_| {}
+    } else |err| switch (err) {
+        error.LazyDependencyNeeded => {},
+    }
     const oauth_module = oauth orelse return;
-    // glint-ignore: Z026 -- a lazy dependency not fetched yet adds no import: the build fetches it and runs again
+    // A lazy dependency not fetched yet adds no import: the build fetches it and runs again.
     if (b.dependencyLazy("clearance", .{ .target = target, .optimize = optimize, .oauth = true })) |clearance| {
         oauth_module.addImport("clearance", clearance.module("clearance"));
         oauth_module.addImport("clearance.oauth", clearance.module("clearance.oauth"));
-    } else |_| {}
+    } else |err| switch (err) {
+        error.LazyDependencyNeeded => {},
+    }
 }
 
 /// parley's development: its tests, its properties, the example and the
