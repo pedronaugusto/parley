@@ -105,24 +105,36 @@ const Session = struct {
     /// The connection's messages, an event each.
     out: parley.stdio.Out = .{ .beginFn = begin, .endFn = end, .keepAliveFn = keepAlive },
 
-    fn begin(o: *parley.stdio.Out) parley.stdio.Out.Error!*Io.Writer {
+    fn begin(o: *parley.stdio.Out) parley.stdio.Out.Error!parley.stdio.WriteEnd {
         const s: *Session = @alignCast(@fieldParentPtr("out", o));
-        const w = s.response.writer(s.io) catch return error.WriteFailed;
-        s.event = sse.EventWriter.begin(w, &s.buffer, .{ .type = "message" }) catch return error.WriteFailed;
-        return &s.event.interface;
+        const w = s.response.writer(s.io) catch |err| return failed(err);
+        s.event = sse.EventWriter.begin(w, &s.buffer, .{ .type = "message" }) catch return s.response.failure();
+        return .{ .interface = &s.event.interface, .causeFn = cause };
+    }
+
+    /// Why a write to the event failed: the response's.
+    fn cause(w: *const Io.Writer) parley.stdio.WriteEnd.Cause {
+        const event: *const sse.EventWriter = @alignCast(@fieldParentPtr("interface", w));
+        const s: *const Session = @alignCast(@fieldParentPtr("event", event));
+        return s.response.failure();
     }
 
     fn end(o: *parley.stdio.Out) parley.stdio.Out.Error!void {
         const s: *Session = @alignCast(@fieldParentPtr("out", o));
-        s.event.end() catch return error.WriteFailed;
-        s.response.flush(s.io) catch return error.WriteFailed;
+        s.event.end() catch return s.response.failure();
+        s.response.flush(s.io) catch |err| return failed(err);
     }
 
     fn keepAlive(o: *parley.stdio.Out) parley.stdio.Out.Error!void {
         const s: *Session = @alignCast(@fieldParentPtr("out", o));
-        const w = s.response.writer(s.io) catch return error.WriteFailed;
-        w.writeAll(":\n\n") catch return error.WriteFailed;
-        s.response.flush(s.io) catch return error.WriteFailed;
+        const w = s.response.writer(s.io) catch |err| return failed(err);
+        w.writeAll(":\n\n") catch return s.response.failure();
+        s.response.flush(s.io) catch |err| return failed(err);
+    }
+
+    /// A response's refusal: its cancel, or a stream that cannot be written.
+    fn failed(err: Response.Error) parley.stdio.Out.Error {
+        return if (err == error.Canceled) error.Canceled else error.WriteFailed;
     }
 };
 

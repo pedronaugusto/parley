@@ -57,7 +57,18 @@ const Harness = struct {
     client: uplink.Client,
     port: u16,
 
+    /// How the server is run: the `Io` its connections are served on, and
+    /// how often a quiet HTTP+SSE stream is kept open.
+    const Serving = struct {
+        io: ?Io = null,
+        sse_keep_alive: parley.Server.Duration = .literal("100ms"),
+    };
+
     fn start(h: *Harness, io: Io) !void {
+        return h.startWith(io, .{});
+    }
+
+    fn startWith(h: *Harness, io: Io, serving: Serving) !void {
         h.core = try .init(testing.allocator, io, .{ .info = .{ .name = "http", .version = "0" } });
         try h.core.addTool(io, .{ .name = "echo" }, echo);
         try h.core.addTool(io, .{ .name = "counted" }, counted);
@@ -66,12 +77,12 @@ const Harness = struct {
         h.endpoint = .init(testing.allocator, &h.core, .{ .keep_alive = .literal("100ms") });
         h.router = .init(testing.allocator);
         try h.router.add("/mcp", h.endpoint.handler());
-        h.sse = .init(testing.allocator, &h.core, .{ .keep_alive = .literal("100ms") });
+        h.sse = .init(testing.allocator, &h.core, .{ .keep_alive = serving.sse_keep_alive });
         try h.router.add("/sse", h.sse.handler());
         h.http = .init(testing.allocator, .{}, h.router.handler());
         h.listener = try (try Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{ .reuse_address = true });
         h.port = h.listener.socket.address.getPort();
-        h.serving = try io.concurrent(uplink.Server.serve, .{ &h.http, io, &h.listener });
+        h.serving = try io.concurrent(uplink.Server.serve, .{ &h.http, serving.io orelse io, &h.listener });
         h.client = .init(testing.allocator, .{});
     }
 
@@ -695,4 +706,26 @@ test "HTTP+SSE: a POST naming no session, or one whose stream has ended, is refu
         if (try c.post(io, initialize_2024) == .not_found) break;
         try io.sleep(.fromMilliseconds(20), .awake);
     } else return error.TestExpectedNotFound;
+}
+
+test "HTTP+SSE: a POST whose answer's write to the stream is canceled returns Canceled, unanswered" {
+    const io = testing.io;
+    // The server's connections on an `Io` that cancels the write it is
+    // told to; the stream is kept open by nothing else meanwhile.
+    const fio = try shakedown.FaultIo.init(testing.allocator, io, .{});
+    defer fio.deinit();
+    var h: Harness = undefined;
+    try h.startWith(io, .{ .io = fio.io(), .sse_keep_alive = .literal("60s") });
+    defer h.stop(io);
+    var c: SseClient = undefined;
+    try c.open(&h, io);
+    defer c.close(io);
+    // The next write: `initialize`'s answer, which is answered on the
+    // POST's task, flushed to the stream.
+    try fio.setPlan(&.{.{ .at = .{ .nth = .{ .call = .net_write, .n = 1 } }, .fault = .cancel }});
+    // Where uplink's cancel was taken for a stream gone, the POST was
+    // answered 202 as if its answer went out.
+    const answered = c.post(io, initialize_2024) catch null;
+    try testing.expectEqual(@as(?std.http.Status, null), answered);
+    try testing.expectEqual(@as(usize, 1), fio.fired().len);
 }

@@ -44,7 +44,7 @@ pub const ServeError = error{ ReadFailed, WriteFailed, Canceled, OutOfMemory, Co
 /// it: the server's cue to exit) or the task is canceled. Requests still
 /// running then are canceled.
 pub fn serve(io: Io, gpa: Allocator, server: *Server, in: *Io.Reader, out: *Io.Writer, options: Options) ServeError!void {
-    var lines: Out.Lines = .{ .writer = out };
+    var lines: Out.Lines = .{ .end = .uncaused(out) };
     var conn: Connection = .init(io, gpa, server, &lines.out, options);
     defer conn.deinit();
     while (true) {
@@ -169,31 +169,32 @@ fn canceled(err: anytype) bool {
 /// each on stdio (`Lines`), an event each on HTTP+SSE. A writer embeds one
 /// and finds itself from it by `@fieldParentPtr`.
 pub const Out = struct {
-    /// A writer for the next message.
-    beginFn: *const fn (o: *Out) Error!*Io.Writer,
-    /// The message written to `beginFn`'s writer is whole: framed, and
+    /// Where the next message is written, and why a write there failed.
+    beginFn: *const fn (o: *Out) Error!WriteEnd,
+    /// The message written to `beginFn`'s end is whole: framed, and
     /// flushed.
     endFn: *const fn (o: *Out) Error!void,
     /// Keeps a quiet stream open (a comment, on HTTP+SSE); null where
     /// nothing needs it.
     keepAliveFn: ?*const fn (o: *Out) Error!void = null,
 
-    pub const Error = error{WriteFailed};
+    /// `Canceled`: the writing task was. `WriteFailed`: the stream broke.
+    pub const Error = WriteEnd.Cause;
 
-    /// Each message a line on `writer`, flushed.
+    /// Each message a line on `end`, flushed.
     pub const Lines = struct {
-        writer: *Io.Writer,
+        end: WriteEnd,
         out: Out = .{ .beginFn = lineBegin, .endFn = lineEnd },
 
-        fn lineBegin(o: *Out) Error!*Io.Writer {
+        fn lineBegin(o: *Out) Error!WriteEnd {
             const l: *Lines = @alignCast(@fieldParentPtr("out", o));
-            return l.writer;
+            return l.end;
         }
 
         fn lineEnd(o: *Out) Error!void {
             const l: *Lines = @alignCast(@fieldParentPtr("out", o));
-            try l.writer.writeByte('\n');
-            try l.writer.flush();
+            l.end.interface.writeByte('\n') catch return l.end.cause();
+            l.end.interface.flush() catch return l.end.cause();
         }
     };
 };
@@ -543,8 +544,8 @@ pub const Connection = struct {
         var held = try c.out.acquire(c.io);
         defer held.deinit(c.io);
         const out = held.value().*;
-        const w = try out.beginFn(out);
-        try w.writeAll(message);
+        const end = try out.beginFn(out);
+        end.interface.writeAll(message) catch return end.cause();
         try out.endFn(out);
     }
 
@@ -553,8 +554,8 @@ pub const Connection = struct {
         var held = try c.out.acquire(c.io);
         defer held.deinit(c.io);
         const out = held.value().*;
-        const w = try out.beginFn(out);
-        try answer.write(w, id);
+        const end = try out.beginFn(out);
+        answer.write(end.interface, id) catch return end.cause();
         try out.endFn(out);
     }
 

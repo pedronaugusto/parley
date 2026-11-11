@@ -274,14 +274,14 @@ const Holding = struct {
     holding: std.atomic.Value(bool) = .init(false),
     let_go: std.Io.Event = .unset,
 
-    fn begin(o: *stdio.Out) stdio.Out.Error!*std.Io.Writer {
+    fn begin(o: *stdio.Out) stdio.Out.Error!stdio.WriteEnd {
         const h: *Holding = @alignCast(@fieldParentPtr("out", o));
-        return &h.written.writer;
+        return .uncaused(&h.written.writer);
     }
 
     fn end(o: *stdio.Out) stdio.Out.Error!void {
         const h: *Holding = @alignCast(@fieldParentPtr("out", o));
-        try h.written.writer.writeByte('\n');
+        h.written.writer.writeByte('\n') catch return error.WriteFailed;
     }
 
     fn hold(o: *stdio.Out) stdio.Out.Error!void {
