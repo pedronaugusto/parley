@@ -68,6 +68,103 @@ pub fn serve(io: Io, gpa: Allocator, server: *Server, in: *Io.Reader, out: *Io.W
     }
 }
 
+/// A stream parley reads that it was handed, and why a read from it failed:
+/// a reader says `ReadFailed` alone, and keeps the cause in its own state.
+pub const ReadEnd = struct {
+    interface: *Io.Reader,
+    /// Why the last read from `interface` failed.
+    causeFn: *const fn (r: *const Io.Reader) Cause,
+
+    /// `Canceled`: the reading task was. `ReadFailed`: anything else.
+    pub const Cause = error{ ReadFailed, Canceled };
+
+    /// A file's reader (stdin, a pipe): its `err`.
+    pub fn file(r: *Io.File.Reader) ReadEnd {
+        return .{ .interface = &r.interface, .causeFn = struct {
+            fn cause(i: *const Io.Reader) Cause {
+                const f: *const Io.File.Reader = @alignCast(@fieldParentPtr("interface", i));
+                return if (canceled(f.err)) error.Canceled else error.ReadFailed;
+            }
+        }.cause };
+    }
+
+    /// A network stream's reader: its `err`.
+    pub fn stream(r: *Io.net.Stream.Reader) ReadEnd {
+        return .{ .interface = &r.interface, .causeFn = struct {
+            fn cause(i: *const Io.Reader) Cause {
+                const s: *const Io.net.Stream.Reader = @alignCast(@fieldParentPtr("interface", i));
+                return if (canceled(s.err)) error.Canceled else error.ReadFailed;
+            }
+        }.cause };
+    }
+
+    /// A reader that records no cause (a fixed buffer, a test's double):
+    /// every failure is `ReadFailed`.
+    pub fn uncaused(r: *Io.Reader) ReadEnd {
+        return .{ .interface = r, .causeFn = struct {
+            fn cause(_: *const Io.Reader) Cause {
+                return error.ReadFailed;
+            }
+        }.cause };
+    }
+
+    pub fn cause(e: ReadEnd) Cause {
+        return e.causeFn(e.interface);
+    }
+};
+
+/// A stream parley writes that it was handed, and why a write to it
+/// failed: a writer says `WriteFailed` alone, and keeps the cause in its own
+/// state.
+pub const WriteEnd = struct {
+    interface: *Io.Writer,
+    /// Why the last write to `interface` failed.
+    causeFn: *const fn (w: *const Io.Writer) Cause,
+
+    /// `Canceled`: the writing task was. `WriteFailed`: anything else.
+    pub const Cause = error{ WriteFailed, Canceled };
+
+    /// A file's writer (stdout, a pipe): its `err`.
+    pub fn file(w: *Io.File.Writer) WriteEnd {
+        return .{ .interface = &w.interface, .causeFn = struct {
+            fn cause(i: *const Io.Writer) Cause {
+                const f: *const Io.File.Writer = @alignCast(@fieldParentPtr("interface", i));
+                return if (canceled(f.err)) error.Canceled else error.WriteFailed;
+            }
+        }.cause };
+    }
+
+    /// A network stream's writer: its `err`.
+    pub fn stream(w: *Io.net.Stream.Writer) WriteEnd {
+        return .{ .interface = &w.interface, .causeFn = struct {
+            fn cause(i: *const Io.Writer) Cause {
+                const s: *const Io.net.Stream.Writer = @alignCast(@fieldParentPtr("interface", i));
+                return if (canceled(s.err)) error.Canceled else error.WriteFailed;
+            }
+        }.cause };
+    }
+
+    /// A writer that records no cause (a fixed buffer, an allocating
+    /// writer, a test's double): every failure is `WriteFailed`.
+    pub fn uncaused(w: *Io.Writer) WriteEnd {
+        return .{ .interface = w, .causeFn = struct {
+            fn cause(_: *const Io.Writer) Cause {
+                return error.WriteFailed;
+            }
+        }.cause };
+    }
+
+    pub fn cause(e: WriteEnd) Cause {
+        return e.causeFn(e.interface);
+    }
+};
+
+/// Whether a std reader's or writer's recorded failure is a cancel.
+fn canceled(err: anytype) bool {
+    const e = err orelse return false;
+    return e == error.Canceled;
+}
+
 /// Where a connection's messages go, one whole message at a time: a line
 /// each on stdio (`Lines`), an event each on HTTP+SSE. A writer embeds one
 /// and finds itself from it by `@fieldParentPtr`.
