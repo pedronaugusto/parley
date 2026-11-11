@@ -45,7 +45,12 @@ pub const Sink = struct {
     /// The end of one request's stream, which its transport holds.
     pub const End = subscriptions.End;
 
-    /// `Closed`: the stream the request came on is gone.
+    /// `Closed`: the stream the request came on is gone, or nothing more is
+    /// written for the request (its client canceled it): there is nothing
+    /// to answer, and a handler that meets it returns it (`Call.Error`,
+    /// `Server.HandleError`). `Canceled`: the task sending was canceled; a
+    /// target says it only for that, so a handler's `Canceled` always means
+    /// its task was.
     pub const SendError = error{ Canceled, Closed, OutOfMemory };
 
     pub fn send(s: Sink, io: std.Io, message: []const u8) SendError!void {

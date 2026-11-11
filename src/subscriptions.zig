@@ -13,7 +13,8 @@
 //! closing (`Hub.close`, answered `complete`), or the stream's owner ending it
 //! (`Listener.end`, `End.end`: the client canceled the request, its input
 //! ended, its session was deleted), each seen by the stream's next wait, after
-//! which its task returns on its own.
+//! which its task returns on its own: with nothing to answer
+//! (`error.Closed`), never with `error.Canceled`.
 const std = @import("std");
 const aegis = @import("aegis");
 const wire = @import("wire.zig");

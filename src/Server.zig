@@ -522,8 +522,11 @@ pub const Failure = struct {
     malformed: bool = false,
 };
 
-/// `Canceled`: the request was canceled, and nothing is answered.
-pub const HandleError = error{ Canceled, OutOfMemory };
+/// `Canceled`: the task answering the request was canceled, and nothing is
+/// answered. `Closed`: there is nothing to answer: the stream the request
+/// came on is gone (`Sink.SendError.Closed`), or a stream it opened was
+/// ended by its client.
+pub const HandleError = error{ Canceled, Closed, OutOfMemory };
 
 /// Building an answer: `TooLong` when it is past the message limit, which
 /// `handle` answers as an internal error rather than write it.
@@ -584,7 +587,7 @@ fn failure(code: wire.Code, message: []const u8) Reply {
 pub fn handle(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink) HandleError!Reply {
     return s.route(io, arena, request, context, sink) catch |err| switch (err) {
         error.TooLong => failure(.internal_error, too_long),
-        error.Canceled, error.OutOfMemory => |e| e,
+        error.Canceled, error.Closed, error.OutOfMemory => |e| e,
     };
 }
 
@@ -793,7 +796,7 @@ fn admitted(s: *const Server, context: *const Context, which: List, name: []cons
     return f.admit(context, which, name);
 }
 
-fn parseParams(s: *const Server, comptime T: type, arena: Allocator, params: ?[]const u8) HandleError!?T {
+fn parseParams(s: *const Server, comptime T: type, arena: Allocator, params: ?[]const u8) Allocator.Error!?T {
     return strand.json.parseLeaky(T, arena, params orelse "{}", types.readOptions(s.jsonLimits())) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => null,
@@ -885,6 +888,7 @@ fn newCall(s: *const Server, io: Io, arena: Allocator, request: wire.Request, co
 fn outcome(s: *Server, io: Io, arena: Allocator, call: *Call, err: Call.Error, method: []const u8, subject: []const u8) BuildError!Reply {
     return switch (err) {
         error.Canceled => error.Canceled,
+        error.Closed => error.Closed,
         error.OutOfMemory => error.OutOfMemory,
         error.InputRequired => s.inputRequired(io, arena, call, method, subject),
         error.MissingCapability => missing(arena, call.missing.?),
@@ -1041,10 +1045,7 @@ const Run = struct {
             error.OutOfMemory => return error.OutOfMemory,
             error.Malformed => unreachable, // unreachable: `serve` read these params before the task was made
         };
-        const p = (s.parseParams(types.CallToolParams, a, task.params) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Canceled => unreachable, // unreachable: parsing does not wait
-        }) orelse unreachable; // unreachable: `callTool` parsed these params before the task was made
+        const p = (try s.parseParams(types.CallToolParams, a, task.params)) orelse unreachable; // unreachable: `callTool` parsed these params before the task was made
         run.arguments = if (p.arguments) |args| args.bytes else null;
         run.context = .{
             .revision = .@"2026-07-28",
@@ -1275,6 +1276,12 @@ fn recordOutcome(s: *Server, table: *tasks.Table, h: *tasks.Table.Held, run: *Ru
             try table.cancelled(h, task, at, "The task was cancelled");
             return false;
         },
+        // A task's round sends nothing on a stream (its sink is none): a
+        // handler that says its stream is gone ends the task failed.
+        error.Closed => {
+            try table.fail(h, task, at, "{\"code\":-32603,\"message\":\"the handler's stream is gone\"}", "the handler's stream is gone");
+            return false;
+        },
         error.InputRequired => {
             const call = &run.call;
             if (task.cancel.isSet()) {
@@ -1318,6 +1325,7 @@ fn recordOutcome(s: *Server, table: *tasks.Table, h: *tasks.Table.Held, run: *Ru
                 error.OutOfMemory => return error.OutOfMemory,
                 error.TooLong => failure(.internal_error, too_long),
                 error.Canceled => unreachable, // unreachable: only `error.InputRequired` waits, handled above
+                error.Closed => unreachable, // unreachable: `error.Closed` is handled above
             };
             const f = reply.failure;
             var out: Writer.Allocating = .init(a);
@@ -1433,10 +1441,7 @@ fn taskJson(s: *Server, io: Io, arena: Allocator, id: []const u8, principal: ?[]
 fn toolOf(s: *Server, io: Io, task: *const tasks.Task) (Allocator.Error || Io.Cancelable)!?*registry.ToolHandler {
     var scratch: std.heap.ArenaAllocator = .init(s.gpa);
     defer scratch.deinit();
-    const p = (s.parseParams(types.CallToolParams, scratch.allocator(), task.params) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.Canceled => return error.Canceled,
-    }) orelse return null;
+    const p = (try s.parseParams(types.CallToolParams, scratch.allocator(), task.params)) orelse return null;
     var held = try s.lists.acquire(io);
     defer held.deinit(io);
     for (held.value().tools.items) |t| if (std.mem.eql(u8, t.name, p.name)) return t.handling.handler();
@@ -1638,7 +1643,7 @@ fn listen(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: 
     };
     defer s.hub.remove(io, &listener);
     // Ended before it started: the client canceled it, or its input ended.
-    if (sink.end) |end| if (!end.attach(io, &listener)) return error.Canceled;
+    if (sink.end) |end| if (!end.attach(io, &listener)) return error.Closed;
     defer if (sink.end) |end| end.detach(io);
 
     const tag = try subscriptionMeta(arena, request.id);
@@ -1649,11 +1654,11 @@ fn listen(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: 
         seen = (listener.wait(io, seen, timeout) catch return error.Canceled) orelse {
             // Quiet for a while: a comment keeps the stream open, and a
             // stream the client left fails to take it.
-            sink.keepAlive(io) catch return error.Canceled;
+            try sink.keepAlive(io);
             continue;
         };
         // Ended by its client: nothing more is written, and nothing answered.
-        if (listener.ended(io)) return error.Canceled;
+        if (listener.ended(io)) return error.Closed;
         var turn: std.heap.ArenaAllocator = .init(s.gpa);
         defer turn.deinit();
         const changed = listener.takeLists(io);
@@ -1692,7 +1697,8 @@ fn subscriptionMeta(arena: Allocator, id: wire.Id) Allocator.Error![]const u8 {
 }
 
 /// Sends a notification whose params are `params` plus `_meta` holding
-/// `tag` (members, without braces) when it is not empty.
+/// `tag` (members, without braces) when it is not empty. `Closed`: the
+/// stream is gone, and nothing is answered.
 pub fn notify(s: *const Server, io: Io, arena: Allocator, sink: Sink, method: []const u8, params: anytype, tag: []const u8) HandleError!void {
     var out: Writer.Allocating = .init(arena);
     const w = &out.writer;
@@ -1709,8 +1715,5 @@ pub fn notify(s: *const Server, io: Io, arena: Allocator, sink: Sink, method: []
         w.print("\"_meta\":{{{s}}}}}", .{tag}) catch return error.OutOfMemory;
     }
     w.writeByte('}') catch return error.OutOfMemory;
-    sink.send(io, out.written()) catch |err| return switch (err) {
-        error.Canceled, error.Closed => error.Canceled,
-        error.OutOfMemory => error.OutOfMemory,
-    };
+    try sink.send(io, out.written());
 }

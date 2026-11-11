@@ -383,3 +383,42 @@ test "a channel's write canceled returns Canceled, not Closed" {
     try testing.expectError(error.Canceled, channel.transport().notify(testing.io, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}"));
     try testing.expectEqual(@as(usize, 1), fio.fired().len);
 }
+
+/// Reports progress before it answers: a stream that cannot take the
+/// report is gone, and the handler returns what the report said.
+fn reporting(call: *Call) Call.Error!parley.ToolResult {
+    try call.progress(1, null, null);
+    return .ofText("reported");
+}
+
+/// Says it ran.
+const Ran = struct {
+    var ran: std.atomic.Value(bool) = .init(false);
+
+    fn handle(_: *Call) Call.Error!parley.ToolResult {
+        ran.store(true, .release);
+        return .ofText("ran");
+    }
+};
+
+test "a handler with nothing to answer, its stream gone, does not end serve" {
+    var server = try newServer(testing.io);
+    defer server.deinit();
+    try server.addTool(testing.io, .{ .name = "reporting" }, reporting);
+    try server.addTool(testing.io, .{ .name = "ran" }, Ran.handle);
+    Ran.ran.store(false, .release);
+    // No task to spare: each request is answered on serve's task.
+    var serial: Serial = .init(testing.io, 0);
+    const with_token =
+        \\"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"progressToken":1}
+    ;
+    var in: std.Io.Reader = .fixed(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"reporting\"," ++ with_token ++ "}}\n" ++
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"ran\"," ++ meta ++ "}}\n",
+    );
+    var out: std.Io.Writer = .failing;
+    // Where the handler said its stream was gone with `Canceled`, serve
+    // took it for its own task's cancel and returned at the first request.
+    try stdio.serve(serial.io(), testing.allocator, &server, .uncaused(&in), .uncaused(&out), .{});
+    try testing.expect(Ran.ran.load(.acquire));
+}

@@ -195,8 +195,8 @@ fn handle(e: *Endpoint, io: Io, request: *Request, response: *Response) anyerror
     const principal = admitted.principal;
     var stream: Stream = .init(io, response);
     const reply = serveWatched(e, io, arena, request, req, principal, stream.sink(e)) catch |err| switch (err) {
-        // The client left: nothing to answer.
-        error.Left => return,
+        // The client left, or its stream is gone: nothing to answer.
+        error.Left, error.Closed => return,
         // The handler's task was canceled (the server is going away):
         // nothing is answered, and the connection ends.
         error.Canceled, error.OutOfMemory => |x| return x,
@@ -369,8 +369,12 @@ fn serveSession(e: *Endpoint, io: Io, arena: Allocator, request: *Request, respo
                     return refuse(io, response, .bad_request, req.id, .invalid_request, "MCP-Protocol-Version is not the session's version");
             }
             var stream: Stream = .init(io, response);
-            // Canceled: nothing is answered, and the connection ends.
-            const reply = try session.handle(io, arena, req, stream.sink(e));
+            const reply = session.handle(io, arena, req, stream.sink(e)) catch |err| switch (err) {
+                // The stream is gone: nothing to answer.
+                error.Closed => return,
+                // Canceled: nothing is answered, and the connection ends.
+                error.Canceled, error.OutOfMemory => |x| return x,
+            };
             return e.answer(io, arena, response, &stream, req.id, reply);
         },
         .notification => |n| if (std.mem.eql(u8, n.method, "notifications/initialized")) {
@@ -425,7 +429,7 @@ fn serveBatch(e: *Endpoint, io: Io, arena: Allocator, request: *Request, respons
                         a.run(io, session, stream.sink(e));
                         if (a.outcome.?.answered) |_| {} else |err| switch (err) {
                             error.Canceled => return error.Canceled,
-                            error.OutOfMemory => {},
+                            error.Closed, error.OutOfMemory => {},
                         }
                     };
                 },
@@ -452,8 +456,9 @@ fn serveBatch(e: *Endpoint, io: Io, arena: Allocator, request: *Request, respons
             .refused => |f| try wire.writeFailure(&one.writer, f.id, f.code, f.reason, null),
             .answered => |result| {
                 const reply = result catch |err| switch (err) {
-                    // Canceled: nothing is answered for it.
-                    error.Canceled => continue,
+                    // Nothing is answered for it: its task was canceled, or
+                    // the stream is gone.
+                    error.Canceled, error.Closed => continue,
                     error.OutOfMemory => return err,
                 };
                 try e.writeReply(a.arena.allocator(), &one.writer, a.request.id, reply);
@@ -527,7 +532,11 @@ fn openStream(e: *Endpoint, io: Io, response: *Response, session_id: ?[]const u8
     // The stream ends when its client leaves or the server closes; a cancel or a lack of memory is the caller's.
     const streamed = entry.session.stream(io, stream.sink(e));
     const ended = guard.endStream(io, response);
-    try streamed;
+    streamed catch |err| switch (err) {
+        // The stream is gone, or could not be held: it has ended.
+        error.Closed => {},
+        error.Canceled, error.OutOfMemory => |x| return x,
+    };
     return ended;
 }
 
@@ -718,7 +727,8 @@ const Stream = struct {
         var held = try s.out.acquire(s.io);
         defer held.deinit(s.io);
         const o = held.value();
-        try uplink.wire.sse.writeEvent(try o.begin(s.io), .{ .type = "message", .data = message });
+        // The body writer says `WriteFailed` alone: the response knows why.
+        uplink.wire.sse.writeEvent(try o.begin(s.io), .{ .type = "message", .data = message }) catch return o.response.failure();
         try o.response.flush(s.io);
     }
 
@@ -759,7 +769,10 @@ const Stream = struct {
             error.Canceled => error.Canceled,
             else => error.Closed,
         };
-        w.writeAll(":\n\n") catch return error.Closed;
+        w.writeAll(":\n\n") catch return switch (o.response.failure()) {
+            error.Canceled => error.Canceled,
+            error.WriteFailed => error.Closed,
+        };
         o.response.flush(s.io) catch |err| return switch (err) {
             error.Canceled => error.Canceled,
             else => error.Closed,

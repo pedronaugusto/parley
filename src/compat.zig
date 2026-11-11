@@ -157,6 +157,7 @@ pub const Session = struct {
             if (rounds > s.options.max_rounds) return failure(.internal_error, "the handler asked for input more rounds than the server allows");
             const responses = s.ask(io, arena, ir.requests, sink) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
+                error.Closed => return error.Closed,
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Refused => return failure(.internal_error, "the client did not give the input the request needs"),
             };
@@ -197,12 +198,14 @@ pub const Session = struct {
     }
 
     /// Writes the session's list changes and resource updates to `sink`
-    /// until the session ends (`end`) or the server closes.
+    /// until the session ends (`end`) or the server closes. `Closed`: the
+    /// stream is gone, or the server holds as many streams as it takes and
+    /// this one ends at once.
     pub fn stream(s: *Session, io: Io, sink: Sink) Server.HandleError!void {
         s.server.hub.add(io, s.gpa, &s.listener, s.server.options.limits.listeners) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Canceled => return error.Canceled,
-            error.TooMany => return error.Canceled,
+            error.TooMany => return error.Closed,
         };
         defer s.server.hub.remove(io, &s.listener);
         var seen: u32 = 0;
@@ -297,7 +300,8 @@ pub const Session = struct {
         return .{ .result = .{ .json = "{}" } };
     }
 
-    const AskError = error{ Canceled, OutOfMemory, Refused };
+    /// `Closed`: the stream the requests go on is gone.
+    const AskError = error{ Canceled, Closed, OutOfMemory, Refused };
 
     /// Sends each input request to the client and waits for every answer:
     /// the `inputResponses` object, keyed as the handler asked.
@@ -318,10 +322,7 @@ pub const Session = struct {
             w.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"{s}\",\"params\":", .{ o.id, r.request.method() }) catch return error.OutOfMemory;
             writeParams(w, r.request, s.server.jsonLimits()) catch return error.OutOfMemory;
             w.writeByte('}') catch return error.OutOfMemory;
-            sink.send(io, out.written()) catch |err| return switch (err) {
-                error.OutOfMemory => error.OutOfMemory,
-                error.Canceled, error.Closed => error.Canceled,
-            };
+            try sink.send(io, out.written());
         }
         var out: Writer.Allocating = .init(arena);
         const w = &out.writer;

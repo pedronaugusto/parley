@@ -61,8 +61,12 @@ pub const TaskHook = struct {
 
 /// What a handler fails with, beside its own errors.
 pub const Error = error{
-    /// The request was canceled: return it, and nothing is answered.
+    /// The task answering the request was canceled: return it, and nothing
+    /// is answered.
     Canceled,
+    /// The stream the request came on is gone (a notification could not be
+    /// sent): return it, and nothing is answered.
+    Closed,
     OutOfMemory,
     /// Input was recorded (or state set) and the client must retry with it.
     InputRequired,
@@ -151,7 +155,7 @@ pub fn progress(call: *Call, done: f64, total: ?f64, message: ?[]const u8) Error
     var out: std.Io.Writer.Allocating = .init(call.arena);
     const Params = struct { progressToken: types.Token, progress: f64, total: ?f64, message: ?[]const u8 };
     writeNotification(&out.writer, call.limits, "notifications/progress", Params{ .progressToken = token, .progress = done, .total = total, .message = message }) catch return error.OutOfMemory;
-    call.sink.send(call.io, out.written()) catch |err| return sent(err);
+    try call.sink.send(call.io, out.written());
 }
 
 /// A log line about this request, sent when the client asked for lines at
@@ -162,16 +166,7 @@ pub fn log(call: *Call, level: types.LoggingLevel, logger: ?[]const u8, data: an
     var out: std.Io.Writer.Allocating = .init(call.arena);
     const Params = struct { level: types.LoggingLevel, logger: ?[]const u8, data: @TypeOf(data) };
     writeNotification(&out.writer, call.limits, "notifications/message", Params{ .level = level, .logger = logger, .data = data }) catch return error.OutOfMemory;
-    call.sink.send(call.io, out.written()) catch |err| return sent(err);
-}
-
-/// A notification that could not be sent: the stream is gone, so the request
-/// is as good as canceled.
-fn sent(err: Sink.SendError) Error {
-    return switch (err) {
-        error.Canceled, error.Closed => error.Canceled,
-        error.OutOfMemory => error.OutOfMemory,
-    };
+    try call.sink.send(call.io, out.written());
 }
 
 fn writeNotification(w: *std.Io.Writer, limits: strand.core.Limits, method: []const u8, params: anytype) !void {

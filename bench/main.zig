@@ -398,7 +398,10 @@ const Bench = struct {
 
     fn ask(b: *Bench, method: []const u8, params: []const u8) WorkloadError!void {
         const r: parley.wire.Request = .{ .id = .{ .integer = 1 }, .method = method, .params = params };
-        const reply = try b.server.serve(b.io, b.arena.allocator(), r, null, .none);
+        const reply = b.server.serve(b.io, b.arena.allocator(), r, null, .none) catch |err| switch (err) {
+            error.Closed => return error.Unanswered,
+            error.Canceled, error.OutOfMemory => |e| return e,
+        };
         switch (reply) {
             // Written, as a transport writes it.
             .result => |body| {

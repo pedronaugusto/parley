@@ -484,7 +484,8 @@ pub const Connection = struct {
     fn streamSession(c: *Connection, session: *compat.Session) Io.Cancelable!void {
         session.stream(c.io, c.sink()) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
-            error.OutOfMemory => {},
+            // The stream is gone, or never opened: it ends.
+            error.Closed, error.OutOfMemory => {},
         };
     }
 
@@ -745,12 +746,9 @@ const Job = struct {
         defer select.cancelDiscard();
         select.concurrent(.done, answer, .{job}) catch {
             // No task to spare for watching: answered here, where a cancel
-            // the handler meets is this task's, unless its client's.
-            const result = answer(job);
-            if (result) |_| {} else |err| {
-                if (err == error.Canceled and job.canceled.load(.acquire) == .running) return error.Canceled;
-            }
-            return job.finish(result);
+            // the handler meets is this task's (its client's cancel reaches
+            // it only through its sink, as `Closed`).
+            return job.finish(answer(job));
         };
         select.concurrent(.canceled, waitCancel, .{ &job.cancel, io }) catch {
             const result = try select.await();
@@ -775,16 +773,21 @@ const Job = struct {
     }
 
     /// Writes what the handler returned. `Canceled`: the task running it
-    /// was, while the answer waited to go out.
+    /// was, in the handler or while the answer waited to go out.
     fn finish(job: *Job, result: Server.HandleError!Server.Reply) Io.Cancelable!void {
-        if (job.canceled.load(.acquire) == .canceled) return;
         const c = job.conn;
-        const reply = result catch |err| switch (err) {
-            // The handler's, when it ran on a task of its own: nothing to
-            // answer (`respond` returns the cancel of its own task).
-            error.Canceled => return,
-            error.OutOfMemory => return wentOut(c.writeFailure(job.request.id, .internal_error, "out of memory")),
+        const returned: ?Server.Reply = result catch |err| switch (err) {
+            // The task the handler ran on was canceled: nothing is answered,
+            // and on `serve`'s own task `serve` returns it.
+            error.Canceled => return error.Canceled,
+            // Nothing to answer: the stream is gone, or the client canceled
+            // the request.
+            error.Closed => return,
+            error.OutOfMemory => null,
         };
+        // Canceled by its client: nothing more is written for it.
+        if (job.canceled.load(.acquire) == .canceled) return;
+        const reply = returned orelse return wentOut(c.writeFailure(job.request.id, .internal_error, "out of memory"));
         // The answer goes to the stream as it is written: a result is never
         // copied into a message first.
         const out: Answer = switch (reply) {
@@ -812,7 +815,9 @@ const Job = struct {
     fn sendFn(t: *Sink.Target, io: Io, message: []const u8) Sink.SendError!void {
         _ = io;
         const job: *Job = @alignCast(@fieldParentPtr("target", t));
-        if (job.canceled.load(.acquire) == .canceled) return error.Canceled;
+        // Canceled by its client: nothing more is written for it, which is
+        // not a cancel of the task sending.
+        if (job.canceled.load(.acquire) == .canceled) return error.Closed;
         job.conn.send(message) catch |err| return switch (err) {
             error.Canceled => error.Canceled,
             error.WriteFailed => error.Closed,
