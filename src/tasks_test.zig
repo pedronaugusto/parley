@@ -4,6 +4,7 @@
 //! that did not declare the extension gets.
 const std = @import("std");
 const strand = @import("strand");
+const shakedown = @import("shakedown");
 const parley = @import("parley.zig");
 
 const testing = std.testing;
@@ -233,4 +234,71 @@ test "a tool that may run as a task needs a server that serves tasks" {
     var s = try Server.init(testing.allocator, testing.io, .{ .info = .{ .name = "plain", .version = "1" } });
     defer s.deinit();
     try testing.expectError(error.TasksNotServed, s.addTool(testing.io, .{ .name = "slow", .task = .optional }, slow));
+}
+
+/// An `Io` whose tasks can be taken away: while its state is 0 there is
+/// none to spare.
+const Gate = shakedown.Layer(std.atomic.Value(u8), .{
+    .concurrent = gateConcurrent,
+    .groupConcurrent = gateGroupConcurrent,
+});
+
+fn gateConcurrent(userdata: ?*anyopaque, result_len: usize, result_alignment: std.mem.Alignment, context: []const u8, context_alignment: std.mem.Alignment, start: *const fn (*const anyopaque, *anyopaque) void) Io.ConcurrentError!*Io.AnyFuture {
+    const g = Gate.of(userdata);
+    if (g.state.load(.acquire) == 0) return error.ConcurrencyUnavailable;
+    return g.base.vtable.concurrent(g.base.userdata, result_len, result_alignment, context, context_alignment, start);
+}
+
+fn gateGroupConcurrent(userdata: ?*anyopaque, group: *Io.Group, context: []const u8, context_alignment: std.mem.Alignment, start: *const fn (*const anyopaque) void) Io.ConcurrentError!void {
+    const g = Gate.of(userdata);
+    if (g.state.load(.acquire) == 0) return error.ConcurrencyUnavailable;
+    return g.base.vtable.groupConcurrent(g.base.userdata, group, context, context_alignment, start);
+}
+
+/// Runs as a task, asks for a confirmation, then, given it, sleeps until
+/// canceled.
+const ConfirmThenStall = struct {
+    var started: std.atomic.Value(bool) = .init(false);
+
+    fn handle(call: *Call) Call.Error!parley.ToolResult {
+        _ = try call.runAsTask();
+        _ = try call.elicit("confirm", .{ .form = .{
+            .message = "Go on?",
+            .requested_schema = .{ .bytes = "{\"type\":\"object\"}" },
+        } }) orelse return error.InputRequired;
+        started.store(true, .release);
+        call.io.sleep(.fromSeconds(60), .awake) catch return error.Canceled;
+        return .ofText("woke");
+    }
+};
+
+fn update(s: *Server, id: []const u8) !void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    _ = try ask(s, arena.allocator(), "tasks/update", try arena.allocator().print("\"taskId\":\"{s}\",\"inputResponses\":{{\"confirm\":{{\"action\":\"accept\",\"content\":{{}}}}}}", .{id}), true);
+}
+
+test "a round run on tasks/update's own task, canceled there, ends the request Canceled and the task cancelled" {
+    var gate: Gate = .init(testing.io, .init(1));
+    var s = try Server.init(testing.allocator, gate.io(), .{ .info = .{ .name = "tasks", .version = "1" }, .tasks = .{ .poll_interval = .literal("10ms") } });
+    defer s.deinit();
+    try s.addTool(testing.io, .{ .name = "confirm_then_stall", .task = .required }, ConfirmThenStall.handle);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const id = try field(a, try ask(&s, a, "tools/call", "\"name\":\"confirm_then_stall\",\"arguments\":{}", true), "taskId");
+    _ = try poll(&s, a, id, "input_required");
+    // No task to spare from here: the next round runs on the request that
+    // gives the input.
+    gate.state.store(0, .release);
+    ConfirmThenStall.started.store(false, .release);
+    var updating = try testing.io.concurrent(update, .{ &s, id });
+    var waited: u32 = 0;
+    while (!ConfirmThenStall.started.load(.acquire) and waited < 1000) : (waited += 1) try testing.io.sleep(.fromMilliseconds(10), .awake);
+    try testing.expect(ConfirmThenStall.started.load(.acquire));
+    // Where the round took the request's cancel for the task's, the
+    // request was answered as if the input had been taken.
+    try testing.expectError(error.Canceled, updating.cancel(testing.io));
+    const done = try poll(&s, a, id, "cancelled");
+    try testing.expectEqualStrings("cancelled", try field(a, done, "status"));
 }

@@ -261,12 +261,13 @@ pub const Connection = struct {
                 }
                 // What sets the session's state (the handshake, the log
                 // level, subscriptions) is answered before the next line is
-                // read, so the requests after it find it set.
+                // read, so the requests after it find it set. Answered on
+                // this task, a cancel of it is this task's to return.
                 if (job.session != null and setsSession(request.method)) return Job.run(job);
                 c.group.concurrent(c.io, Job.run, .{job}) catch {
                     // No task to spare: answered here, before the next line
-                    // is read (and it cannot be canceled).
-                    Job.run(job);
+                    // is read.
+                    return Job.run(job);
                 };
             },
             .notification => |n| {
@@ -310,7 +311,16 @@ pub const Connection = struct {
         // answer is written.
         const batch = try c.gpa.create(Batch);
         batch.* = .{ .conn = c, .source = job };
-        defer batch.release();
+        const taken = c.takeBatch(batch, session, elements);
+        // The reader's hold: let go whatever came of the elements.
+        const released = batch.release();
+        try taken;
+        return released;
+    }
+
+    /// The elements of `batch`, each as `dispatch` takes one message.
+    fn takeBatch(c: *Connection, batch: *Batch, session: *compat.Session, elements: []const wire.Element) ServeError!void {
+        const job = batch.source;
         for (elements) |element| {
             const message = switch (element.read) {
                 .refused => |f| {
@@ -336,10 +346,10 @@ pub const Connection = struct {
                     }
                     batch.hold();
                     if (setsSession(request.method)) {
-                        Job.run(member);
+                        try Job.run(member);
                         continue;
                     }
-                    c.group.concurrent(c.io, Job.run, .{member}) catch Job.run(member);
+                    c.group.concurrent(c.io, Job.run, .{member}) catch try Job.run(member);
                 },
                 .notification => |n| try c.notice(job.arena.allocator(), n),
                 .result, .failure => session.deliver(c.io, message),
@@ -451,7 +461,7 @@ pub const Connection = struct {
         try out.endFn(out);
     }
 
-    fn writeFailure(c: *Connection, id: ?wire.Id, code: wire.Code, message: []const u8) ServeError!void {
+    fn writeFailure(c: *Connection, id: ?wire.Id, code: wire.Code, message: []const u8) error{ WriteFailed, Canceled }!void {
         var buffer: [512]u8 = undefined;
         var w: Io.Writer = .fixed(&buffer);
         wire.writeFailure(&w, id, code, message, null) catch {
@@ -459,7 +469,7 @@ pub const Connection = struct {
             w = .fixed(&buffer);
             wire.writeFailure(&w, null, code, message, null) catch unreachable; // unreachable: a fixed message fits
         };
-        c.send(w.buffered()) catch |err| return err;
+        return c.send(w.buffered());
     }
 };
 
@@ -524,7 +534,9 @@ const Batch = struct {
     }
 
     /// A holder is done: the last writes the array and frees the batch.
-    fn release(b: *Batch) void {
+    /// `Canceled`: the last holder's task was, while the array waited to go
+    /// out.
+    fn release(b: *Batch) Io.Cancelable!void {
         const c = b.conn;
         {
             var held = b.held.acquireUncancelable(c.io);
@@ -542,15 +554,20 @@ const Batch = struct {
         }
         // No answer: nothing is written (JSON-RPC 2.0 §6, never an empty array).
         if (out.items.len == 0) return;
-        out.append(c.gpa, ']') catch {
-            // glint-ignore: Z026 -- the answers could not be closed and the refusal could not be written: the stream is gone
-            c.writeFailure(null, .internal_error, "out of memory") catch {};
-            return;
-        };
-        // glint-ignore: Z026 -- a stream that cannot be written is gone; the reader sees its end
-        c.send(out.items) catch {};
+        out.append(c.gpa, ']') catch return wentOut(c.writeFailure(null, .internal_error, "out of memory"));
+        return wentOut(c.send(out.items));
     }
 };
+
+/// What came of a message written where nothing waits for it: a cancel of
+/// the writing task is returned; a stream that cannot be written is gone,
+/// and the reader sees its end.
+fn wentOut(written: error{ WriteFailed, Canceled }!void) Io.Cancelable!void {
+    written catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        error.WriteFailed => {},
+    };
+}
 
 /// One request: its bytes, its arena, and its cancellation.
 const Job = struct {
@@ -605,16 +622,21 @@ const Job = struct {
         canceled: Io.Cancelable!void,
     };
 
-    /// Answers the request, or stops at its cancellation.
-    fn run(job: *Job) void {
+    /// Answers the request, or stops at its client's cancellation, then
+    /// frees it. `Canceled`: the task running it was canceled (on `serve`'s
+    /// own task, `serve` returns it); nothing is answered then.
+    fn run(job: *Job) Io.Cancelable!void {
         const c = job.conn;
-        const io = c.io;
-        defer {
-            c.retire(job);
-            const batch = job.batch;
-            job.destroy();
-            if (batch) |b| b.release();
-        }
+        const batch = job.batch;
+        const ran = job.respond();
+        c.retire(job);
+        job.destroy();
+        if (batch) |b| try b.release();
+        return ran;
+    }
+
+    fn respond(job: *Job) Io.Cancelable!void {
+        const io = job.conn.io;
         var buffer: [2]Outcome = undefined;
         var select: Io.Select(Outcome) = .init(io, &buffer);
         // Every task of the select has ended before the job's memory goes:
@@ -622,18 +644,22 @@ const Job = struct {
         // return lives in the job's arena.
         defer select.cancelDiscard();
         select.concurrent(.done, answer, .{job}) catch {
-            // No task to spare for watching: answered, never canceled.
-            job.finish(answer(job));
-            return;
+            // No task to spare for watching: answered here, where a cancel
+            // the handler meets is this task's, unless its client's.
+            const result = answer(job);
+            if (result) |_| {} else |err| {
+                if (err == error.Canceled and job.canceled.load(.acquire) == .running) return error.Canceled;
+            }
+            return job.finish(result);
         };
         select.concurrent(.canceled, waitCancel, .{ &job.cancel, io }) catch {
-            const result = select.await() catch return;
-            job.finish(result.done);
-            return;
+            const result = try select.await();
+            return job.finish(result.done);
         };
-        switch (select.await() catch return) {
-            .done => |result| job.finish(result),
-            // Canceled: the request's task ends; nothing is answered.
+        switch (try select.await()) {
+            .done => |result| return job.finish(result),
+            // Canceled by its client: the request's task ends; nothing is
+            // answered.
             .canceled => {},
         }
     }
@@ -648,16 +674,16 @@ const Job = struct {
         try event.wait(io);
     }
 
-    fn finish(job: *Job, result: Server.HandleError!Server.Reply) void {
+    /// Writes what the handler returned. `Canceled`: the task running it
+    /// was, while the answer waited to go out.
+    fn finish(job: *Job, result: Server.HandleError!Server.Reply) Io.Cancelable!void {
         if (job.canceled.load(.acquire) == .canceled) return;
         const c = job.conn;
         const reply = result catch |err| switch (err) {
+            // The handler's, when it ran on a task of its own: nothing to
+            // answer (`respond` returns the cancel of its own task).
             error.Canceled => return,
-            error.OutOfMemory => {
-                // glint-ignore: Z026 -- the answer could not be made and the refusal could not be written: the stream is gone
-                c.writeFailure(job.request.id, .internal_error, "out of memory") catch {};
-                return;
-            },
+            error.OutOfMemory => return wentOut(c.writeFailure(job.request.id, .internal_error, "out of memory")),
         };
         // The answer goes to the stream as it is written: a result is never
         // copied into a message first.
@@ -665,24 +691,18 @@ const Job = struct {
             .result => |body| .{ .result = body },
             .input_required => |ir| .{
                 .result = .{
-                    .json = c.server.inputRequiredJson(job.arena.allocator(), ir) catch {
-                        // glint-ignore: Z026 -- the answer could not be made and the refusal could not be written: the stream is gone
-                        c.writeFailure(job.request.id, .internal_error, "out of memory") catch {};
-                        return;
-                    },
+                    .json = c.server.inputRequiredJson(job.arena.allocator(), ir) catch
+                        return wentOut(c.writeFailure(job.request.id, .internal_error, "out of memory")),
                 },
             },
             .failure => |f| .{ .failure = f },
         };
         if (job.batch) |batch| {
-            batch.add(job.request.id, out) catch {
-                // glint-ignore: Z026 -- the answer could not be made and the refusal could not be written: the stream is gone
-                c.writeFailure(job.request.id, .internal_error, "out of memory") catch {};
-            };
+            batch.add(job.request.id, out) catch
+                return wentOut(c.writeFailure(job.request.id, .internal_error, "out of memory"));
             return;
         }
-        // glint-ignore: Z026 -- a stream that cannot be written is gone; the reader sees its end
-        c.sendAnswer(job.request.id, out) catch {};
+        return wentOut(c.sendAnswer(job.request.id, out));
     }
 
     fn sink(job: *Job) Sink {

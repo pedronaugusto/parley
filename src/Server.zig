@@ -1098,7 +1098,11 @@ fn callAsTask(s: *Server, io: Io, arena: Allocator, request: wire.Request, conte
     table.group.concurrent(table.io, runRound, .{run}) catch {
         // No task to run it on: answered here, as it was asked.
         run.may_detach = false;
-        runRound(run);
+        runRound(run) catch |err| {
+            // This request's task was canceled while the round ran on it.
+            table.destroy(task);
+            return err;
+        };
     };
     run.decided.wait(io) catch {
         // The call was canceled: its handler stops, unless it runs as a
@@ -1170,25 +1174,47 @@ const Outcome = union(enum) {
 };
 
 /// Runs the round's handler until it returns or its task is canceled, then
-/// records what came of it.
-fn runRound(run: *Run) void {
-    const returned = answerRound(run);
-    run.server.recordRound(run, returned);
+/// records what came of it. `Canceled`: the task running the round was
+/// canceled (recorded as the task's cancellation, as `tasks/cancel` is);
+/// on a request's own task, the request returns it.
+fn runRound(run: *Run) Io.Cancelable!void {
+    var stopped = false;
+    const returned = answerRound(run, &stopped);
+    try run.server.recordRound(run, returned);
+    if (stopped) return error.Canceled;
 }
 
-fn answerRound(run: *Run) Call.Error!registry.ToolResult {
+/// What the round's handler returned; `stopped` set when the task running
+/// the round was canceled, which the handler's `Canceled` alone does not
+/// tell from `tasks/cancel`.
+fn answerRound(run: *Run, stopped: *bool) Call.Error!registry.ToolResult {
     const io = run.call.io;
     var buffer: [2]Outcome = undefined;
     var select: Io.Select(Outcome) = .init(io, &buffer);
     // Both tasks end before the round's memory goes; what they return is
     // on the round's arena.
     defer select.cancelDiscard();
-    select.concurrent(.done, callHandler, .{run}) catch return callHandler(run);
+    select.concurrent(.done, callHandler, .{run}) catch {
+        // No task to spare: the handler runs here, and a cancel it meets
+        // that `tasks/cancel` did not ask for is this task's.
+        const result = callHandler(run);
+        if (result) |_| {} else |err| {
+            if (err == error.Canceled and !run.task.cancel.isSet()) stopped.* = true;
+        }
+        return result;
+    };
     select.concurrent(.canceled, waitCancel, .{ &run.task.cancel, io }) catch {
-        const first = select.await() catch return error.Canceled;
+        const first = select.await() catch {
+            stopped.* = true;
+            return error.Canceled;
+        };
         return first.done;
     };
-    return switch (select.await() catch return error.Canceled) {
+    const first = select.await() catch {
+        stopped.* = true;
+        return error.Canceled;
+    };
+    return switch (first) {
         .done => |result| result,
         .canceled => error.Canceled,
     };
@@ -1204,7 +1230,8 @@ fn waitCancel(event: *Io.Event, io: Io) Io.Cancelable!void {
 
 /// What came of a round: the waiting call's answer, or the task's next
 /// status, and the next round when the handler asked for nothing.
-fn recordRound(s: *Server, run: *Run, returned: Call.Error!registry.ToolResult) void {
+/// `Canceled`: that next round ran on this task, and the task was canceled.
+fn recordRound(s: *Server, run: *Run, returned: Call.Error!registry.ToolResult) Io.Cancelable!void {
     const table = &s.task_table.?;
     const io = table.io;
     const task = run.task;
@@ -1234,7 +1261,7 @@ fn recordRound(s: *Server, run: *Run, returned: Call.Error!registry.ToolResult) 
     s.hub.changed(io, .task, &n.id);
     const handler = run.handler;
     run.release();
-    if (n.again) s.startRound(task, handler, null, n.state);
+    if (n.again) try s.startRound(task, handler, null, n.state);
 }
 
 /// Records `returned` on the run's task (the caller holds the table's lock):
@@ -1309,8 +1336,9 @@ fn recordOutcome(s: *Server, table: *tasks.Table, h: *tasks.Table.Held, run: *Ru
 }
 
 /// Starts a round of `task`'s handler with `responses` (its `inputResponses`)
-/// and `state`; one that cannot start ends the task failed.
-fn startRound(s: *Server, task: *tasks.Task, handler: *registry.ToolHandler, responses: ?[]const u8, state_in: ?[]const u8) void {
+/// and `state`; one that cannot start ends the task failed. `Canceled`: no
+/// task was free, the round ran on this one, and this one was canceled.
+fn startRound(s: *Server, task: *tasks.Task, handler: *registry.ToolHandler, responses: ?[]const u8, state_in: ?[]const u8) Io.Cancelable!void {
     const table = &s.task_table.?;
     const run = Run.create(s, task, handler, false, .{ .string = &task.id }, .none, responses, state_in) catch {
         var held = table.lock();
@@ -1320,7 +1348,7 @@ fn startRound(s: *Server, task: *tasks.Task, handler: *registry.ToolHandler, res
         task.running = false;
         return;
     };
-    table.group.concurrent(table.io, runRound, .{run}) catch runRound(run);
+    table.group.concurrent(table.io, runRound, .{run}) catch return runRound(run);
 }
 
 const TaskMethod = enum { get, update, cancel };
@@ -1384,7 +1412,7 @@ fn taskRequest(s: *Server, io: Io, arena: Allocator, request: wire.Request, cont
         }
     }
     if (changed) s.hub.changed(io, .task, &id);
-    if (next) |responses| s.startRound(task, handler.?, responses, task.state);
+    if (next) |responses| try s.startRound(task, handler.?, responses, task.state);
     var out: Result = .begin(s, arena, context.revision);
     try out.end(s, null, false);
     return .{ .result = try out.body() };

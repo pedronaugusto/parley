@@ -418,7 +418,16 @@ fn serveBatch(e: *Endpoint, io: Io, arena: Allocator, request: *Request, respons
                         continue;
                     }
                     a.request = req;
-                    group.concurrent(io, Answered.run, .{ a, io, session, stream.sink(e) }) catch a.run(io, session, stream.sink(e));
+                    group.concurrent(io, Answered.run, .{ a, io, session, stream.sink(e) }) catch {
+                        // No task to spare: answered here, where a cancel
+                        // the handler meets is this task's: nothing is
+                        // answered, and the connection ends.
+                        a.run(io, session, stream.sink(e));
+                        if (a.outcome.?.answered) |_| {} else |err| switch (err) {
+                            error.Canceled => return error.Canceled,
+                            error.OutOfMemory => {},
+                        }
+                    };
                 },
                 .notification => |n| if (std.mem.eql(u8, n.method, "notifications/initialized")) {
                     _ = session.initialized(io);
@@ -515,10 +524,11 @@ fn openStream(e: *Endpoint, io: Io, response: *Response, session_id: ?[]const u8
         // The client is gone already, or the stream cannot be begun.
         error.Closed, error.OutOfMemory => return,
     };
-    // glint-ignore: Z026 -- the stream was the answer; a client gone before its end needs no more
-    defer response.end(io) catch {};
     // The stream ends when its client leaves or the server closes; a cancel or a lack of memory is the caller's.
-    try entry.session.stream(io, stream.sink(e));
+    const streamed = entry.session.stream(io, stream.sink(e));
+    const ended = guard.endStream(io, response);
+    try streamed;
+    return ended;
 }
 
 /// DELETE: the session ends.

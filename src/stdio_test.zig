@@ -2,6 +2,7 @@
 //! finish in, refusals that name the request they refuse, cancellation, and
 //! a long request that holds up nothing behind it.
 const std = @import("std");
+const shakedown = @import("shakedown");
 const parley = @import("parley.zig");
 const stdio = @import("stdio.zig");
 const Pipe = @import("testing/Pipe.zig");
@@ -209,4 +210,128 @@ test "a message past strand's defaults, within the message limit, is read and an
     const answer = answerTo(out.written(), "\"id\":1,").?;
     try testing.expect(std.mem.find(u8, answer, "\"isError\"") == null);
     try testing.expect(std.mem.find(u8, answer, text) != null);
+}
+
+/// An `Io` with no task to spare: every request is answered on the task
+/// that reads it.
+const Serial = shakedown.Layer(u8, .{
+    .concurrent = struct {
+        fn concurrent(_: ?*anyopaque, _: usize, _: std.mem.Alignment, _: []const u8, _: std.mem.Alignment, _: *const fn (*const anyopaque, *anyopaque) void) std.Io.ConcurrentError!*std.Io.AnyFuture {
+            return error.ConcurrencyUnavailable;
+        }
+    }.concurrent,
+    .groupConcurrent = struct {
+        fn groupConcurrent(_: ?*anyopaque, _: *std.Io.Group, _: []const u8, _: std.mem.Alignment, _: *const fn (*const anyopaque) void) std.Io.ConcurrentError!void {
+            return error.ConcurrencyUnavailable;
+        }
+    }.groupConcurrent,
+});
+
+/// Says it started, then sleeps until canceled.
+const Stall = struct {
+    var started: std.atomic.Value(bool) = .init(false);
+
+    fn handle(call: *Call) Call.Error!parley.ToolResult {
+        started.store(true, .release);
+        call.io.sleep(.fromSeconds(60), .awake) catch return error.Canceled;
+        return .ofText("woke");
+    }
+};
+
+/// Waits (a while at most) until `flag` is set.
+fn until(flag: *std.atomic.Value(bool)) !void {
+    var waited: u32 = 0;
+    while (!flag.load(.acquire) and waited < 1000) : (waited += 1) try testing.io.sleep(.fromMilliseconds(10), .awake);
+    try testing.expect(flag.load(.acquire));
+}
+
+fn serveOn(io: std.Io, server: *parley.Server, in: *std.Io.Reader, out: *std.Io.Writer) stdio.ServeError!void {
+    return stdio.serve(io, testing.allocator, server, in, out, .{});
+}
+
+test "a request answered on serve's own task, canceled there, ends serve Canceled, unanswered" {
+    var server = try newServer(testing.io);
+    defer server.deinit();
+    try server.addTool(testing.io, .{ .name = "stall" }, Stall.handle);
+    Stall.started.store(false, .release);
+    var serial: Serial = .init(testing.io, 0);
+    var in: std.Io.Reader = .fixed("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"stall\"," ++ meta ++ "}}\n");
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var serving = try testing.io.concurrent(serveOn, .{ serial.io(), &server, &in, &out.writer });
+    try until(&Stall.started);
+    // Where the cancel was taken for the request's own and spent there,
+    // serve read on to the end of its input and returned as if done.
+    try testing.expectError(error.Canceled, serving.cancel(testing.io));
+    try testing.expectEqualStrings("", out.written());
+}
+
+/// Messages a line each into `written`; `keepAliveFn` holds the stream
+/// until `let_go`, so another message waits for its turn.
+const Holding = struct {
+    out: stdio.Out = .{ .beginFn = begin, .endFn = end, .keepAliveFn = hold },
+    written: std.Io.Writer.Allocating,
+    holding: std.atomic.Value(bool) = .init(false),
+    let_go: std.Io.Event = .unset,
+
+    fn begin(o: *stdio.Out) stdio.Out.Error!*std.Io.Writer {
+        const h: *Holding = @alignCast(@fieldParentPtr("out", o));
+        return &h.written.writer;
+    }
+
+    fn end(o: *stdio.Out) stdio.Out.Error!void {
+        const h: *Holding = @alignCast(@fieldParentPtr("out", o));
+        try h.written.writer.writeByte('\n');
+    }
+
+    fn hold(o: *stdio.Out) stdio.Out.Error!void {
+        const h: *Holding = @alignCast(@fieldParentPtr("out", o));
+        h.holding.store(true, .release);
+        h.let_go.waitUncancelable(testing.io);
+        h.holding.store(false, .release);
+    }
+};
+
+fn keepAlive(conn: *stdio.Connection) error{ WriteFailed, Canceled }!void {
+    return conn.keepAlive();
+}
+
+fn take(conn: *stdio.Connection, bytes: []u8) stdio.Connection.TakeError!void {
+    return conn.take(bytes);
+}
+
+/// Takes `message` on a task of its own while another holds the stream,
+/// cancels it, and returns what the take returned.
+fn takeWhileHeld(conn: *stdio.Connection, holding: *Holding, message: []const u8) stdio.Connection.TakeError!void {
+    holding.let_go.reset();
+    var keeping = try testing.io.concurrent(keepAlive, .{conn});
+    defer {
+        holding.let_go.set(testing.io);
+        // glint-ignore: Z026 -- the holder only holds; how it ends is not what the test checks
+        keeping.await(testing.io) catch {};
+    }
+    var waited: u32 = 0;
+    while (!holding.holding.load(.acquire) and waited < 1000) : (waited += 1) try testing.io.sleep(.fromMilliseconds(1), .awake);
+    var taking = try testing.io.concurrent(take, .{ conn, try testing.allocator.dupe(u8, message) });
+    return taking.cancel(testing.io);
+}
+
+test "an answer canceled while it waits for its turn on the stream returns Canceled: a request's, and a batch's" {
+    var server = try newServer(testing.io);
+    defer server.deinit();
+    var serial: Serial = .init(testing.io, 0);
+    var holding: Holding = .{ .written = .init(testing.allocator) };
+    defer holding.written.deinit();
+    var conn: stdio.Connection = .init(serial.io(), testing.allocator, &server, &holding.out, .{});
+    defer conn.deinit();
+    // A request answered on the task that takes it: its answer waits for
+    // the stream, and the cancel lands there. Where it was dropped, the
+    // take returned as if answered.
+    try testing.expectError(error.Canceled, takeWhileHeld(&conn, &holding, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{" ++ meta ++ "}}"));
+    // A batch's array, written once its last request is answered.
+    try conn.take(try testing.allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"1\"}}}"));
+    try testing.expectError(error.Canceled, takeWhileHeld(&conn, &holding, "[{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}]"));
+    // Neither went out; the handshake's answer did.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, holding.written.written(), "\n"));
+    try testing.expect(answerTo(holding.written.written(), "\"id\":2,") != null);
 }

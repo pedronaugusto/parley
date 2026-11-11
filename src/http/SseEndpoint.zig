@@ -165,8 +165,15 @@ fn open(e: *SseEndpoint, io: Io, request: *Request, response: *Response) anyerro
     }
     // Last, the response ends: the connection, which writes to it, has
     // stopped first, and a POST still holding the session finds it ended.
-    // glint-ignore: Z026 -- the stream was the answer; a client gone before its end needs no more
-    defer response.end(io) catch {};
+    const streamed = e.serveStream(io, request, response, session);
+    const ended = guard.endStream(io, response);
+    try streamed;
+    return ended;
+}
+
+/// The session's stream, until its client leaves or the server stops;
+/// then the session is let go.
+fn serveStream(e: *SseEndpoint, io: Io, request: *Request, response: *Response, session: *Session) anyerror!void {
     defer e.release(session);
     defer {
         e.forget(io, session);

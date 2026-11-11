@@ -124,6 +124,15 @@ pub fn refuse(io: Io, response: *Response, status: std.http.Status, id: ?wire.Id
     return response.send(io, w.buffered());
 }
 
+/// Ends a response that was a stream: a client gone before its end needs
+/// no more; a cancel is returned.
+pub fn endStream(io: Io, response: *Response) Io.Cancelable!void {
+    response.end(io) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        error.WriteFailed, error.OutOfMemory, error.InvalidHeader, error.HeadSent, error.HeadTooLarge, error.BodyNotAllowed, error.BodyIncomplete => {},
+    };
+}
+
 /// Whether `Content-Type` is JSON.
 pub fn isJson(content_type: ?[]const u8) bool {
     const value = content_type orelse return false;

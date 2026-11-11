@@ -485,6 +485,50 @@ test "a request whose connection's task is canceled while its handler runs is no
     try testing.expectEqualStrings("", got.items);
 }
 
+test "a batch whose request is answered on the connection's task, canceled there, is not answered, and its connection ends" {
+    const io = testing.io;
+    var h: Harness = undefined;
+    try h.start(io);
+    defer h.stop(io);
+    Stall.started.store(false, .release);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const session = try openSession(&h, io, arena.allocator(), "2025-03-26");
+    // A connection of the test's own, served on a task the test cancels,
+    // with no task to spare: the batch's request runs on the connection's.
+    var serial: Serial = .init(io, 0);
+    var listener = try (try Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const raw = try listener.socket.address.connect(io, .{ .mode = .stream });
+    defer raw.close(io);
+    const accepted = try listener.accept(io);
+    var serving = try io.concurrent(uplink.Server.serveConnection, .{ &h.http, serial.io(), accepted });
+    const body = "[{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"stall\"}}]";
+    var write_buffer: [1024]u8 = undefined;
+    var w = raw.writer(io, &write_buffer);
+    try w.interface.print("POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\n" ++
+        "Mcp-Session-Id: {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{ session, body.len, body });
+    try w.interface.flush();
+    try Stall.until(&Stall.started);
+    var canceling = try io.concurrent(cancelServing, .{ &serving, io });
+    defer canceling.await(io);
+    // What comes back before the connection ends: nothing, where the
+    // member's cancel was taken for its outcome and the batch answered 202.
+    var read_buffer: [1024]u8 = undefined;
+    var r = raw.reader(io, &read_buffer);
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(testing.allocator);
+    var piece: [256]u8 = undefined;
+    while (std.mem.find(u8, got.items, "\r\n\r\n") == null) {
+        const n = r.interface.readSliceShort(&piece) catch break;
+        if (n == 0) break;
+        try got.appendSlice(testing.allocator, piece[0..n]);
+    }
+    // glint-ignore: Z026 -- a socket the server closed first has nothing left to shut down
+    raw.shutdown(io, .both) catch {};
+    try testing.expectEqualStrings("", got.items);
+}
+
 /// Opens a session at `version` and returns its id.
 fn openSession(h: *Harness, io: Io, arena: std.mem.Allocator, version: []const u8) ![]const u8 {
     var url_buffer: [64]u8 = undefined;

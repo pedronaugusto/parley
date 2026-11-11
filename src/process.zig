@@ -103,7 +103,12 @@ pub const Child = struct {
             } },
         });
         errdefer {
-            // glint-ignore: Z026 -- a child that could not be given its client is ended however that goes
+            // A cancel waits until the child is reaped (it is never left
+            // running), and lands at the caller's next cancelation point;
+            // the error that ended the spawn is the one returned.
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
+            // glint-ignore: Z026 -- a child that could not be given its client is ended however that goes; no cancel lands here
             _ = c.process.killWait(io, .fromRaw(0)) catch {};
             c.process.deinit(io);
         }
