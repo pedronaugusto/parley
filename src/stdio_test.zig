@@ -3,6 +3,7 @@
 //! a long request that holds up nothing behind it.
 const std = @import("std");
 const shakedown = @import("shakedown");
+const aegis = @import("aegis");
 const parley = @import("parley.zig");
 const stdio = @import("stdio.zig");
 const Pipe = @import("testing/Pipe.zig");
@@ -64,7 +65,7 @@ test "a line a message: answers, refusals naming their request, blank lines pass
     var in: std.Io.Reader = .fixed(input);
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try stdio.serve(testing.io, testing.allocator, &server, .uncaused(&in), .uncaused(&out.writer), .{});
+    try stdio.serve(testing.io, testing.allocator, &server, .causeless(&in), .causeless(&out.writer), .{});
     const lines = out.written();
     try testing.expectEqual(@as(usize, 6), std.mem.count(u8, lines, "\n"));
     try testing.expect(std.mem.find(u8, answerTo(lines, "\"id\":1,").?, "\"text\":\"one\"") != null);
@@ -84,7 +85,7 @@ test "a line past the limit is refused and the next one read" {
     var in: std.Io.Reader = .fixed(input);
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try stdio.serve(testing.io, testing.allocator, &server, .uncaused(&in), .uncaused(&out.writer), .{});
+    try stdio.serve(testing.io, testing.allocator, &server, .causeless(&in), .causeless(&out.writer), .{});
     const lines = out.written();
     try testing.expect(std.mem.find(u8, lines, "longer than the server reads") != null);
     try testing.expect(std.mem.find(u8, answerTo(lines, "\"id\":2,").?, "\"tools\":[") != null);
@@ -98,7 +99,7 @@ test "an answer past the limit is refused, not written" {
     var in: std.Io.Reader = .fixed(request ++ "\n");
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try stdio.serve(testing.io, testing.allocator, &server, .uncaused(&in), .uncaused(&out.writer), .{});
+    try stdio.serve(testing.io, testing.allocator, &server, .causeless(&in), .causeless(&out.writer), .{});
     const answer = answerTo(out.written(), "\"id\":1,").?;
     try testing.expect(std.mem.find(u8, answer, "-32603") != null);
     try testing.expect(std.mem.find(u8, answer, "message limit") != null);
@@ -113,7 +114,7 @@ test "a tool's answer past the limit is refused, and nothing of it is written" {
     var in: std.Io.Reader = .fixed(request ++ "\n");
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try stdio.serve(testing.io, testing.allocator, &server, .uncaused(&in), .uncaused(&out.writer), .{});
+    try stdio.serve(testing.io, testing.allocator, &server, .causeless(&in), .causeless(&out.writer), .{});
     const answer = answerTo(out.written(), "\"id\":1,").?;
     try testing.expect(std.mem.find(u8, answer, "message limit") != null);
     try testing.expect(std.mem.find(u8, out.written(), "xxxx") == null);
@@ -121,7 +122,7 @@ test "a tool's answer past the limit is refused, and nothing of it is written" {
 
 fn serveTask(io: std.Io, server: *parley.Server, in: *Pipe, out: *Pipe) void {
     // glint-ignore: Z026 -- the test reads what was written; how the serving ended is not what it checks
-    stdio.serve(io, testing.allocator, server, .uncaused(&in.reader), .uncaused(&out.writer), .{}) catch {};
+    stdio.serve(io, testing.allocator, server, .causeless(&in.reader), .causeless(&out.writer), .{}) catch {};
     out.close();
 }
 
@@ -206,7 +207,7 @@ test "a message past strand's defaults, within the message limit, is read and an
     var in: std.Io.Reader = .fixed(input.written());
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try stdio.serve(testing.io, testing.allocator, &server, .uncaused(&in), .uncaused(&out.writer), .{});
+    try stdio.serve(testing.io, testing.allocator, &server, .causeless(&in), .causeless(&out.writer), .{});
     const answer = answerTo(out.written(), "\"id\":1,").?;
     try testing.expect(std.mem.find(u8, answer, "\"isError\"") == null);
     try testing.expect(std.mem.find(u8, answer, text) != null);
@@ -246,7 +247,7 @@ fn until(flag: *std.atomic.Value(bool)) !void {
 }
 
 fn serveOn(io: std.Io, server: *parley.Server, in: *std.Io.Reader, out: *std.Io.Writer) stdio.ServeError!void {
-    return stdio.serve(io, testing.allocator, server, .uncaused(in), .uncaused(out), .{});
+    return stdio.serve(io, testing.allocator, server, .causeless(in), .causeless(out), .{});
 }
 
 test "a request answered on serve's own task, canceled there, ends serve Canceled, unanswered" {
@@ -274,9 +275,9 @@ const Holding = struct {
     holding: std.atomic.Value(bool) = .init(false),
     let_go: std.Io.Event = .unset,
 
-    fn begin(o: *stdio.Out) stdio.Out.Error!stdio.WriteEnd {
+    fn begin(o: *stdio.Out) stdio.Out.Error!aegis.io.WriteEnd {
         const h: *Holding = @alignCast(@fieldParentPtr("out", o));
-        return .uncaused(&h.written.writer);
+        return .causeless(&h.written.writer);
     }
 
     fn end(o: *stdio.Out) stdio.Out.Error!void {
@@ -362,7 +363,7 @@ test "an answer on serve's own task whose flush is canceled ends serve Canceled"
     var out = file.writerStreaming(fio.io(), &buffer);
     // Where the end could not say why the write failed, the stream was
     // taken for broken, the cancel spent, and serve read on to its end.
-    try testing.expectError(error.Canceled, stdio.serve(fio.io(), testing.allocator, &server, .uncaused(&in), .file(&out), .{}));
+    try testing.expectError(error.Canceled, stdio.serve(fio.io(), testing.allocator, &server, .causeless(&in), .fromFile(&out), .{}));
     try testing.expectEqual(@as(usize, 1), fio.fired().len);
 }
 
@@ -376,7 +377,7 @@ test "a channel's write canceled returns Canceled, not Closed" {
     var from_server: std.Io.Reader = .fixed("");
     var buffer: [256]u8 = undefined;
     var to_server = file.writerStreaming(fio.io(), &buffer);
-    var channel: stdio.Channel = .init(testing.allocator, .uncaused(&from_server), .file(&to_server));
+    var channel: stdio.Channel = .init(testing.allocator, .causeless(&from_server), .fromFile(&to_server));
     defer channel.deinit(testing.io);
     // Where the end could not say why, a canceled write was the server's
     // input gone.
@@ -419,6 +420,6 @@ test "a handler with nothing to answer, its stream gone, does not end serve" {
     var out: std.Io.Writer = .failing;
     // Where the handler said its stream was gone with `Canceled`, serve
     // took it for its own task's cancel and returned at the first request.
-    try stdio.serve(serial.io(), testing.allocator, &server, .uncaused(&in), .uncaused(&out), .{});
+    try stdio.serve(serial.io(), testing.allocator, &server, .causeless(&in), .causeless(&out), .{});
     try testing.expect(Ran.ran.load(.acquire));
 }

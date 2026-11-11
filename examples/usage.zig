@@ -29,7 +29,7 @@ fn serveStdio(io: Io, gpa: std.mem.Allocator, server: *parley.Server) !void {
     var out_buffer: [64 * 1024]u8 = undefined;
     var stdin = Io.File.stdin().readerStreaming(io, &in_buffer);
     var stdout = Io.File.stdout().writerStreaming(io, &out_buffer);
-    try parley.stdio.serve(io, gpa, server, .file(&stdin), .file(&stdout), .{});
+    try parley.stdio.serve(io, gpa, server, .fromFile(&stdin), .fromFile(&stdout), .{});
     // --- README:stdio ---
 }
 
@@ -98,7 +98,7 @@ fn overStdio(io: Io, gpa: std.mem.Allocator, server: *parley.Server) !void {
     var out: Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     // Ends that record no cause: every failure is the stream broken.
-    try parley.stdio.serve(io, gpa, server, .uncaused(&in), .uncaused(&out.writer), .{});
+    try parley.stdio.serve(io, gpa, server, .causeless(&in), .causeless(&out.writer), .{});
     std.debug.assert(std.mem.find(u8, out.written(), "\"protocolVersion\":\"2025-06-18\"") != null);
 }
 

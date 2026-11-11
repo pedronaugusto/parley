@@ -29,5 +29,5 @@ pub fn main(init: std.process.Init) !void {
     var out_buffer: [64 * 1024]u8 = undefined;
     var stdin = std.Io.File.stdin().readerStreaming(io, &in_buffer);
     var stdout = std.Io.File.stdout().writerStreaming(io, &out_buffer);
-    try parley.stdio.serve(io, init.gpa, &server, .file(&stdin), .file(&stdout), .{});
+    try parley.stdio.serve(io, init.gpa, &server, .fromFile(&stdin), .fromFile(&stdout), .{});
 }

@@ -92,7 +92,7 @@ var in_buffer: [64 * 1024]u8 = undefined;
 var out_buffer: [64 * 1024]u8 = undefined;
 var stdin = Io.File.stdin().readerStreaming(io, &in_buffer);
 var stdout = Io.File.stdout().writerStreaming(io, &out_buffer);
-try parley.stdio.serve(io, gpa, server, .file(&stdin), .file(&stdout), .{});
+try parley.stdio.serve(io, gpa, server, .fromFile(&stdin), .fromFile(&stdout), .{});
 ```
 <!-- END GENERATED -->
 

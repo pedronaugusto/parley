@@ -26,6 +26,8 @@ const Sink = @import("context.zig").Sink;
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
+const ReadEnd = aegis.io.ReadEnd;
+const WriteEnd = aegis.io.WriteEnd;
 
 pub const Options = struct {
     /// The session an `initialize` opens (2025-11-25 and before).
@@ -69,103 +71,6 @@ pub fn serve(io: Io, gpa: Allocator, server: *Server, in: ReadEnd, out: WriteEnd
     }
 }
 
-/// A stream parley reads that it was handed, and why a read from it failed:
-/// a reader says `ReadFailed` alone, and keeps the cause in its own state.
-pub const ReadEnd = struct {
-    interface: *Io.Reader,
-    /// Why the last read from `interface` failed.
-    causeFn: *const fn (r: *const Io.Reader) Cause,
-
-    /// `Canceled`: the reading task was. `ReadFailed`: anything else.
-    pub const Cause = error{ ReadFailed, Canceled };
-
-    /// A file's reader (stdin, a pipe): its `err`.
-    pub fn file(r: *Io.File.Reader) ReadEnd {
-        return .{ .interface = &r.interface, .causeFn = struct {
-            fn cause(i: *const Io.Reader) Cause {
-                const f: *const Io.File.Reader = @alignCast(@fieldParentPtr("interface", i));
-                return if (canceled(f.err)) error.Canceled else error.ReadFailed;
-            }
-        }.cause };
-    }
-
-    /// A network stream's reader: its `err`.
-    pub fn stream(r: *Io.net.Stream.Reader) ReadEnd {
-        return .{ .interface = &r.interface, .causeFn = struct {
-            fn cause(i: *const Io.Reader) Cause {
-                const s: *const Io.net.Stream.Reader = @alignCast(@fieldParentPtr("interface", i));
-                return if (canceled(s.err)) error.Canceled else error.ReadFailed;
-            }
-        }.cause };
-    }
-
-    /// A reader that records no cause (a fixed buffer, a test's double):
-    /// every failure is `ReadFailed`.
-    pub fn uncaused(r: *Io.Reader) ReadEnd {
-        return .{ .interface = r, .causeFn = struct {
-            fn cause(_: *const Io.Reader) Cause {
-                return error.ReadFailed;
-            }
-        }.cause };
-    }
-
-    pub fn cause(e: ReadEnd) Cause {
-        return e.causeFn(e.interface);
-    }
-};
-
-/// A stream parley writes that it was handed, and why a write to it
-/// failed: a writer says `WriteFailed` alone, and keeps the cause in its own
-/// state.
-pub const WriteEnd = struct {
-    interface: *Io.Writer,
-    /// Why the last write to `interface` failed.
-    causeFn: *const fn (w: *const Io.Writer) Cause,
-
-    /// `Canceled`: the writing task was. `WriteFailed`: anything else.
-    pub const Cause = error{ WriteFailed, Canceled };
-
-    /// A file's writer (stdout, a pipe): its `err`.
-    pub fn file(w: *Io.File.Writer) WriteEnd {
-        return .{ .interface = &w.interface, .causeFn = struct {
-            fn cause(i: *const Io.Writer) Cause {
-                const f: *const Io.File.Writer = @alignCast(@fieldParentPtr("interface", i));
-                return if (canceled(f.err)) error.Canceled else error.WriteFailed;
-            }
-        }.cause };
-    }
-
-    /// A network stream's writer: its `err`.
-    pub fn stream(w: *Io.net.Stream.Writer) WriteEnd {
-        return .{ .interface = &w.interface, .causeFn = struct {
-            fn cause(i: *const Io.Writer) Cause {
-                const s: *const Io.net.Stream.Writer = @alignCast(@fieldParentPtr("interface", i));
-                return if (canceled(s.err)) error.Canceled else error.WriteFailed;
-            }
-        }.cause };
-    }
-
-    /// A writer that records no cause (a fixed buffer, an allocating
-    /// writer, a test's double): every failure is `WriteFailed`.
-    pub fn uncaused(w: *Io.Writer) WriteEnd {
-        return .{ .interface = w, .causeFn = struct {
-            fn cause(_: *const Io.Writer) Cause {
-                return error.WriteFailed;
-            }
-        }.cause };
-    }
-
-    pub fn cause(e: WriteEnd) Cause {
-        return e.causeFn(e.interface);
-    }
-};
-
-/// Whether a std reader's or writer's recorded failure is a cancel.
-fn canceled(err: anytype) bool {
-    const e = err orelse return false;
-    return e == error.Canceled;
-}
-
 /// Where a connection's messages go, one whole message at a time: a line
 /// each on stdio (`Lines`), an event each on HTTP+SSE. A writer embeds one
 /// and finds itself from it by `@fieldParentPtr`.
@@ -180,7 +85,7 @@ pub const Out = struct {
     keepAliveFn: ?*const fn (o: *Out) Error!void = null,
 
     /// `Canceled`: the writing task was. `WriteFailed`: the stream broke.
-    pub const Error = WriteEnd.Cause;
+    pub const Error = error{ WriteFailed, Canceled };
 
     /// Each message a line on `end`, flushed.
     pub const Lines = struct {
@@ -194,8 +99,8 @@ pub const Out = struct {
 
         fn lineEnd(o: *Out) Error!void {
             const l: *Lines = @alignCast(@fieldParentPtr("out", o));
-            l.end.interface.writeByte('\n') catch return l.end.cause();
-            l.end.interface.flush() catch return l.end.cause();
+            l.end.writer().writeByte('\n') catch |err| return l.end.settle(err);
+            l.end.writer().flush() catch |err| return l.end.settle(err);
         }
     };
 };
@@ -299,18 +204,18 @@ pub const Connection = struct {
     /// buffer is the job's own on `gpa`, not its arena: growing it frees what
     /// it outgrew, where an arena would keep every size it passed through.
     fn readLine(c: *Connection, end: ReadEnd, job: *Job) ServeError!Read {
-        const in = end.interface;
+        const in = end.reader();
         var line: Io.Writer.Allocating = .fromArrayList(c.gpa, &job.bytes);
         defer job.bytes = line.toArrayList();
         // A longer line is refused and passed over; the line break is
         // looked for one byte past it.
         const limit = @as(usize, c.server.options.limits.message.raw()) + 1;
         const n = in.streamDelimiterLimit(&line.writer, '\n', .limited(limit)) catch |err| switch (err) {
-            error.ReadFailed => return end.cause(),
+            error.ReadFailed => return end.settle(error.ReadFailed),
             error.WriteFailed => return error.OutOfMemory,
             error.StreamTooLong => {
                 _ = in.discardDelimiterInclusive('\n') catch |e| switch (e) {
-                    error.ReadFailed => return end.cause(),
+                    error.ReadFailed => return end.settle(error.ReadFailed),
                     error.EndOfStream => {},
                 };
                 return .too_long;
@@ -318,7 +223,7 @@ pub const Connection = struct {
         };
         const at_end = blk: {
             const next = in.peekByte() catch |err| switch (err) {
-                error.ReadFailed => return end.cause(),
+                error.ReadFailed => return end.settle(error.ReadFailed),
                 error.EndOfStream => break :blk true,
             };
             aegis.assert.invariant(next == '\n', "a line stops at its break");
@@ -548,7 +453,7 @@ pub const Connection = struct {
         defer held.deinit(c.io);
         const out = held.value().*;
         const end = try out.beginFn(out);
-        end.interface.writeAll(message) catch return end.cause();
+        end.writer().writeAll(message) catch |err| return end.settle(err);
         try out.endFn(out);
     }
 
@@ -558,7 +463,7 @@ pub const Connection = struct {
         defer held.deinit(c.io);
         const out = held.value().*;
         const end = try out.beginFn(out);
-        answer.write(end.interface, id) catch return end.cause();
+        answer.write(end.writer(), id) catch |err| return end.settle(err);
         try out.endFn(out);
     }
 
@@ -940,14 +845,14 @@ pub const Channel = struct {
         defer held.deinit(io);
         const w = held.value();
         if (w.ended) return error.Closed;
-        const out = w.out.interface;
+        const out = w.out.writer();
         out.writeAll(message) catch return closed(w.out);
         out.writeByte('\n') catch return closed(w.out);
         out.flush() catch return closed(w.out);
     }
 
     fn closed(out: WriteEnd) error{ Closed, Canceled } {
-        return switch (out.cause()) {
+        return switch (out.settle(error.WriteFailed)) {
             error.Canceled => error.Canceled,
             error.WriteFailed => error.Closed,
         };
@@ -982,15 +887,15 @@ pub const Channel = struct {
         defer line_buffer.deinit();
         while (true) {
             line_buffer.clearRetainingCapacity();
-            _ = ch.in.interface.streamDelimiterLimit(&line_buffer.writer, '\n', .limited(@as(usize, ch.client.?.options.limits.message.raw()) + 1)) catch |err| switch (err) {
+            _ = ch.in.reader().streamDelimiterLimit(&line_buffer.writer, '\n', .limited(@as(usize, ch.client.?.options.limits.message.raw()) + 1)) catch |err| switch (err) {
                 error.StreamTooLong => {
-                    _ = ch.in.interface.discardDelimiterInclusive('\n') catch return;
+                    _ = ch.in.reader().discardDelimiterInclusive('\n') catch return;
                     continue;
                 },
                 else => return,
             };
-            const at_end = if (ch.in.interface.peekByte()) |_| blk: {
-                ch.in.interface.toss(1);
+            const at_end = if (ch.in.reader().peekByte()) |_| blk: {
+                ch.in.reader().toss(1);
                 break :blk false;
             } else |_| true;
             const bytes = std.mem.trimEnd(u8, line_buffer.written(), "\r");

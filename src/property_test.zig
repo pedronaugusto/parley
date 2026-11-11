@@ -123,7 +123,7 @@ fn anyLines(_: void, c: *shake.Case) !void {
     }
     var in: std.Io.Reader = .fixed(input.items);
     var out: std.Io.Writer.Allocating = .init(c.gpa);
-    try stdio.serve(io, gpa, server, .uncaused(&in), .uncaused(&out.writer), .{});
+    try stdio.serve(io, gpa, server, .causeless(&in), .causeless(&out.writer), .{});
     // Every line out is one JSON-RPC message.
     var it = std.mem.splitScalar(u8, out.written(), '\n');
     while (it.next()) |line| {

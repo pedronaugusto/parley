@@ -105,17 +105,16 @@ const Session = struct {
     /// The connection's messages, an event each.
     out: parley.stdio.Out = .{ .beginFn = begin, .endFn = end, .keepAliveFn = keepAlive },
 
-    fn begin(o: *parley.stdio.Out) parley.stdio.Out.Error!parley.stdio.WriteEnd {
+    fn begin(o: *parley.stdio.Out) parley.stdio.Out.Error!aegis.io.WriteEnd {
         const s: *Session = @alignCast(@fieldParentPtr("out", o));
         const w = s.response.writer(s.io) catch |err| return failed(err);
         s.event = sse.EventWriter.begin(w, &s.buffer, .{ .type = "message" }) catch return s.response.failure();
-        return .{ .interface = &s.event.interface, .causeFn = cause };
+        return .init(&s.event.interface, s, cause);
     }
 
     /// Why a write to the event failed: the response's.
-    fn cause(w: *const Io.Writer) parley.stdio.WriteEnd.Cause {
-        const event: *const sse.EventWriter = @alignCast(@fieldParentPtr("interface", w));
-        const s: *const Session = @alignCast(@fieldParentPtr("event", event));
+    fn cause(context: *const anyopaque) ?anyerror {
+        const s: *const Session = @ptrCast(@alignCast(context)); // safe: begin passes its Session
         return s.response.failure();
     }
 
