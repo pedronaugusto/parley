@@ -211,7 +211,12 @@ fn sessionStream(t: *Transport, io: Io) Io.Cancelable!void {
     if (response.status != .ok) return;
     const data = arena.alloc(u8, client.options.limits.message.raw()) catch return;
     var reader: uplink.wire.sse.Reader = .init(response.reader(io), data);
-    while (reader.next() catch return) |event| {
+    while (reader.next() catch |err| switch (err) {
+        // A read the task's cancel stopped returns it; any other failure
+        // is the stream's end.
+        error.ReadFailed => if (response.failure() == error.Canceled) return error.Canceled else return,
+        error.DataTooLong, error.FieldTooLong => return,
+    }) |event| {
         var turn: std.heap.ArenaAllocator = .init(t.gpa);
         defer turn.deinit();
         const a = turn.allocator();
@@ -219,7 +224,7 @@ fn sessionStream(t: *Transport, io: Io) Io.Cancelable!void {
         var replies: parley.Client.Replies = .init(a, event.data);
         for (elements) |element| switch (element.read) {
             .message => |message| switch (message) {
-                .request => |r| replies.add(client.serveRequest(io, a, r)) catch break,
+                .request => |r| replies.add(try client.serveRequest(io, a, r)) catch break,
                 else => {},
             },
             .refused => {},
@@ -348,7 +353,12 @@ fn events(t: *Transport, io: Io, arena: Allocator, exchange: *Client.Exchange, f
     while (true) {
         const data = try arena.alloc(u8, exchange.client.options.limits.message.raw());
         var reader: uplink.wire.sse.Reader = .init(response.reader(io), data);
-        while (reader.next() catch return error.Closed) |event| {
+        while (reader.next() catch |err| return switch (err) {
+            // A read the request's cancel stopped returns it; any other
+            // failure is the stream gone.
+            error.ReadFailed => if (response.failure() == error.Canceled) error.Canceled else error.Closed,
+            error.DataTooLong, error.FieldTooLong => error.Closed,
+        }) |event| {
             if (event.id.len != 0) last_id = try arena.dupe(u8, event.id);
             if (event.retry) |r| retry = r;
             if (event.data.len == 0) continue;
@@ -365,7 +375,7 @@ fn events(t: *Transport, io: Io, arena: Allocator, exchange: *Client.Exchange, f
                     .failure => |f| if (f.id) |id| if (id.eql(exchange.id)) {
                         found = element.bytes;
                     },
-                    .request => try replies.add(exchange.inbound(io, arena, message)),
+                    .request => try replies.add(try exchange.inbound(io, arena, message)),
                     .notification => {},
                 },
                 .refused => {},

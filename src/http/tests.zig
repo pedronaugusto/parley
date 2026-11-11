@@ -396,6 +396,95 @@ test "a client that closes its stream stops the call: the handler is canceled" {
     try Stall.until(&Stall.canceled);
 }
 
+/// A tool whose answer becomes an event stream at once (a log line before
+/// its result), then runs until it is stopped.
+const StallStreaming = struct {
+    var started: std.atomic.Value(bool) = .init(false);
+
+    fn handle(call: *Call) Call.Error!parley.ToolResult {
+        call.sink.send(call.io, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"level\":\"info\",\"data\":\"waiting\"}}") catch return error.Canceled;
+        started.store(true, .release);
+        try call.io.sleep(.fromSeconds(60), .awake);
+        return .ofText("woke");
+    }
+};
+
+fn callStallStreaming(client: *parley.Client, io: Io) parley.Client.CallError!void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    _ = try client.callTool(io, arena.allocator(), "stall_streaming", .{}, null);
+}
+
+test "a call canceled while its answer's event stream is read comes back Canceled" {
+    const io = testing.io;
+    var h: Harness = undefined;
+    try h.start(io);
+    defer h.stop(io);
+    try h.core.addTool(io, .{ .name = "stall_streaming" }, StallStreaming.handle);
+    var url_buffer: [64]u8 = undefined;
+    const url = try std.mem.print(&url_buffer, "http://127.0.0.1:{d}/mcp", .{h.port});
+    var remote: Transport = .init(testing.allocator, &h.client, url, .{});
+    defer remote.deinit();
+    defer remote.close(io);
+    var client: parley.Client = .init(testing.allocator, remote.transport(), .{
+        .info = .{ .name = "c", .version = "1" },
+        .revisions = &.{.@"2026-07-28"},
+    });
+    defer client.deinit();
+    try client.connect(io);
+    StallStreaming.started.store(false, .release);
+    var calling = try io.concurrent(callStallStreaming, .{ &client, io });
+    try Stall.until(&StallStreaming.started);
+    // The log line is on its way: the client reads the stream for the
+    // answer when the cancel lands.
+    try io.sleep(.fromMilliseconds(200), .awake);
+    try testing.expectError(error.Canceled, calling.cancel(io));
+}
+
+fn cancelServing(serving: *Io.Future(void), io: Io) void {
+    serving.cancel(io);
+}
+
+test "a request whose connection's task is canceled while its handler runs is not answered, and its connection ends" {
+    const io = testing.io;
+    var h: Harness = undefined;
+    try h.start(io);
+    defer h.stop(io);
+    Stall.started.store(false, .release);
+    // A connection of the test's own, served on a task the test cancels.
+    var listener = try (try Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const raw = try listener.socket.address.connect(io, .{ .mode = .stream });
+    defer raw.close(io);
+    const accepted = try listener.accept(io);
+    var serving = try io.concurrent(uplink.Server.serveConnection, .{ &h.http, io, accepted });
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"stall\"," ++ meta ++ "}}";
+    var write_buffer: [1024]u8 = undefined;
+    var w = raw.writer(io, &write_buffer);
+    try w.interface.print("POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\n" ++
+        "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: stall\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
+    try w.interface.flush();
+    try Stall.until(&Stall.started);
+    var canceling = try io.concurrent(cancelServing, .{ &serving, io });
+    defer canceling.await(io);
+    // What comes back before the connection ends: nothing, where a handler
+    // that took the cancel for an answer had its response ended as a 200.
+    var read_buffer: [1024]u8 = undefined;
+    var r = raw.reader(io, &read_buffer);
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(testing.allocator);
+    var piece: [256]u8 = undefined;
+    while (std.mem.find(u8, got.items, "\r\n\r\n") == null) {
+        const n = r.interface.readSliceShort(&piece) catch break;
+        if (n == 0) break;
+        try got.appendSlice(testing.allocator, piece[0..n]);
+    }
+    // The connection ends either way, so the canceled task returns.
+    // glint-ignore: Z026 -- a socket the server closed first has nothing left to shut down
+    raw.shutdown(io, .both) catch {};
+    try testing.expectEqualStrings("", got.items);
+}
+
 /// Opens a session at `version` and returns its id.
 fn openSession(h: *Harness, io: Io, arena: std.mem.Allocator, version: []const u8) ![]const u8 {
     var url_buffer: [64]u8 = undefined;

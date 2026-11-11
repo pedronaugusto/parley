@@ -193,9 +193,15 @@ fn open(e: *SseEndpoint, io: Io, request: *Request, response: *Response) anyerro
     // quiet one is kept open with a comment.
     const keep_alive = e.options.keep_alive.toIoDuration();
     while (true) {
-        const left = request.gone(io, .{ .duration = .{ .raw = keep_alive, .clock = .awake } }) catch break;
+        const left = request.gone(io, .{ .duration = .{ .raw = keep_alive, .clock = .awake } }) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.BodyUnread => break,
+        };
         if (left) break;
-        session.connection.keepAlive() catch break;
+        session.connection.keepAlive() catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.WriteFailed => break,
+        };
     }
 }
 
@@ -220,16 +226,15 @@ fn post(e: *SseEndpoint, io: Io, arena: Allocator, request: *Request, response: 
             return;
         }
     }
-    session.opened.wait(io) catch {
+    session.opened.wait(io) catch |err| {
         e.gpa.free(body);
-        return;
+        return err;
     };
     session.connection.take(body) catch |err| switch (err) {
         error.Ended => return refuse(io, response, .not_found, null, .invalid_request, "Session not found: its stream has ended"),
         // The stream broke: the session ends with its GET.
         error.WriteFailed, error.ReadFailed => return refuse(io, response, .not_found, null, .invalid_request, "Session not found: its stream has ended"),
-        error.Canceled => return,
-        error.OutOfMemory, error.ConcurrencyUnavailable => |x| return x,
+        error.Canceled, error.OutOfMemory, error.ConcurrencyUnavailable => |x| return x,
     };
     response.status = .accepted;
     return response.end(io);

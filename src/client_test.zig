@@ -98,6 +98,57 @@ test "a 2026-07-28 server: discovered, listed, called, input given across rounds
     wiring.to_server.close();
 }
 
+var asked_slowly: std.atomic.Value(bool) = .init(false);
+
+/// Takes its time over the answer, until the call asking is canceled.
+fn answerSlowly(_: *Client.Handlers, io: Io, _: std.mem.Allocator, _: []const u8) Client.HandlerError!parley.types.ElicitResult {
+    asked_slowly.store(true, .release);
+    try io.sleep(.fromSeconds(2), .awake);
+    return .{ .action = .accept, .content = .{ .bytes = "{\"name\":\"ada\"}" } };
+}
+
+fn callGreet(client: *Client, io: Io) Client.CallError!void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    _ = try client.callTool(io, arena.allocator(), "greet", .{}, null);
+}
+
+test "a call canceled while the application answers the server's input comes back Canceled" {
+    const io = testing.io;
+    var server = try parley.Server.init(testing.allocator, io, .{ .info = .{ .name = "s", .version = "1" } });
+    defer server.deinit();
+    try server.addTool(io, .{ .name = "greet" }, greet);
+
+    var wiring: Wiring = .{ .to_server = undefined, .from_server = undefined };
+    wiring.init(io);
+    var task = try io.concurrent(serveTask, .{ io, &server, &wiring.to_server, &wiring.from_server });
+    defer task.cancel(io);
+
+    var writer_buffer: [4096]u8 = undefined;
+    var out = PipeWriter.init(&wiring.to_server, &writer_buffer);
+    var channel: stdio.Channel = .init(testing.allocator, &wiring.from_server.reader, &out.writer);
+    var answers: Client.Handlers = .{ .elicit = answerSlowly };
+    var client: Client = .init(testing.allocator, channel.transport(), .{
+        .info = .{ .name = "c", .version = "1" },
+        .handlers = &answers,
+        .max_rounds = 1,
+    });
+    defer client.deinit();
+    try channel.start(io, &client);
+    defer channel.deinit(io);
+    try client.connect(io);
+
+    asked_slowly.store(false, .release);
+    var calling = try io.concurrent(callGreet, .{ &client, io });
+    var waited: u32 = 0;
+    while (!asked_slowly.load(.acquire) and waited < 1000) : (waited += 1) try io.sleep(.fromMilliseconds(10), .awake);
+    try testing.expect(asked_slowly.load(.acquire));
+    // The handler sees the cancel; the call ends with it, where it would
+    // send the server an answer saying so and go on.
+    try testing.expectError(error.Canceled, calling.cancel(io));
+    wiring.to_server.close();
+}
+
 /// Runs as a task and asks who is there, as the task's input.
 fn knock(call: *Call) Call.Error!parley.ToolResult {
     _ = try call.runAsTask();

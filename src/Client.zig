@@ -162,7 +162,8 @@ pub const Exchange = struct {
     status: u16 = 0,
 
     /// A message that arrived for the request before its answer.
-    pub fn inbound(x: *Exchange, io: Io, arena: Allocator, message: wire.Message) Answer {
+    /// `Canceled`: the application's handler was, and nothing answers it.
+    pub fn inbound(x: *Exchange, io: Io, arena: Allocator, message: wire.Message) Io.Cancelable!Answer {
         return switch (message) {
             .request => |r| x.client.serveRequest(io, arena, r),
             else => .none,
@@ -383,8 +384,9 @@ fn writeWithMeta(c: *const Client, w: *Writer, params: []const u8) Writer.Error!
     try w.writeByte('}');
 }
 
-/// A server's request in a session, answered by the application.
-pub fn serveRequest(c: *Client, io: Io, arena: Allocator, request: wire.Request) Answer {
+/// A server's request in a session, answered by the application. A handler
+/// canceled is `Canceled`, the caller's to return: nothing answers it.
+pub fn serveRequest(c: *Client, io: Io, arena: Allocator, request: wire.Request) Io.Cancelable!Answer {
     const params = request.params orelse "{}";
     var out: Writer.Allocating = .init(arena);
     const result: (HandlerError || error{ MethodNotFound, WriteFailed })![]const u8 = blk: {
@@ -411,6 +413,7 @@ pub fn serveRequest(c: *Client, io: Io, arena: Allocator, request: wire.Request)
     if (result) |bytes| {
         wire.writeResult(&out.writer, request.id, bytes) catch return .none;
     } else |err| {
+        if (err == error.Canceled) return error.Canceled;
         const code: wire.Code = if (err == error.MethodNotFound) .method_not_found else .internal_error;
         wire.writeFailure(&out.writer, request.id, code, if (err == error.Refused) "the user declined" else @errorName(err), null) catch return .none;
     }
@@ -575,7 +578,7 @@ fn inputResponses(c: *Client, io: Io, arena: Allocator, object: []const u8, give
         const r = strand.json.parseLeaky(Request, arena, m.value, types.readOptions(c.jsonLimits())) catch return error.Protocol;
         const message = try arena.print("{{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"{s}\",\"params\":{s}}}", .{ r.method, r.params.bytes });
         const asked = wire.decode(arena, message, .{ .limits = c.jsonLimits() }) catch return error.Protocol;
-        const answer = c.serveRequest(io, arena, asked.request);
+        const answer = try c.serveRequest(io, arena, asked.request);
         const bytes = switch (answer) {
             .message => |b| b,
             .none => return error.Protocol,

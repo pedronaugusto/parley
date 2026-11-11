@@ -11,6 +11,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `http.Transport.Authorization`'s `credentials` takes the request's method and URL and returns `Credentials` (`authorization`, and a `dpop` proof), and its vtable gains `nonce`: what a DPoP-bound token needs per request.
 - Every interface is embedded: its owner holds it as a field and recovers itself with `@fieldParentPtr`, where a `context: *anyopaque` was cast back. The interface's functions take a pointer to it, an option or a call takes that pointer, and the owner gives it from an accessor (`Stream.sink`, `Channel.transport`, `http.Transport.transport`, `oauth.Authorizer.authorization`, `oauth.Guard.access`). So it goes for `Sink` (its `Target`), `stdio.Out`, `Client.Transport`, `Client.Handlers` (`Client.Options.handlers` is `?*Handlers`), `http.Transport.Authorization`, `http.Endpoint.Access` (`access: ?*Access`), `oauth.Guard.Needs`, `oauth.Authorizer.TokenSource` and `SignIn` (the options hold pointers), `Server.Filter`, `Server.Completer` (`setCompleter(*Completer)`), `Call.TaskHook`, and `ToolHandler`, `ReadHandler` and `PromptHandler` (`addDynamicTool`, `addResource`, `addTemplate` and `addDynamicPrompt` take a pointer the server keeps; `typedTool` and `typedPrompt` give one that lives as long as the program). Each function is named for what it does with `Fn` after it (`sendFn`, `checkFn`, `callFn`), and a method of the same name calls it.
 - The endpoints' uplink `Handler`s are embedded the same way, as uplink's `Server.init` takes `*Handler`.
+- `Client.serveRequest` and `Client.Exchange.inbound` return `std.Io.Cancelable!Answer`: a handler that was canceled is `error.Canceled`, for the transport to return, where it became a JSON-RPC error sent back to the server.
 
 ### Changed
 
@@ -19,6 +20,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - HTTP+SSE: a POST arriving while its stream's `endpoint` event was still being flushed answered on the stream at the same time as the GET's flush (a data race ThreadSanitizer found); a POST now waits until that event is written.
+- A cancel is returned as `error.Canceled` where it was taken for something else. A call canceled while the application answered the server's input sent the server an error and carried on to its next round; it now ends with the cancel, as does the stdio channel's reading and the HTTP transport's session stream. A call canceled while its answer's event stream was read came back `Closed`, and the session stream ended as if the server closed it. On the server side, `http.Endpoint` and `http.SseEndpoint` handlers whose task was canceled (a server stopping) returned as if done, so uplink ended the response as an empty 200 and kept reading the connection; they now return `error.Canceled`, and the connection ends unanswered.
 
 
 ### Added

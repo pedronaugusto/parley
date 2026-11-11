@@ -859,15 +859,19 @@ pub const Channel = struct {
                 break :blk false;
             } else |_| true;
             const bytes = std.mem.trimEnd(u8, line_buffer.written(), "\r");
-            if (bytes.len != 0) ch.handle(io, bytes);
+            if (bytes.len != 0) ch.handle(io, bytes) catch |err| switch (err) {
+                // `deinit` stops the reading.
+                error.Canceled => return,
+            };
             if (at_end) return;
         }
     }
 
     /// One frame from the server: a message, or a batch where the
     /// session's revision has them. The answers to its requests go back
-    /// together, as `Client.Replies` has them.
-    fn handle(ch: *Channel, io: Io, bytes: []const u8) void {
+    /// together, as `Client.Replies` has them. `Canceled`: the reading was,
+    /// while the application answered a request of the server's.
+    fn handle(ch: *Channel, io: Io, bytes: []const u8) Io.Cancelable!void {
         const client = ch.client.?;
         var arena: std.heap.ArenaAllocator = .init(ch.gpa);
         defer arena.deinit();
@@ -883,7 +887,7 @@ pub const Channel = struct {
                 // A session server's own request: answered by the client.
                 .request => {
                     var exchange: Client.Exchange = .{ .id = .{ .integer = 0 }, .method = "", .message = "", .revision = client.revision, .timeout = .zero, .client = client };
-                    replies.add(exchange.inbound(io, a, message)) catch return;
+                    replies.add(try exchange.inbound(io, a, message)) catch return;
                 },
                 .notification => {},
             },

@@ -195,9 +195,11 @@ fn handle(e: *Endpoint, io: Io, request: *Request, response: *Response) anyerror
     const principal = admitted.principal;
     var stream: Stream = .init(io, response);
     const reply = serveWatched(e, io, arena, request, req, principal, stream.sink(e)) catch |err| switch (err) {
-        // The client left, or the server is going away: nothing to answer.
-        error.Canceled => return,
-        error.OutOfMemory => return err,
+        // The client left: nothing to answer.
+        error.Left => return,
+        // The handler's task was canceled (the server is going away):
+        // nothing is answered, and the connection ends.
+        error.Canceled, error.OutOfMemory => |x| return x,
     };
     return e.answer(io, arena, response, &stream, req.id, reply);
 }
@@ -209,10 +211,10 @@ const Watched = union(enum) {
 
 /// Serves `req` on a task of its own beside a wait for the client to
 /// leave: a client that closes its stream (the 2026-07-28 revision's
-/// cancellation over HTTP) stops the handler, which sees `error.Canceled`.
-/// A stream the request opened (`subscriptions/listen`) is ended instead,
-/// and returns on its own.
-fn serveWatched(e: *Endpoint, io: Io, arena: Allocator, request: *Request, req: wire.Request, principal: ?[]const u8, given: parley.Sink) parley.Server.HandleError!parley.Server.Reply {
+/// cancellation over HTTP) stops the handler, which sees `error.Canceled`,
+/// and is `Left`. A stream the request opened (`subscriptions/listen`) is
+/// ended instead, and returns on its own.
+fn serveWatched(e: *Endpoint, io: Io, arena: Allocator, request: *Request, req: wire.Request, principal: ?[]const u8, given: parley.Sink) (parley.Server.HandleError || error{Left})!parley.Server.Reply {
     var end: parley.Sink.End = .{};
     var sink = given;
     sink.end = &end;
@@ -234,7 +236,7 @@ fn serveWatched(e: *Endpoint, io: Io, arena: Allocator, request: *Request, req: 
             if (!(left catch false)) continue;
             // The client left: a stream is ended, and its answer awaited;
             // any other handler is stopped as the select ends.
-            if (!std.mem.eql(u8, req.method, "subscriptions/listen")) return error.Canceled;
+            if (!std.mem.eql(u8, req.method, "subscriptions/listen")) return error.Left;
             end.end(io);
         },
     };
@@ -367,10 +369,8 @@ fn serveSession(e: *Endpoint, io: Io, arena: Allocator, request: *Request, respo
                     return refuse(io, response, .bad_request, req.id, .invalid_request, "MCP-Protocol-Version is not the session's version");
             }
             var stream: Stream = .init(io, response);
-            const reply = session.handle(io, arena, req, stream.sink(e)) catch |err| switch (err) {
-                error.Canceled => return,
-                error.OutOfMemory => return err,
-            };
+            // Canceled: nothing is answered, and the connection ends.
+            const reply = try session.handle(io, arena, req, stream.sink(e));
             return e.answer(io, arena, response, &stream, req.id, reply);
         },
         .notification => |n| if (std.mem.eql(u8, n.method, "notifications/initialized")) {
@@ -510,7 +510,11 @@ fn openStream(e: *Endpoint, io: Io, response: *Response, session_id: ?[]const u8
     defer entry.streaming.store(.closed, .release);
     var stream: Stream = .init(io, response);
     // The head goes now: the client learns the stream is open.
-    stream.keepAlive(io) catch return;
+    stream.keepAlive(io) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        // The client is gone already, or the stream cannot be begun.
+        error.Closed, error.OutOfMemory => return,
+    };
     // glint-ignore: Z026 -- the stream was the answer; a client gone before its end needs no more
     defer response.end(io) catch {};
     // The stream ends when its client leaves or the server closes; a cancel or a lack of memory is the caller's.
