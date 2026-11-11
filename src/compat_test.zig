@@ -56,7 +56,7 @@ test "Codex 0.160.0's session, as it sent it: initialize 2025-06-18, list, call"
     var in: std.Io.Reader = .fixed(@embedFile("testing/captures/codex-0.160.0.jsonl"));
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try stdio.serve(testing.io, testing.allocator, &server, &in, &out.writer, .{});
+    try stdio.serve(testing.io, testing.allocator, &server, .uncaused(&in), .uncaused(&out.writer), .{});
     const lines = out.written();
     const init = answerTo(lines, "\"id\":0,").?;
     try expectContains(init, "\"protocolVersion\":\"2025-06-18\",\"capabilities\":{");
@@ -92,7 +92,7 @@ test "Claude Code 2.1.302's probe is answered modern, and it stays modern" {
     var in: std.Io.Reader = .fixed(modern.items);
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try stdio.serve(testing.io, testing.allocator, &server, &in, &out.writer, .{});
+    try stdio.serve(testing.io, testing.allocator, &server, .uncaused(&in), .uncaused(&out.writer), .{});
     const discovered = answerTo(out.written(), "server-discover-probe-1").?;
     try expectContains(discovered, "\"supportedVersions\":[\"2026-07-28\"");
 }
@@ -115,7 +115,7 @@ test "the session's own methods: ping, the log level, subscriptions; requests be
     var in: std.Io.Reader = .fixed(input);
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try stdio.serve(testing.io, testing.allocator, &server, &in, &out.writer, .{});
+    try stdio.serve(testing.io, testing.allocator, &server, .uncaused(&in), .uncaused(&out.writer), .{});
     const lines = out.written();
     try expectContains(answerTo(lines, "\"id\":1,").?, "-32602");
     try expectContains(answerTo(lines, "\"id\":3,").?, "\"result\":{}");
@@ -138,7 +138,7 @@ test "2025-03-26 and 2024-11-05 are answered as asked, and a later session's han
         var in: std.Io.Reader = .fixed(input.items);
         var out: std.Io.Writer.Allocating = .init(testing.allocator);
         defer out.deinit();
-        try stdio.serve(testing.io, testing.allocator, &server, &in, &out.writer, .{});
+        try stdio.serve(testing.io, testing.allocator, &server, .uncaused(&in), .uncaused(&out.writer), .{});
         const lines = out.written();
         var want: [64]u8 = undefined;
         try expectContains(answerTo(lines, "\"id\":1,").?, try std.mem.print(&want, "\"protocolVersion\":\"{s}\"", .{version}));
@@ -160,7 +160,7 @@ test "a 2025-03-26 session takes a batch: one array of its requests' answers, it
     var in: std.Io.Reader = .fixed(input);
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try stdio.serve(testing.io, testing.allocator, &server, &in, &out.writer, .{});
+    try stdio.serve(testing.io, testing.allocator, &server, .uncaused(&in), .uncaused(&out.writer), .{});
     var lines: std.ArrayList([]const u8) = .empty;
     defer lines.deinit(testing.allocator);
     var it = std.mem.splitScalar(u8, out.written(), '\n');
@@ -201,7 +201,7 @@ test "a batch is refused whole on a session whose revision removed them, and bef
     var in: std.Io.Reader = .fixed(input);
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try stdio.serve(testing.io, testing.allocator, &server, &in, &out.writer, .{});
+    try stdio.serve(testing.io, testing.allocator, &server, .uncaused(&in), .uncaused(&out.writer), .{});
     const lines = out.written();
     try testing.expectEqual(@as(usize, 3), std.mem.count(u8, lines, "\n"));
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, lines, "a batch is taken only on a session at 2025-03-26 or 2024-11-05"));
@@ -235,14 +235,14 @@ test "a session whose list changes have no task to go out on is refused, where i
     var in: std.Io.Reader = .fixed(input);
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try testing.expectError(error.ConcurrencyUnavailable, stdio.serve(serial.io(), testing.allocator, &server, &in, &out.writer, .{}));
+    try testing.expectError(error.ConcurrencyUnavailable, stdio.serve(serial.io(), testing.allocator, &server, .uncaused(&in), .uncaused(&out.writer), .{}));
     // The handshake itself was answered, inline: requests need no task.
     try expectContains(answerTo(out.written(), "\"id\":1,").?, "\"protocolVersion\":\"2025-11-25\"");
 }
 
 fn serveTask(io: std.Io, server: *parley.Server, in: *Pipe, out: *Pipe) void {
     // glint-ignore: Z026 -- the test reads what was written; how the serving ended is not what it checks
-    stdio.serve(io, testing.allocator, server, &in.reader, &out.writer, .{}) catch {};
+    stdio.serve(io, testing.allocator, server, .uncaused(&in.reader), .uncaused(&out.writer), .{}) catch {};
     out.close();
 }
 

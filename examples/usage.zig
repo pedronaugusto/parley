@@ -21,11 +21,16 @@ pub fn main(init: std.process.Init) !void {
 
 /// This program as a stdio server, which `overProcess` launches.
 fn serveStdio(io: Io, gpa: std.mem.Allocator, server: *parley.Server) !void {
+    // --- README:stdio ---
+    // A server a client launches: one message a line on stdin and stdout,
+    // both eras, until the client closes stdin. Each end is handed with
+    // what says why a read or write on it failed: a cancel is `Canceled`.
     var in_buffer: [64 * 1024]u8 = undefined;
     var out_buffer: [64 * 1024]u8 = undefined;
     var stdin = Io.File.stdin().readerStreaming(io, &in_buffer);
     var stdout = Io.File.stdout().writerStreaming(io, &out_buffer);
-    try parley.stdio.serve(io, gpa, server, &stdin.interface, &stdout.interface, .{});
+    try parley.stdio.serve(io, gpa, server, .file(&stdin), .file(&stdout), .{});
+    // --- README:stdio ---
 }
 
 fn overProcess(io: Io, gpa: std.mem.Allocator, self: []const u8) !void {
@@ -92,11 +97,8 @@ fn overStdio(io: Io, gpa: std.mem.Allocator, server: *parley.Server) !void {
     var in: Io.Reader = .fixed("{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{}}}\n");
     var out: Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    // --- README:stdio ---
-    // A server a client launches: one message a line on stdin and stdout,
-    // both eras, until the client closes stdin.
-    try parley.stdio.serve(io, gpa, server, &in, &out.writer, .{});
-    // --- README:stdio ---
+    // Ends that record no cause: every failure is the stream broken.
+    try parley.stdio.serve(io, gpa, server, .uncaused(&in), .uncaused(&out.writer), .{});
     std.debug.assert(std.mem.find(u8, out.written(), "\"protocolVersion\":\"2025-06-18\"") != null);
 }
 

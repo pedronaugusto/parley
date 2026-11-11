@@ -42,9 +42,10 @@ pub const ServeError = error{ ReadFailed, WriteFailed, Canceled, OutOfMemory, Co
 
 /// Serves `server` over `in` and `out` until `in` ends (the client closed
 /// it: the server's cue to exit) or the task is canceled. Requests still
-/// running then are canceled.
-pub fn serve(io: Io, gpa: Allocator, server: *Server, in: *Io.Reader, out: *Io.Writer, options: Options) ServeError!void {
-    var lines: Out.Lines = .{ .end = .uncaused(out) };
+/// running then are canceled. A read or write on either end that failed
+/// because the task was canceled is `Canceled`, as the end says.
+pub fn serve(io: Io, gpa: Allocator, server: *Server, in: ReadEnd, out: WriteEnd, options: Options) ServeError!void {
+    var lines: Out.Lines = .{ .end = out };
     var conn: Connection = .init(io, gpa, server, &lines.out, options);
     defer conn.deinit();
     while (true) {
@@ -297,18 +298,19 @@ pub const Connection = struct {
     /// The next line into `job`'s buffer, without its line break. The
     /// buffer is the job's own on `gpa`, not its arena: growing it frees what
     /// it outgrew, where an arena would keep every size it passed through.
-    fn readLine(c: *Connection, in: *Io.Reader, job: *Job) ServeError!Read {
+    fn readLine(c: *Connection, end: ReadEnd, job: *Job) ServeError!Read {
+        const in = end.interface;
         var line: Io.Writer.Allocating = .fromArrayList(c.gpa, &job.bytes);
         defer job.bytes = line.toArrayList();
         // A longer line is refused and passed over; the line break is
         // looked for one byte past it.
         const limit = @as(usize, c.server.options.limits.message.raw()) + 1;
         const n = in.streamDelimiterLimit(&line.writer, '\n', .limited(limit)) catch |err| switch (err) {
-            error.ReadFailed => return error.ReadFailed,
+            error.ReadFailed => return end.cause(),
             error.WriteFailed => return error.OutOfMemory,
             error.StreamTooLong => {
                 _ = in.discardDelimiterInclusive('\n') catch |e| switch (e) {
-                    error.ReadFailed => return error.ReadFailed,
+                    error.ReadFailed => return end.cause(),
                     error.EndOfStream => {},
                 };
                 return .too_long;
@@ -316,7 +318,7 @@ pub const Connection = struct {
         };
         const at_end = blk: {
             const next = in.peekByte() catch |err| switch (err) {
-                error.ReadFailed => return error.ReadFailed,
+                error.ReadFailed => return end.cause(),
                 error.EndOfStream => break :blk true,
             };
             aegis.assert.invariant(next == '\n', "a line stops at its break");
@@ -823,7 +825,7 @@ const Job = struct {
 /// each, the server's own requests (a session's) answered by the client.
 pub const Channel = struct {
     gpa: Allocator,
-    in: *Io.Reader,
+    in: ReadEnd,
     /// Private: where messages go, one at a time.
     writing: aegis.BlockingGuarded(Writing),
     /// Private: the requests waiting for their answers.
@@ -834,7 +836,7 @@ pub const Channel = struct {
     transporting: Client.Transport = .{ .vtable = &.{ .request = request, .notify = notify, .opened = opened } },
 
     const Writing = struct {
-        out: *Io.Writer,
+        out: WriteEnd,
         /// Set by `end`: nothing more is written.
         ended: bool = false,
     };
@@ -852,7 +854,7 @@ pub const Channel = struct {
         answer: ?[]u8 = null,
     };
 
-    pub fn init(gpa: Allocator, in: *Io.Reader, out: *Io.Writer) Channel {
+    pub fn init(gpa: Allocator, in: ReadEnd, out: WriteEnd) Channel {
         return .{ .gpa = gpa, .in = in, .writing = .init(.{ .out = out }) };
     }
 
@@ -926,14 +928,24 @@ pub const Channel = struct {
         return arena.dupe(u8, answer);
     }
 
-    fn write(ch: *Channel, io: Io, message: []const u8) Client.RequestError!void {
+    /// `Closed`: the channel was ended, or the server's input broke.
+    /// `Canceled`: the writing task was.
+    fn write(ch: *Channel, io: Io, message: []const u8) error{ Closed, Canceled }!void {
         var held = ch.writing.acquireUncancelable(io);
         defer held.deinit(io);
         const w = held.value();
         if (w.ended) return error.Closed;
-        w.out.writeAll(message) catch return error.Closed;
-        w.out.writeByte('\n') catch return error.Closed;
-        w.out.flush() catch return error.Closed;
+        const out = w.out.interface;
+        out.writeAll(message) catch return closed(w.out);
+        out.writeByte('\n') catch return closed(w.out);
+        out.flush() catch return closed(w.out);
+    }
+
+    fn closed(out: WriteEnd) error{ Closed, Canceled } {
+        return switch (out.cause()) {
+            error.Canceled => error.Canceled,
+            error.WriteFailed => error.Closed,
+        };
     }
 
     fn notify(t: *Client.Transport, io: Io, message: []const u8) Client.RequestError!void {
@@ -965,15 +977,15 @@ pub const Channel = struct {
         defer line_buffer.deinit();
         while (true) {
             line_buffer.clearRetainingCapacity();
-            _ = ch.in.streamDelimiterLimit(&line_buffer.writer, '\n', .limited(@as(usize, ch.client.?.options.limits.message.raw()) + 1)) catch |err| switch (err) {
+            _ = ch.in.interface.streamDelimiterLimit(&line_buffer.writer, '\n', .limited(@as(usize, ch.client.?.options.limits.message.raw()) + 1)) catch |err| switch (err) {
                 error.StreamTooLong => {
-                    _ = ch.in.discardDelimiterInclusive('\n') catch return;
+                    _ = ch.in.interface.discardDelimiterInclusive('\n') catch return;
                     continue;
                 },
                 else => return,
             };
-            const at_end = if (ch.in.peekByte()) |_| blk: {
-                ch.in.toss(1);
+            const at_end = if (ch.in.interface.peekByte()) |_| blk: {
+                ch.in.interface.toss(1);
                 break :blk false;
             } else |_| true;
             const bytes = std.mem.trimEnd(u8, line_buffer.written(), "\r");
@@ -988,7 +1000,8 @@ pub const Channel = struct {
     /// One frame from the server: a message, or a batch where the
     /// session's revision has them. The answers to its requests go back
     /// together, as `Client.Replies` has them. `Canceled`: the reading was,
-    /// while the application answered a request of the server's.
+    /// while the application answered a request of the server's, or while
+    /// the answers were written.
     fn handle(ch: *Channel, io: Io, bytes: []const u8) Io.Cancelable!void {
         const client = ch.client.?;
         var arena: std.heap.ArenaAllocator = .init(ch.gpa);
@@ -1011,7 +1024,11 @@ pub const Channel = struct {
             },
         };
         const answer = (replies.message() catch return) orelse return;
-        ch.write(io, answer) catch return;
+        ch.write(io, answer) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            // The server's input broke: its output's end is read next.
+            error.Closed => {},
+        };
     }
 
     /// An answer to a request of the client's: handed to the request that

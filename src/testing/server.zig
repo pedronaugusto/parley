@@ -123,6 +123,6 @@ fn serve(gpa: std.mem.Allocator, io: Io, arguments: Arguments) !void {
     try stderr.interface.writeAll("ready\n");
     try stderr.interface.flush();
     // The benchmarks echo a 64 MiB message.
-    try parley.stdio.serve(io, gpa, &server, &stdin.interface, &stdout.interface, .{});
+    try parley.stdio.serve(io, gpa, &server, .file(&stdin), .file(&stdout), .{});
     if (arguments.linger) try io.sleep(.fromSeconds(3600), .awake);
 }

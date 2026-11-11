@@ -46,7 +46,7 @@ const Wiring = struct {
 
 fn serveTask(io: Io, server: *parley.Server, in: *Pipe, out: *Pipe) void {
     // glint-ignore: Z026 -- the test reads what the client got; how the serving ended is not what it checks
-    stdio.serve(io, testing.allocator, server, &in.reader, &out.writer, .{}) catch {};
+    stdio.serve(io, testing.allocator, server, .uncaused(&in.reader), .uncaused(&out.writer), .{}) catch {};
     out.close();
 }
 
@@ -64,7 +64,7 @@ test "a 2026-07-28 server: discovered, listed, called, input given across rounds
 
     var writer_buffer: [4096]u8 = undefined;
     var out = PipeWriter.init(&wiring.to_server, &writer_buffer);
-    var channel: stdio.Channel = .init(testing.allocator, &wiring.from_server.reader, &out.writer);
+    var channel: stdio.Channel = .init(testing.allocator, .uncaused(&wiring.from_server.reader), .uncaused(&out.writer));
     var answers: Client.Handlers = .{ .elicit = answerName };
     var client: Client = .init(testing.allocator, channel.transport(), .{
         .info = .{ .name = "c", .version = "1" },
@@ -126,7 +126,7 @@ test "a call canceled while the application answers the server's input comes bac
 
     var writer_buffer: [4096]u8 = undefined;
     var out = PipeWriter.init(&wiring.to_server, &writer_buffer);
-    var channel: stdio.Channel = .init(testing.allocator, &wiring.from_server.reader, &out.writer);
+    var channel: stdio.Channel = .init(testing.allocator, .uncaused(&wiring.from_server.reader), .uncaused(&out.writer));
     var answers: Client.Handlers = .{ .elicit = answerSlowly };
     var client: Client = .init(testing.allocator, channel.transport(), .{
         .info = .{ .name = "c", .version = "1" },
@@ -177,7 +177,7 @@ test "a call the server runs as a task: polled, its input given, answered as if 
     defer task.cancel(io);
     var writer_buffer: [4096]u8 = undefined;
     var out = PipeWriter.init(&wiring.to_server, &writer_buffer);
-    var channel: stdio.Channel = .init(testing.allocator, &wiring.from_server.reader, &out.writer);
+    var channel: stdio.Channel = .init(testing.allocator, .uncaused(&wiring.from_server.reader), .uncaused(&out.writer));
     var answers: Client.Handlers = .{ .elicit = answerName };
     var client: Client = .init(testing.allocator, channel.transport(), .{
         .info = .{ .name = "c", .version = "1" },
@@ -255,7 +255,7 @@ test "a session server: discover not understood, so initialize, then requests wi
     defer task.cancel(io);
     var writer_buffer: [4096]u8 = undefined;
     var out = PipeWriter.init(&wiring.to_server, &writer_buffer);
-    var channel: stdio.Channel = .init(testing.allocator, &wiring.from_server.reader, &out.writer);
+    var channel: stdio.Channel = .init(testing.allocator, .uncaused(&wiring.from_server.reader), .uncaused(&out.writer));
     var client: Client = .init(testing.allocator, channel.transport(), .{ .info = .{ .name = "c", .version = "1" } });
     defer client.deinit();
     try channel.start(io, &client);
@@ -311,7 +311,7 @@ test "a 2024-11-05 server: its revision taken, a batch from it taken, its reques
     defer task.cancel(io);
     var writer_buffer: [4096]u8 = undefined;
     var out = PipeWriter.init(&wiring.to_server, &writer_buffer);
-    var channel: stdio.Channel = .init(testing.allocator, &wiring.from_server.reader, &out.writer);
+    var channel: stdio.Channel = .init(testing.allocator, .uncaused(&wiring.from_server.reader), .uncaused(&out.writer));
     var client: Client = .init(testing.allocator, channel.transport(), .{ .info = .{ .name = "c", .version = "1" } });
     defer client.deinit();
     try channel.start(io, &client);

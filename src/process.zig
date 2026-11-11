@@ -119,7 +119,7 @@ pub const Child = struct {
         // unreachable: both pipes were asked for, and spawn made them
         c.reader = c.process.stdoutReader(io, &c.read_buffer) orelse unreachable;
         c.writer = c.process.stdinWriter(io, &c.write_buffer) orelse unreachable;
-        c.channel = .init(gpa, &c.reader.interface, &c.writer.interface);
+        c.channel = .init(gpa, .file(&c.reader), .file(&c.writer));
         c.client = .init(gpa, c.channel.transport(), options.client);
         errdefer c.client.deinit();
         c.kept = switch (options.stderr) {
