@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-12
+
 ### Security
 
 - Pins uplink 0.8.8, which refuses a tab in a URL and percent-encodes a target's bytes past ASCII: before it, the MCP endpoint URL a caller passes, and the protected-resource and authorization-server metadata URLs a server names, could put a tab onto the request line uplink sent. See uplink's advisory. Nothing else changes.
@@ -150,7 +152,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `wire`: JSON-RPC 2.0 as MCP speaks it. `decode` reads a message's envelope and tells a request, a notification, a result and an error apart, leaving `params` and `result` as their bytes; a refusal names its code and, when it could be read, the id. `writeRequest`, `writeNotification`, `writeResult` (and `beginResult`/`endResult` around a result written in place) and `writeFailure`.
 - `Revision`: the protocol revisions parley speaks.
 
-[Unreleased]: https://github.com/pedronaugusto/parley/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/pedronaugusto/parley/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/pedronaugusto/parley/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/pedronaugusto/parley/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/pedronaugusto/parley/compare/v0.5.1...v0.7.0
 [0.5.1]: https://github.com/pedronaugusto/parley/compare/v0.5.0...v0.5.1
