@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- Pins uplink 0.8.8, which refuses a tab in a URL and percent-encodes a target's bytes past ASCII: before it, the MCP endpoint URL a caller passes, and the protected-resource and authorization-server metadata URLs a server names, could put a tab onto the request line uplink sent. See uplink's advisory. Nothing else changes.
+
 ## [0.8.0] - 2026-10-28
 
 ### Breaking

@@ -24,8 +24,8 @@
             .hash = "strand-0.11.1-8LNWVtZJJgDujColV9BwoK1duuRMWp4bfuV2Gc2iLTEI",
         },
         .uplink = .{
-            .url = "git+https://github.com/pedronaugusto/uplink?ref=v0.8.7#d225d809c81f03bceed13f2a3c701d323238ecba",
-            .hash = "uplink-0.8.7-0eVSJkcWFgAnxHgRJ1doYRx0XDWlfg6t8lKlMESTd9V9",
+            .url = "git+https://github.com/pedronaugusto/uplink?ref=v0.8.8#9089ce4993ad9b947629a970b19e5eea73d19a75",
+            .hash = "uplink-0.8.8-0eVSJrwpFgDyUqsykeB4v8e4pNmVl3RDCXX3nJjikQgc",
             .lazy = true,
         },
         .clearance = .{
