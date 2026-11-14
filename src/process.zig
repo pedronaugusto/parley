@@ -34,8 +34,8 @@ pub const Stderr = union(enum) {
     inherit,
     /// The null device.
     ignore,
-    /// A file the caller opened and keeps open until `spawn` returns.
-    file: Io.File,
+    /// A file the caller opened and keeps open until `spawn` returns, and closes.
+    file: aegis.own.Unowned(Io.File),
     /// Read on a task of the child's own; the latest bytes up to this many
     /// are kept, for `Child.stderrTail` (a server that failed to start says
     /// why there).
@@ -97,7 +97,7 @@ pub const Child = struct {
                 .stderr = switch (options.stderr) {
                     .inherit => .inherit,
                     .ignore => .ignore,
-                    .file => |f| .{ .file = f },
+                    .file => |f| .{ .file = f.get() },
                     .kept => .pipe,
                 },
             } },
@@ -193,6 +193,7 @@ pub const Child = struct {
         const file = c.process.stderrFile() orelse unreachable;
         var buffer: [4096]u8 = undefined;
         while (true) {
+            // glint-ignore: Z026 -- the server's stderr ends with the server; what it wrote is forwarded until then
             const n = file.readStreaming(io, &.{&buffer}) catch return;
             if (n == 0) return;
             k.append(io, buffer[0..n]);
@@ -201,7 +202,7 @@ pub const Child = struct {
 };
 
 /// The latest bytes of a stream, up to a limit: a ring.
-const Kept = struct {
+pub const Kept = struct {
     ring: aegis.BlockingGuarded(Ring),
     task: ?Io.Future(void) = null,
 

@@ -201,7 +201,9 @@ fn sessionStream(t: *Transport, io: Io) Io.Cancelable!void {
     fields.appendSlice(arena, &.{
         .{ .name = "Accept", .value = "text/event-stream" },
         .{ .name = headers.protocol_version, .value = client.revision.text() },
+        // glint-ignore: Z026 -- with no memory for its headers the session stream is not opened; requests still go by POST
     }) catch return;
+    // glint-ignore: Z026 -- with no memory for its headers the session stream is not opened; requests still go by POST
     if (t.session) |id| fields.append(arena, .{ .name = headers.session_id, .value = id }) catch return;
     var response = t.send(io, arena, .{ .method = .GET, .url = t.url, .headers = fields.items }) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
@@ -209,6 +211,7 @@ fn sessionStream(t: *Transport, io: Io) Io.Cancelable!void {
     };
     defer response.deinit(io);
     if (response.status != .ok) return;
+    // glint-ignore: Z026 -- with no memory for its buffer the session stream is not read; requests still go by POST
     const data = arena.alloc(u8, client.options.limits.message.raw()) catch return;
     var reader: uplink.wire.sse.Reader = .init(response.reader(io), data);
     while (reader.next() catch |err| switch (err) {
@@ -220,15 +223,18 @@ fn sessionStream(t: *Transport, io: Io) Io.Cancelable!void {
         var turn: std.heap.ArenaAllocator = .init(t.gpa);
         defer turn.deinit();
         const a = turn.allocator();
+        // glint-ignore: Z026 -- an event that is no message is passed over; the stream's next is read
         const elements = wire.decodeFrame(a, event.data, client.revision.batches(), .{ .limits = client.jsonLimits() }) catch continue;
         var replies: parley.Client.Replies = .init(a, event.data);
         for (elements) |element| switch (element.read) {
             .message => |message| switch (message) {
+                // glint-ignore: Z026 -- with no memory for more answers, the event's others go unanswered and time out at the server
                 .request => |r| replies.add(try client.serveRequest(io, a, r)) catch break,
                 else => {},
             },
             .refused => {},
         };
+        // glint-ignore: Z026 -- answers that cannot be written for want of memory go unanswered and time out at the server
         const answer = (replies.message() catch continue) orelse continue;
         t.postAnswer(io, a, client.revision, answer) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
@@ -251,6 +257,7 @@ pub fn listed(t: *Transport, io: Io, limits: strand.core.Limits, arena: Allocato
     const known = guard.value();
     for (l.tools) |tool| {
         const Tool = struct { name: []const u8, inputSchema: strand.json.Raw = .{ .bytes = "{}" } };
+        // glint-ignore: Z026 -- a tool entry that does not read is left out of the list, as the list's others are kept
         const parsed = strand.json.parseLeaky(Tool, arena, tool.bytes, parley.types.readOptions(limits)) catch continue;
         const marks = parley.registry.headerParams(t.gpa, parsed.inputSchema.bytes, limits) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -362,6 +369,7 @@ fn events(t: *Transport, io: Io, arena: Allocator, exchange: *Client.Exchange, f
             if (event.id.len != 0) last_id = try arena.dupe(u8, event.id);
             if (event.retry) |r| retry = r;
             if (event.data.len == 0) continue;
+            // glint-ignore: Z026 -- an event that is no message is passed over; the stream's next is read
             const elements = wire.decodeFrame(arena, event.data, exchange.revision.batches(), .{ .limits = exchange.client.jsonLimits() }) catch continue;
             // The event's requests are answered before the answer it may
             // carry is taken: a batch's are answered together.
@@ -448,6 +456,7 @@ fn mirror(t: *Transport, io: Io, arena: Allocator, exchange: *const Client.Excha
         for (p.path) |step| value = member(value, step, limits) orelse break else {
             if (std.mem.eql(u8, value, "null")) continue;
             const text = switch (p.kind) {
+                // glint-ignore: Z026 -- a marked argument that is no string sends no header; the call goes without it
                 .string => strand.json.parseLeaky([]const u8, arena, value, .{ .limits = limits }) catch continue,
                 .integer, .boolean => value,
             };

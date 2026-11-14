@@ -464,7 +464,7 @@ pub const Content = struct {
     /// The bytes it is.
     len: usize = 0,
 
-    const Of = union(enum) {
+    pub const Of = union(enum) {
         /// With the server's identity when `identify`.
         tool: struct { result: registry.ToolResult, identify: bool },
         /// Under the read's caching hint, private when a filter decides.
@@ -1000,6 +1000,12 @@ fn missingTasks() Reply {
 /// Who holds a round: the round itself, and the call waiting on it.
 const Holders = aegis.units.Count(enum { holders }, u8);
 
+/// What the call waiting on a round is told: its task now runs the round, or the handler's outcome.
+const Decided = union(enum) {
+    detached,
+    done: Call.Error!registry.ToolResult,
+};
+
 const Run = struct {
     server: *Server,
     task: *tasks.Task,
@@ -1013,10 +1019,8 @@ const Run = struct {
     /// Whether the handler may run as a task: not when the round runs on
     /// the call's own task (no task was free).
     may_detach: bool = true,
-    /// Set when the waiting call has its answer: the task, or the outcome.
-    decided: Io.Event = .unset,
-    /// The handler's outcome, for the waiting call.
-    outcome: ?(Call.Error!registry.ToolResult) = null,
+    /// Set once the waiting call has its answer: the task, or the handler's outcome.
+    decided: aegis.Signal(Decided) = .{},
     /// Who holds the round: the round itself, and the call waiting on it.
     /// The last to let go frees it.
     holders: aegis.Atomic(Holders),
@@ -1105,34 +1109,35 @@ fn callAsTask(s: *Server, io: Io, arena: Allocator, request: wire.Request, conte
             return err;
         };
     };
-    run.decided.wait(io) catch {
+    const decided = run.decided.wait(io) catch {
         // The call was canceled: its handler stops, unless it runs as a
         // task already.
         const attached = attached: {
             var held = table.lock();
             defer held.deinit(table.io);
-            if (run.attached) task.cancel.set(table.io);
+            if (run.attached) task.stop(table.io);
             break :attached run.attached;
         };
         if (attached) {
-            run.decided.waitUncancelable(io);
+            _ = run.decided.waitUncancelable(io);
             table.destroy(task);
         }
         return error.Canceled;
     };
-    {
-        var held = table.lock();
-        defer held.deinit(table.io);
-        if (!run.attached) {
+    const answered = switch (decided.*) {
+        .done => |done| done,
+        .detached => {
+            var held = table.lock();
+            defer held.deinit(table.io);
             var out: Writer.Allocating = .init(arena);
             tasks.write(&out.writer, task, .created, table.options.ttl, table.options.poll_interval, s.identityMembers()) catch return error.OutOfMemory;
             return .{ .result = .{ .json = out.written() } };
-        }
-    }
+        },
+    };
     // Answered as asked: the reply is written on the call's arena before the
     // round's goes.
     defer table.destroy(task);
-    const reply = try s.answerTool(io, arena, &run.call, run.outcome.?, request.method, name, context.revision);
+    const reply = try s.answerTool(io, arena, &run.call, answered, request.method, name, context.revision);
     return switch (reply) {
         .input_required => |ir| .{ .result = .{ .json = try s.inputRequiredJson(arena, ir) } },
         // Made whole: what the handler returned is on the round's arena.
@@ -1158,14 +1163,16 @@ fn become(hook: *Call.TaskHook) Call.Error!bool {
         var held = table.lock();
         defer held.deinit(table.io);
         // A call canceled while it waited takes its task with it.
-        if (run.task.cancel.isSet()) return error.Canceled;
+        if (run.task.stopping()) return error.Canceled;
         if (!try table.hold(held.value(), run.task, tasks.now(table.io))) return false;
         run.task.running = true;
         run.attached = false;
     }
     // From here the request is answered: nothing more goes on its stream.
     run.call.sink = .none;
-    run.decided.set(table.io);
+    // One side decides: the round's end only while the call is attached, and here only once this
+    // detached it, both under the table's lock.
+    run.decided.set(table.io, .detached) catch unreachable; // glint-ignore: Z026 -- decided once, here or at the round's end
     return true;
 }
 
@@ -1200,7 +1207,7 @@ fn answerRound(run: *Run, stopped: *bool) Call.Error!registry.ToolResult {
         // that `tasks/cancel` did not ask for is this task's.
         const result = callHandler(run);
         if (result) |_| {} else |err| {
-            if (err == error.Canceled and !run.task.cancel.isSet()) stopped.* = true;
+            if (err == error.Canceled and !run.task.stopping()) stopped.* = true;
         }
         return result;
     };
@@ -1225,8 +1232,8 @@ fn callHandler(run: *Run) Call.Error!registry.ToolResult {
     return run.handler.call(&run.call, run.arguments);
 }
 
-fn waitCancel(event: *Io.Event, io: Io) Io.Cancelable!void {
-    try event.wait(io);
+fn waitCancel(cancel: *const aegis.Signal(void), io: Io) Io.Cancelable!void {
+    _ = try cancel.wait(io);
 }
 
 /// What came of a round: the waiting call's answer, or the task's next
@@ -1240,10 +1247,7 @@ fn recordRound(s: *Server, run: *Run, returned: Call.Error!registry.ToolResult) 
     const next: ?Next = recorded: {
         var held = table.lock();
         defer held.deinit(io);
-        if (run.attached) {
-            run.outcome = returned;
-            break :recorded null;
-        }
+        if (run.attached) break :recorded null;
         const again = s.recordOutcome(table, held.value(), run, returned) catch blk: {
             // glint-ignore: Z026 -- out of memory while recording: the task fails with what fits, or stays as it was
             table.fail(held.value(), task, tasks.now(io), "{\"code\":-32603,\"message\":\"out of memory\"}", "out of memory") catch {};
@@ -1255,7 +1259,7 @@ fn recordRound(s: *Server, run: *Run, returned: Call.Error!registry.ToolResult) 
     };
     // Attached: the waiting call answers with the outcome.
     const n = next orelse {
-        run.decided.set(io);
+        run.decided.set(io, .{ .done = returned }) catch unreachable; // glint-ignore: Z026 -- decided once: attached, the round's end decides, never `become`
         run.release();
         return;
     };
@@ -1284,7 +1288,7 @@ fn recordOutcome(s: *Server, table: *tasks.Table, h: *tasks.Table.Held, run: *Ru
         },
         error.InputRequired => {
             const call = &run.call;
-            if (task.cancel.isSet()) {
+            if (task.stopping()) {
                 try table.cancelled(h, task, at, "The task was cancelled");
                 return false;
             }
@@ -1411,7 +1415,7 @@ fn taskRequest(s: *Server, io: Io, arena: Allocator, request: wire.Request, cont
             .cancel => if (!task.lifecycle.isTerminal()) {
                 if (task.running) {
                     // The round sees it and ends the task cancelled.
-                    task.cancel.set(table.io);
+                    task.stop(table.io);
                 } else {
                     try table.cancelled(h, task, tasks.now(io), "The task was cancelled");
                     changed = true;

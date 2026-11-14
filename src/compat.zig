@@ -178,15 +178,16 @@ pub const Session = struct {
         };
         var guard = s.held.acquireUncancelable(io);
         defer guard.deinit(io);
-        for (guard.value().outgoing.items) |o| if (o.id == n and !o.done) {
-            o.outcome = switch (outcome) {
+        for (guard.value().outgoing.items) |o| if (o.id == n and o.answer.get() == null) {
+            const answer: Outcome = switch (outcome) {
                 // Copied on the session's allocator: the asking task owns its
                 // arena, and is waiting.
+                // glint-ignore: Z026 -- an answer that cannot be copied for want of memory leaves its request unanswered, which times out
                 .result => |bytes| .{ .result = s.gpa.dupe(u8, bytes) catch return },
                 .failure => .{ .failure = "" },
             };
-            o.done = true;
-            o.event.set(io);
+            // Under the session's lock, the one place it is set: unset here.
+            o.answer.set(io, answer) catch unreachable; // glint-ignore: Z026 -- checked unset above, under the same lock
             return;
         };
     }
@@ -328,11 +329,11 @@ pub const Session = struct {
         const w = &out.writer;
         w.writeByte('{') catch return error.OutOfMemory;
         for (requests, pending.items, 0..) |r, o, i| {
-            o.event.waitTimeout(io, .{ .duration = .{ .raw = s.options.input_timeout.toIoDuration(), .clock = .awake } }) catch |err| switch (err) {
+            const got = o.answer.waitTimeout(io, .{ .duration = .{ .raw = s.options.input_timeout.toIoDuration(), .clock = .awake } }) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 error.Timeout => return error.Refused,
             };
-            const answer = switch (o.outcome) {
+            const answer = switch (got.*) {
                 .result => |bytes| bytes,
                 .failure => return error.Refused,
             };
@@ -348,10 +349,10 @@ pub const Session = struct {
     fn retire(s: *Session, io: Io, o: *Outgoing) void {
         var guard = s.held.acquireUncancelable(io);
         defer guard.deinit(io);
-        switch (o.outcome) {
+        if (o.answer.get()) |answer| switch (answer.*) {
             .result => |bytes| s.gpa.free(bytes),
             .failure => {},
-        }
+        };
         const outgoing = &guard.value().outgoing;
         for (outgoing.items, 0..) |x, i| if (x == o) {
             _ = outgoing.swapRemove(i);
@@ -365,9 +366,8 @@ const Outcome = union(enum) { result: []const u8, failure: []const u8 };
 /// A request of the server's, waiting for the client's answer.
 const Outgoing = struct {
     id: u64,
-    event: Io.Event = .unset,
-    done: bool = false,
-    outcome: Outcome = .{ .failure = "" },
+    /// The client's answer, once it comes.
+    answer: aegis.Signal(Outcome) = .{},
 };
 
 /// A request's params as the session sends them: what was asked, without
