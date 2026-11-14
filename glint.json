@@ -1,0 +1,11 @@
+{
+  "seams": [
+    {
+      "file": "src/process.zig",
+      "rules": [
+        "A009"
+      ],
+      "reason": "a stdio server's standard error: what the server writes there is kept as it is, its latest bytes, for Child.stderrTail and the caller's log, and never parsed"
+    }
+  ]
+}
