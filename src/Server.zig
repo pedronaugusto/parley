@@ -446,7 +446,7 @@ pub const Body = union(enum) {
             .content => |c| {
                 const out = try arena.alloc(u8, c.len);
                 var w: Writer = .fixed(out);
-                c.write(&w) catch unreachable; // unreachable: counted to fit exactly
+                c.write(&w) catch unreachable; // glint-ignore: Z026 -- counted to fit exactly
                 return out;
             },
         };
@@ -840,7 +840,7 @@ fn listPage(s: *Server, io: Io, arena: Allocator, comptime which: List, params: 
     r.w().writeByte(']') catch return error.OutOfMemory;
     if (i < items.len) {
         var buffer: [32]u8 = undefined;
-        try r.field("nextCursor", std.mem.print(&buffer, "{d}.{d}", .{ generation, i }) catch unreachable); // unreachable: two integers fit 32 bytes
+        try r.field("nextCursor", std.mem.print(&buffer, "{d}.{d}", .{ generation, i }) catch unreachable); // glint-ignore: Z026 -- two integers fit 32 bytes
     }
     try r.end(s, hint, s.options.filter != null);
     return .{ .result = try r.body() };

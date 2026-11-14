@@ -121,7 +121,7 @@ test "a tool's answer past the limit is refused, and nothing of it is written" {
 }
 
 fn serveTask(io: std.Io, server: *parley.Server, in: *Pipe, out: *Pipe) void {
-    // glint-ignore: Z026 -- the test reads what was written; how the serving ended is not what it checks
+    // the test reads what was written; how the serving ended is not what it checks
     stdio.serve(io, testing.allocator, server, .causeless(&in.reader), .causeless(&out.writer), .{}) catch {};
     out.close();
 }
@@ -308,7 +308,7 @@ fn takeWhileHeld(conn: *stdio.Connection, holding: *Holding, message: []const u8
     var keeping = try testing.io.concurrent(keepAlive, .{conn});
     defer {
         holding.let_go.set(testing.io);
-        // glint-ignore: Z026 -- the holder only holds; how it ends is not what the test checks
+        // the holder only holds; how it ends is not what the test checks
         keeping.await(testing.io) catch {};
     }
     var waited: u32 = 0;

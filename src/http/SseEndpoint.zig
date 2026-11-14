@@ -69,7 +69,7 @@ pub fn init(gpa: Allocator, server: *parley.Server, options: Options) SseEndpoin
 /// stream: no session is left.
 pub fn deinit(e: *SseEndpoint) void {
     const sessions = e.sessions.teardown();
-    std.debug.assert(sessions.items.len == 0);
+    aegis.assert.invariant(sessions.items.len == 0, "sessions.items.len == 0");
     sessions.deinit(e.gpa);
 }
 

@@ -89,7 +89,7 @@ const Harness = struct {
     fn stop(h: *Harness, io: Io) void {
         h.client.deinit(io);
         h.http.shutdown(io);
-        // glint-ignore: Z026 -- serve ends with the shutdown; its result is not what the test checks
+        // serve ends with the shutdown; its result is not what the test checks
         h.serving.await(io) catch {};
         h.http.deinit(io);
         h.endpoint.deinit();
@@ -336,7 +336,7 @@ test "a session's stream ends when the session is deleted" {
     opened.deinit(io);
     stream_open.store(false, .release);
     var streaming = try io.concurrent(readStream, .{ &h, io, url, session });
-    // glint-ignore: Z026 -- reached only when the test failed first; how the reader ends is not what it checks
+    // reached only when the test failed first; how the reader ends is not what it checks
     defer streaming.cancel(io) catch {};
     try Stall.until(&stream_open);
     var deleted = try h.client.send(io, .{ .method = .DELETE, .url = url, .headers = &.{
@@ -402,7 +402,7 @@ test "a client that closes its stream stops the call: the handler is canceled" {
     Stall.canceled.store(false, .release);
     var calling = try io.concurrent(postStall, .{ &h, io });
     try Stall.until(&Stall.started);
-    // glint-ignore: Z026 -- the client gives up; how its own call ends is not what the test checks
+    // the client gives up; how its own call ends is not what the test checks
     calling.cancel(io) catch {};
     try Stall.until(&Stall.canceled);
 }
@@ -491,7 +491,7 @@ test "a request whose connection's task is canceled while its handler runs is no
         try got.appendSlice(testing.allocator, piece[0..n]);
     }
     // The connection ends either way, so the canceled task returns.
-    // glint-ignore: Z026 -- a socket the server closed first has nothing left to shut down
+    // a socket the server closed first has nothing left to shut down
     raw.shutdown(io, .both) catch {};
     try testing.expectEqualStrings("", got.items);
 }
@@ -535,7 +535,7 @@ test "a batch whose request is answered on the connection's task, canceled there
         if (n == 0) break;
         try got.appendSlice(testing.allocator, piece[0..n]);
     }
-    // glint-ignore: Z026 -- a socket the server closed first has nothing left to shut down
+    // a socket the server closed first has nothing left to shut down
     raw.shutdown(io, .both) catch {};
     try testing.expectEqualStrings("", got.items);
 }

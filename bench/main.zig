@@ -146,7 +146,7 @@ const echo_params = "\"name\":\"echo\",\"arguments\":{\"text\":\"hello\"}";
 /// request or notification of the server's own.
 fn answers(line: []const u8, id: u64) bool {
     var buffer: [32]u8 = undefined;
-    const key = std.mem.print(&buffer, "\"id\":{d}", .{id}) catch unreachable; // unreachable: a u64 prints in 32 bytes
+    const key = std.mem.print(&buffer, "\"id\":{d}", .{id}) catch unreachable; // glint-ignore: Z026 -- a u64 prints in 32 bytes
     var at: usize = 0;
     while (std.mem.findPos(u8, line, at, key)) |found| {
         const after = found + key.len;
@@ -385,7 +385,7 @@ const Bench = struct {
         b.server = try parley.Server.init(b.gpa, b.io, .{ .info = .{ .name = "bench", .version = "0" } });
         var name_buffer: [16]u8 = undefined;
         for (0..100) |i| {
-            const name = std.mem.print(&name_buffer, "wide_{d}", .{i}) catch unreachable; // unreachable: the name fits
+            const name = std.mem.print(&name_buffer, "wide_{d}", .{i}) catch unreachable; // glint-ignore: Z026 -- the name fits
             try b.server.addTool(b.io, .{ .name = name, .description = "A tool with twenty arguments" }, wide);
         }
         try b.server.addTool(b.io, .{ .name = "echo" }, echo);
@@ -533,7 +533,7 @@ const Bench = struct {
         b.pending = b.next;
         b.next += 1;
         var params: [128]u8 = undefined;
-        const sleep_params = std.mem.print(&params, "\"name\":\"sleep\",\"arguments\":{{\"ms\":{d}}}", .{long_call_ms}) catch unreachable; // unreachable: it fits
+        const sleep_params = std.mem.print(&params, "\"name\":\"sleep\",\"arguments\":{{\"ms\":{d}}}", .{long_call_ms}) catch unreachable; // glint-ignore: Z026 -- it fits
         try b.process.?.send(try request(&b.line, era, b.pending, "tools/call", sleep_params));
         _ = switch (era) {
             .session => try b.askProcess(era, "ping", ""),
@@ -574,15 +574,15 @@ const Bench = struct {
 
     fn listen(b: *Bench) WorkloadError!void {
         // A port the system gave and took back, for the server to take.
-        var probe = (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(b.io, .{}) catch return error.ServerFailed; // unreachable: the address is literal
+        var probe = (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(b.io, .{}) catch return error.ServerFailed; // glint-ignore: Z026 -- the address is literal
         const port = probe.socket.address.getPort();
         probe.deinit(b.io);
         var port_text: [8]u8 = undefined;
-        b.url = std.mem.print(&b.url_buffer, "http://127.0.0.1:{d}/mcp", .{port}) catch unreachable; // unreachable: it fits
-        b.process = try Process.start(b.gpa, b.io, b.command, &.{ "--tools", listed_tools, "--port", std.mem.print(&port_text, "{d}", .{port}) catch unreachable }); // unreachable: a port fits
+        b.url = std.mem.print(&b.url_buffer, "http://127.0.0.1:{d}/mcp", .{port}) catch unreachable; // glint-ignore: Z026 -- it fits
+        b.process = try Process.start(b.gpa, b.io, b.command, &.{ "--tools", listed_tools, "--port", std.mem.print(&port_text, "{d}", .{port}) catch unreachable }); // glint-ignore: Z026 -- a port fits
         errdefer b.stopProcess();
         // Ready once it accepts a connection.
-        const address = Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable; // unreachable: the address is literal
+        const address = Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable; // glint-ignore: Z026 -- the address is literal
         for (0..1000) |_| {
             if (address.connect(b.io, .{ .mode = .stream })) |stream| {
                 stream.close(b.io);

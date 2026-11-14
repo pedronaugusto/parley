@@ -241,7 +241,7 @@ test "a session whose list changes have no task to go out on is refused, where i
 }
 
 fn serveTask(io: std.Io, server: *parley.Server, in: *Pipe, out: *Pipe) void {
-    // glint-ignore: Z026 -- the test reads what was written; how the serving ended is not what it checks
+    // the test reads what was written; how the serving ended is not what it checks
     stdio.serve(io, testing.allocator, server, .causeless(&in.reader), .causeless(&out.writer), .{}) catch {};
     out.close();
 }

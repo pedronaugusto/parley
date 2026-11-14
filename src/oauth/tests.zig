@@ -64,7 +64,7 @@ const Provider = struct {
 
     fn stop(p: *Provider, io: Io) void {
         p.http.shutdown(io);
-        // glint-ignore: Z026 -- serve ends with the shutdown; its result is not what the test checks
+        // serve ends with the shutdown; its result is not what the test checks
         p.serving.await(io) catch {};
         p.http.deinit(io);
         p.listener.deinit(io);
@@ -364,7 +364,7 @@ const Guarded = struct {
 
     fn stop(g: *Guarded, io: Io) void {
         g.server.shutdown(io);
-        // glint-ignore: Z026 -- serve ends with the shutdown; its result is not what the test checks
+        // serve ends with the shutdown; its result is not what the test checks
         g.serving.await(io) catch {};
         g.server.deinit(io);
         g.router.deinit();
