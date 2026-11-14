@@ -194,3 +194,127 @@ fn anySchema(_: void, c: *shake.Case) !void {
 test "any input schema's header marks are found or refused" {
     try shake.check(std.testing.allocator, {}, anySchema, .{ .cases = 2000 });
 }
+
+const meta = @import("meta.zig");
+const types = @import("types.zig");
+
+/// A request's `_meta`, as `meta.read` promises it: each reserved key it
+/// reads comes back as written, one absent is null, `raw` is the `_meta`
+/// object as written, the params' other members and `_meta`'s vendor keys
+/// change nothing, and params that are not an object, or a reserved key of
+/// the wrong shape, are `Malformed`.
+fn requestMeta(_: void, c: *shake.Case) !void {
+    var out: std.Io.Writer.Allocating = .init(c.gpa);
+    const w = &out.writer;
+    // What is written, and so what reading must give.
+    var version: ?[]const u8 = null;
+    var level: ?types.LoggingLevel = null;
+    var token: ?types.Token = null;
+    var malformed = false;
+    var raw: ?[]const u8 = null;
+
+    if (shake.gen.intRange(c.source, u8, 0, 15) == 0) {
+        // Params that are not an object.
+        try w.writeAll(if (shake.gen.boolean(c.source)) "[{\"_meta\":{}}]" else "7");
+        malformed = true;
+    } else {
+        try w.writeAll("{");
+        var members: usize = 0;
+        if (shake.gen.boolean(c.source)) {
+            try w.writeAll("\"name\":\"echo\"");
+            members += 1;
+        }
+        if (shake.gen.boolean(c.source)) {
+            if (members > 0) try w.writeAll(",");
+            try w.writeAll("\"_meta\":");
+            const start = out.written().len;
+            try w.writeAll("{");
+            var keys: usize = 0;
+            if (shake.gen.boolean(c.source)) {
+                const text = try shake.gen.string(c.source, c.gpa, .{ .kind = .utf8, .max_len = 16 });
+                try w.print("\"{s}\":{f}", .{ meta.protocol_version, std.json.fmt(text, .{}) });
+                version = text;
+                keys += 1;
+            }
+            if (shake.gen.boolean(c.source)) {
+                if (keys > 0) try w.writeAll(",");
+                try w.writeAll("\"com.example/vendor\":[1,{\"logLevel\":null}]");
+                keys += 1;
+            }
+            switch (shake.gen.intRange(c.source, u8, 0, 3)) {
+                0 => {},
+                1, 2 => {
+                    if (keys > 0) try w.writeAll(",");
+                    const all = std.enums.values(types.LoggingLevel);
+                    const chosen = all[shake.gen.intRange(c.source, usize, 0, all.len - 1)];
+                    try w.print("\"{s}\":\"{s}\"", .{ meta.log_level, @tagName(chosen) });
+                    level = chosen;
+                    keys += 1;
+                },
+                else => {
+                    if (keys > 0) try w.writeAll(",");
+                    try w.print("\"{s}\":{s}", .{ meta.log_level, if (shake.gen.boolean(c.source)) "\"loud\"" else "3" });
+                    malformed = true;
+                    keys += 1;
+                },
+            }
+            switch (shake.gen.intRange(c.source, u8, 0, 4)) {
+                0 => {},
+                1 => {
+                    if (keys > 0) try w.writeAll(",");
+                    const n = shake.gen.int(c.source, i64);
+                    try w.print("\"{s}\":{d}", .{ meta.progress_token, n });
+                    token = .{ .integer = n };
+                    keys += 1;
+                },
+                2 => {
+                    if (keys > 0) try w.writeAll(",");
+                    const text = try shake.gen.string(c.source, c.gpa, .{ .kind = .utf8, .max_len = 16 });
+                    try w.print("\"{s}\":{f}", .{ meta.progress_token, std.json.fmt(text, .{}) });
+                    token = .{ .string = text };
+                    keys += 1;
+                },
+                3 => {
+                    if (keys > 0) try w.writeAll(",");
+                    try w.print("\"{s}\":{s}", .{ meta.progress_token, if (shake.gen.boolean(c.source)) "true" else "{}" });
+                    malformed = true;
+                    keys += 1;
+                },
+                else => {
+                    if (keys > 0) try w.writeAll(",");
+                    try w.print("\"{s}\":{s}", .{ meta.client_info, if (shake.gen.boolean(c.source)) "5" else "[]" });
+                    malformed = true;
+                    keys += 1;
+                },
+            }
+            try w.writeAll("}");
+            raw = out.written()[start..];
+            members += 1;
+        }
+        if (shake.gen.boolean(c.source)) {
+            if (members > 0) try w.writeAll(",");
+            try w.writeAll("\"arguments\":{\"_meta\":{\"progressToken\":\"not this one\"}}");
+        }
+        try w.writeAll("}");
+    }
+    const params = out.written();
+    const got = meta.read(c.gpa, params, wire_limits) catch |err| switch (err) {
+        error.Malformed => return if (malformed) {} else error.RefusedWellFormed,
+        error.OutOfMemory => return err,
+    };
+    if (malformed) return error.TookMalformed;
+    if ((got.raw == null) != (raw == null)) return error.RawChanged;
+    if (raw) |r| if (!std.mem.eql(u8, got.raw.?, r)) return error.RawChanged;
+    if ((got.version == null) != (version == null)) return error.VersionChanged;
+    if (version) |v| if (!std.mem.eql(u8, got.version.?, v)) return error.VersionChanged;
+    if (got.log_level != level) return error.LevelChanged;
+    if ((got.progress_token == null) != (token == null)) return error.TokenChanged;
+    if (token) |t| switch (t) {
+        .integer => |n| if (got.progress_token.? != .integer or got.progress_token.?.integer != n) return error.TokenChanged,
+        .string => |s| if (got.progress_token.? != .string or !std.mem.eql(u8, got.progress_token.?.string, s)) return error.TokenChanged,
+    };
+}
+
+test "a request's _meta reads back as written, or is refused exactly where it is malformed" {
+    try shake.check(std.testing.allocator, {}, requestMeta, .{ .cases = 2000 });
+}
