@@ -52,7 +52,7 @@ pub const Sealer = struct {
         try io.randomSecure(nonce);
         var plain_owner: aegis.SecretBytes = try .init(arena, 8 + payload.len);
         defer plain_owner.deinit(arena);
-        plain_owner.resizeWithinCapacity(8 + payload.len) catch unreachable; // unreachable: allocated to this length
+        plain_owner.resizeWithinCapacity(8 + payload.len) catch unreachable; // glint-ignore: Z026 -- allocated to this length
         const plain = plain_owner.exposeMut();
         std.mem.writeInt(i64, plain[0..8], expiry.raw(), .big);
         @memcpy(plain[8..], payload);

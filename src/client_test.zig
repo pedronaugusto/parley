@@ -45,7 +45,7 @@ const Wiring = struct {
 };
 
 fn serveTask(io: Io, server: *parley.Server, in: *Pipe, out: *Pipe) void {
-    // glint-ignore: Z026 -- the test reads what the client got; how the serving ended is not what it checks
+    // the test reads what the client got; how the serving ended is not what it checks
     stdio.serve(io, testing.allocator, server, .causeless(&in.reader), .causeless(&out.writer), .{}) catch {};
     out.close();
 }

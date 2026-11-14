@@ -239,7 +239,7 @@ pub const Table = struct {
             task.asked.appendAssumeCapacity(.{ .key = key, .request = try t.gpa.dupe(u8, a.request) });
         }
         try t.keepState(h, task, state);
-        _ = task.lifecycle.step(.ask) catch unreachable; // unreachable: a round runs only while the task is working
+        _ = task.lifecycle.step(.ask) catch unreachable; // glint-ignore: Z026 -- a round runs only while the task is working
         task.updated = at;
     }
 
@@ -281,14 +281,14 @@ pub const Table = struct {
         }
         w.writeByte('}') catch return error.OutOfMemory;
         task.clearAnswers(t.gpa);
-        _ = task.lifecycle.step(.@"resume") catch unreachable; // unreachable: the status was checked above
+        _ = task.lifecycle.step(.@"resume") catch unreachable; // glint-ignore: Z026 -- the status was checked above
         task.updated = at;
         return out.written();
     }
 
     pub fn complete(t: *Table, _: *Held, task: *Task, at: Instant, result: []const u8) Allocator.Error!void {
         task.outcome = try t.gpa.dupe(u8, result);
-        _ = task.lifecycle.step(.complete) catch unreachable; // unreachable: a round runs only while the task is working
+        _ = task.lifecycle.step(.complete) catch unreachable; // glint-ignore: Z026 -- a round runs only while the task is working
         task.updated = at;
     }
 
@@ -301,7 +301,7 @@ pub const Table = struct {
         if (task.message) |old| t.gpa.free(old);
         task.message = text;
         task.outcome = owned;
-        _ = task.lifecycle.step(.fail) catch unreachable; // unreachable: not terminal, checked above
+        _ = task.lifecycle.step(.fail) catch unreachable; // glint-ignore: Z026 -- not terminal, checked above
         task.updated = at;
     }
 
@@ -310,7 +310,7 @@ pub const Table = struct {
         const owned = try t.gpa.dupe(u8, message);
         if (task.message) |old| t.gpa.free(old);
         task.message = owned;
-        _ = task.lifecycle.step(.cancel) catch unreachable; // unreachable: not terminal, checked above
+        _ = task.lifecycle.step(.cancel) catch unreachable; // glint-ignore: Z026 -- not terminal, checked above
         task.updated = at;
     }
 };

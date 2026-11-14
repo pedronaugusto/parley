@@ -232,7 +232,7 @@ fn sessionStream(t: *Transport, io: Io) Io.Cancelable!void {
         const answer = (replies.message() catch continue) orelse continue;
         t.postAnswer(io, a, client.revision, answer) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
-            // glint-ignore: Z026 -- an answer the server cannot take leaves its request unanswered, which it times out
+            // an answer the server cannot take leaves its request unanswered, which it times out
             else => {},
         };
     }

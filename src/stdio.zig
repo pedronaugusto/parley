@@ -473,7 +473,7 @@ pub const Connection = struct {
         wire.writeFailure(&w, id, code, message, null) catch {
             // An id too long for the buffer: answered without it.
             w = .fixed(&buffer);
-            wire.writeFailure(&w, null, code, message, null) catch unreachable; // unreachable: a fixed message fits
+            wire.writeFailure(&w, null, code, message, null) catch unreachable; // glint-ignore: Z026 -- a fixed message fits
         };
         return c.send(w.buffered());
     }
@@ -818,9 +818,9 @@ pub const Channel = struct {
             // Canceled or out of time: the server is told, and stops.
             var buffer: [128]u8 = undefined;
             var w: Io.Writer = .fixed(&buffer);
-            w.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":") catch unreachable; // unreachable: the buffer holds it
+            w.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":") catch unreachable; // glint-ignore: Z026 -- the buffer holds it
             if (exchange.id.write(&w)) |_| {
-                w.writeAll("}}") catch unreachable; // unreachable: an integer id fits the buffer
+                w.writeAll("}}") catch unreachable; // glint-ignore: Z026 -- an integer id fits the buffer
                 // glint-ignore: Z026 -- the request ends either way; a notice the server cannot take changes nothing
                 ch.write(io, w.buffered()) catch {};
             } else |write_err| switch (write_err) {

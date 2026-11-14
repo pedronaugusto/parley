@@ -207,7 +207,7 @@ pub const Listener = struct {
         try w.names.ensureUnusedCapacity(gpa, 1);
         try w.changed.resize(gpa, w.names.items.len + 1, false);
         const copy = gpa.dupe(u8, name) catch |err| {
-            w.changed.resize(gpa, w.names.items.len, false) catch unreachable; // unreachable: shrinking never allocates
+            w.changed.resize(gpa, w.names.items.len, false) catch unreachable; // glint-ignore: Z026 -- shrinking never allocates
             return err;
         };
         w.names.appendAssumeCapacity(copy);
@@ -225,7 +225,7 @@ pub const Listener = struct {
             // The bits after `i` move down one.
             var k = i;
             while (k + 1 < w.changed.bit_length) : (k += 1) w.changed.setValue(k, w.changed.isSet(k + 1));
-            w.changed.resize(gpa, w.names.items.len, false) catch unreachable; // unreachable: shrinking never allocates
+            w.changed.resize(gpa, w.names.items.len, false) catch unreachable; // glint-ignore: Z026 -- shrinking never allocates
             return;
         };
     }

@@ -259,7 +259,7 @@ pub const Session = struct {
         h.revision = if (Revision.named(p.protocolVersion)) |r| (if (r.stateless()) Revision.latest_legacy else r) else Revision.latest_legacy;
         h.client = p.capabilities;
         h.client_info = p.clientInfo;
-        _ = h.lifecycle.step(.initialize) catch unreachable; // unreachable: awaiting was checked above
+        _ = h.lifecycle.step(.initialize) catch unreachable; // glint-ignore: Z026 -- awaiting was checked above
         var out: Writer.Allocating = .init(arena);
         const w = &out.writer;
         w.print("{{\"protocolVersion\":\"{s}\",\"capabilities\":", .{h.revision.text()}) catch return error.OutOfMemory;

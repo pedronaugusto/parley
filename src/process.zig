@@ -140,7 +140,7 @@ pub const Child = struct {
     /// again, then killed. Not a cancelation point: it finishes within
     /// twice the grace. Once is enough; `deinit` frees the child after.
     pub fn close(c: *Child, io: Io) CloseError!Term {
-        std.debug.assert(!c.closed);
+        aegis.assert.invariant(!c.closed, "!c.closed");
         c.closed = true;
         const protection = io.swapCancelProtection(.blocked);
         defer _ = io.swapCancelProtection(protection);
