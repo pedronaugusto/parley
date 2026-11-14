@@ -90,11 +90,22 @@ pub const Task = struct {
     outcome: ?[]const u8 = null,
     /// Set to stop the round running: `tasks/cancel`, its time running out,
     /// the server closing.
-    cancel: Io.Event = .unset,
+    cancel: aegis.Signal(void) = .{},
     /// A round of its handler is running.
     running: bool = false,
     /// Rounds run back to back without asking the client for anything.
     quiet_rounds: u8 = 0,
+
+    /// Asks the round running the task to stop; asked again, the first ask stands.
+    pub fn stop(t: *Task, io: Io) void {
+        // glint-ignore: Z026 -- asked already: the round sees the first ask
+        t.cancel.set(io, {}) catch {};
+    }
+
+    /// Whether the task was asked to stop.
+    pub fn stopping(t: *const Task) bool {
+        return t.cancel.get() != null;
+    }
 
     pub fn status(t: *const Task) Status {
         return t.lifecycle.current();
@@ -215,7 +226,7 @@ pub const Table = struct {
                 continue;
             }
             if (task.running) {
-                task.cancel.set(t.io);
+                task.stop(t.io);
                 i += 1;
                 continue;
             }

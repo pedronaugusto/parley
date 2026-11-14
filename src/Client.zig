@@ -437,6 +437,7 @@ fn withDefaults(arena: Allocator, limits: strand.core.Limits, params: []const u8
     each.init(properties.bytes, .{ .limits = limits });
     while (each.next() catch null) |p| {
         var name_buffer: [256]u8 = undefined;
+        // glint-ignore: Z026 -- a property whose name does not fit 256 bytes gets no default; the schema's others are read
         const name = p.nameInto(&name_buffer) catch continue;
         if (hasMember(content, limits, name)) continue;
         var fields: strand.json.Members = undefined;

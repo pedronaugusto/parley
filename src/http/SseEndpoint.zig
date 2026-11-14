@@ -98,12 +98,18 @@ const Session = struct {
     /// Set once the stream's first event, which names the session, is
     /// written: the response is the GET's alone until then, and a POST
     /// waits for it before anything answers on the stream.
-    opened: Io.Event = .unset,
+    opened: aegis.Signal(void) = .{},
     /// The event being written, between `begin` and `end`.
     event: sse.EventWriter = undefined,
     buffer: [256]u8 = undefined,
     /// The connection's messages, an event each.
     out: parley.stdio.Out = .{ .beginFn = begin, .endFn = end, .keepAliveFn = keepAlive },
+
+    /// Lets the POSTs waiting through: the endpoint event is written, or the stream ended first.
+    fn open(s: *Session, io: Io) void {
+        // glint-ignore: Z026 -- opened already: the stream's end after its event changes nothing
+        s.opened.set(io, {}) catch {};
+    }
 
     fn begin(o: *parley.stdio.Out) parley.stdio.Out.Error!aegis.io.WriteEnd {
         const s: *Session = @alignCast(@fieldParentPtr("out", o));
@@ -191,7 +197,7 @@ fn serveStream(e: *SseEndpoint, io: Io, request: *Request, response: *Response, 
         session.connection.deinit();
     }
     // A POST waiting finds the session ended, where its stream never opens.
-    defer session.opened.set(io);
+    defer session.open(io);
 
     try response.header("Content-Type", "text/event-stream");
     try response.header("Cache-Control", "no-cache");
@@ -205,7 +211,7 @@ fn serveStream(e: *SseEndpoint, io: Io, request: *Request, response: *Response, 
         // returns, so a POST waits for `opened`.
         try sse.writeEvent(try response.writer(io), .{ .type = "endpoint", .data = endpoint });
         try response.flush(io);
-        session.opened.set(io);
+        session.open(io);
     }
     // The stream is open until the client leaves or the server stops; a
     // quiet one is kept open with a comment.
@@ -244,7 +250,7 @@ fn post(e: *SseEndpoint, io: Io, arena: Allocator, request: *Request, response: 
             return;
         }
     }
-    session.opened.wait(io) catch |err| {
+    _ = session.opened.wait(io) catch |err| {
         e.gpa.free(body);
         return err;
     };

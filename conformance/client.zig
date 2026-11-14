@@ -58,6 +58,7 @@ fn elicit(h: *parley.Client.Handlers, _: Io, arena: Allocator, params: []const u
         var first = true;
         while (members.next() catch null) |p| {
             const Field = struct { type: []const u8 = "string", default: ?Raw = null };
+            // glint-ignore: Z026 -- a property whose schema does not read has no default to fill; the form's others are read
             const f = strand.json.parseLeaky(Field, arena, p.value, read_options) catch continue;
             if (f.default != null) continue;
             if (!first) w.writeByte(',') catch return error.OutOfMemory;
