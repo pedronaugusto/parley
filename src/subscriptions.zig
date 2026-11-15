@@ -48,8 +48,8 @@ const Locks = aegis.Order(&.{
 /// The names a listener watches of one kind, and which changed.
 const Watched = struct {
     names: std.ArrayList([]const u8) = .empty,
-    /// One bit per name: changed and not yet written.
-    changed: std.DynamicBitSetUnmanaged = .{},
+    /// One per name: changed and not yet written.
+    changed: std.ArrayList(bool) = .empty,
 
     fn deinit(w: *Watched, gpa: Allocator) void {
         for (w.names.items) |n| gpa.free(n);
@@ -189,9 +189,8 @@ pub const Listener = struct {
         defer held.deinit(io);
         const w = held.value().watched.getPtr(which);
         var out: std.ArrayList([]const u8) = .empty;
-        var it = w.changed.iterator(.{});
-        while (it.next()) |i| try out.append(arena, try arena.dupe(u8, w.names.items[i]));
-        w.changed.unsetAll();
+        for (w.changed.items, w.names.items) |changed, name| if (changed) try out.append(arena, try arena.dupe(u8, name));
+        @memset(w.changed.items, false);
         return out.items;
     }
 
@@ -205,12 +204,9 @@ pub const Listener = struct {
         for (w.names.items) |n| if (std.mem.eql(u8, n, name)) return;
         if (w.names.items.len >= max) return error.TooMany;
         try w.names.ensureUnusedCapacity(gpa, 1);
-        try w.changed.resize(gpa, w.names.items.len + 1, false);
-        const copy = gpa.dupe(u8, name) catch |err| {
-            w.changed.resize(gpa, w.names.items.len, false) catch unreachable; // glint-ignore: Z026 -- shrinking never allocates
-            return err;
-        };
-        w.names.appendAssumeCapacity(copy);
+        try w.changed.ensureUnusedCapacity(gpa, 1);
+        w.names.appendAssumeCapacity(try gpa.dupe(u8, name));
+        w.changed.appendAssumeCapacity(false);
     }
 
     /// Stops watching `name` (a legacy `resources/unsubscribe`).
@@ -222,10 +218,7 @@ pub const Listener = struct {
         for (w.names.items, 0..) |n, i| if (std.mem.eql(u8, n, name)) {
             gpa.free(n);
             _ = w.names.orderedRemove(i);
-            // The bits after `i` move down one.
-            var k = i;
-            while (k + 1 < w.changed.bit_length) : (k += 1) w.changed.setValue(k, w.changed.isSet(k + 1));
-            w.changed.resize(gpa, w.names.items.len, false) catch unreachable; // glint-ignore: Z026 -- shrinking never allocates
+            _ = w.changed.orderedRemove(i);
             return;
         };
     }
@@ -343,7 +336,7 @@ pub const Hub = struct {
             const st = state.value();
             const w = st.watched.getPtr(which);
             for (w.names.items, 0..) |n, i| if (std.mem.eql(u8, n, name)) {
-                w.changed.set(i);
+                w.changed.items[i] = true;
                 l.mark(io, st, kind);
             };
         }
