@@ -8,7 +8,7 @@ const std = @import("std");
 /// conduit, fetched only then; with `oauth` (the default, and `http`)
 /// `parley.oauth`, MCP's authorization on clearance's OAuth 2.1, fetched only
 /// then.
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const with_http = b.option(bool, "http", "Build parley.http, Streamable HTTP on uplink, which fetches uplink") orelse true;
@@ -25,26 +25,19 @@ pub fn build(b: *std.Build) void {
             .{ .name = "strand", .module = strand },
         },
     });
-    if (with_process) {
-        // Declared before conduit is fetched, as parley.http is below.
-        const process = b.addModule("parley.process", .{
-            .root_source_file = b.path("src/process.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "aegis", .module = aegis },
-                .{ .name = "parley", .module = parley },
-            },
-        });
-        // glint-ignore: Z026 -- a lazy dependency not fetched yet adds no import: the build fetches it and runs again
-        if (b.dependencyLazy("conduit", .{ .target = target, .optimize = optimize })) |conduit| process.addImport("conduit", conduit.module("conduit")) else |err| switch (err) {
-            error.LazyDependencyNeeded => {},
-        }
-    }
-    if (!with_http) return;
-    // Declared before uplink is fetched: a consumer's first pass must find
-    // the module it asks for, and only learns here what to fetch.
-    const http = b.addModule("parley.http", .{
+    // Each module is declared before what it needs is fetched: a consumer's
+    // first pass must find the module it asks for, and only learns here
+    // what to fetch.
+    const process = if (with_process) b.addModule("parley.process", .{
+        .root_source_file = b.path("src/process.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "aegis", .module = aegis },
+            .{ .name = "parley", .module = parley },
+        },
+    }) else null;
+    const http = if (with_http) b.addModule("parley.http", .{
         .root_source_file = b.path("src/http.zig"),
         .target = target,
         .optimize = optimize,
@@ -53,33 +46,39 @@ pub fn build(b: *std.Build) void {
             .{ .name = "strand", .module = strand },
             .{ .name = "parley", .module = parley },
         },
-    });
-    // Declared, as parley.http is, before what it needs is fetched.
-    const oauth = if (with_oauth) b.addModule("parley.oauth", .{
+    }) else null;
+    const oauth = if (http) |h| if (with_oauth) b.addModule("parley.oauth", .{
         .root_source_file = b.path("src/oauth.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "aegis", .module = aegis },
             .{ .name = "parley", .module = parley },
-            .{ .name = "parley.http", .module = http },
+            .{ .name = "parley.http", .module = h },
         },
-    }) else null;
-    // glint-ignore: Z026 -- a lazy dependency not fetched yet adds no import: the build fetches it and runs again
-    if (b.dependencyLazy("uplink", .{ .target = target, .optimize = optimize })) |uplink| {
-        http.addImport("uplink", uplink.module("uplink"));
-        if (oauth) |o| o.addImport("uplink", uplink.module("uplink"));
-    } else |err| switch (err) {
-        error.LazyDependencyNeeded => {},
+    }) else null else null;
+    // Every lazy dependency the modules need is asked for before any is
+    // used, so one pass marks each one not fetched yet; the build then
+    // returns `error.LazyDependencyNeeded`, and Zig fetches them and
+    // configures again (std.Build.dependencyLazy).
+    const conduit = lazy(b, process != null, "conduit", .{ .target = target, .optimize = optimize });
+    const uplink = lazy(b, http != null, "uplink", .{ .target = target, .optimize = optimize });
+    const clearance = lazy(b, oauth != null, "clearance", .{ .target = target, .optimize = optimize, .oauth = true });
+    if (try conduit) |c| if (process) |m| m.addImport("conduit", c.module("conduit"));
+    if (try uplink) |u| {
+        if (http) |m| m.addImport("uplink", u.module("uplink"));
+        if (oauth) |m| m.addImport("uplink", u.module("uplink"));
     }
-    const oauth_module = oauth orelse return;
-    // glint-ignore: Z026 -- a lazy dependency not fetched yet adds no import: the build fetches it and runs again
-    if (b.dependencyLazy("clearance", .{ .target = target, .optimize = optimize, .oauth = true })) |clearance| {
-        oauth_module.addImport("clearance", clearance.module("clearance"));
-        oauth_module.addImport("clearance.oauth", clearance.module("clearance.oauth"));
-    } else |err| switch (err) {
-        error.LazyDependencyNeeded => {},
-    }
+    if (try clearance) |c| if (oauth) |m| {
+        m.addImport("clearance", c.module("clearance"));
+        m.addImport("clearance.oauth", c.module("clearance.oauth"));
+    };
+}
+
+/// The lazy dependency `name` where it is `wanted`, null where it is not.
+fn lazy(b: *std.Build, wanted: bool, name: []const u8, args: anytype) error{LazyDependencyNeeded}!?*std.Build.Dependency {
+    if (!wanted) return null;
+    return try b.dependencyLazy(name, args);
 }
 
 /// parley's development: its tests, its properties, the example and the
@@ -101,8 +100,9 @@ pub fn dev(b: *std.Build, tools: type) void {
     // The suite alone, in the mode asked for: what ThreadSanitizer runs.
     // parley.http's tests are a binary of their own, rooted in that module.
     const tests = suite(b, "parley-tests", target, optimize, filters);
-    // glint-ignore: Z026 -- a lazy dependency not fetched yet ends this configure pass; the build fetches it and configures again
-    const uplink_package = p.dependencyLazy("uplink", .{ .target = target, .optimize = optimize }) catch return;
+    // Each lazy dependency below is needed here: one not fetched yet ends
+    // this configure pass, and the build fetches it and configures again.
+    const uplink_package = p.dependency("uplink", .{ .target = target, .optimize = optimize });
     const http_tests = b.addTest(.{ .name = "parley-http-tests", .filters = filters, .root_module = package.module("parley.http") });
     const unit = b.step("unit", "Run the test suite alone");
     const tests_run = b.addRunArtifact(tests);
@@ -116,8 +116,7 @@ pub fn dev(b: *std.Build, tools: type) void {
 
     // parley.oauth's tests: an authorization server, a guarded endpoint and
     // a client signing in, over loopback.
-    // glint-ignore: Z026 -- a lazy dependency not fetched yet ends this configure pass; the build fetches it and configures again
-    const clearance_package = p.dependencyLazy("clearance", .{ .target = target, .optimize = optimize, .oauth = true }) catch return;
+    const clearance_package = p.dependency("clearance", .{ .target = target, .optimize = optimize, .oauth = true });
     const oauth_module = package.module("parley.oauth");
     // The tests sign tokens with a cloak key.
     if (oauth_module.import_table.get("cloak") == null) {
@@ -132,8 +131,7 @@ pub fn dev(b: *std.Build, tools: type) void {
     // parley.process's tests launch a real server: the fixture, built here
     // and named to them by its path from the package root, which holds on a
     // runner replaying the tests. The benchmarks launch it too.
-    // glint-ignore: Z026 -- a lazy dependency not fetched yet ends this configure pass; the build fetches it and configures again
-    _ = p.dependencyLazy("conduit", .{ .target = target, .optimize = optimize }) catch return;
+    const conduit_package = p.dependency("conduit", .{ .target = target, .optimize = optimize });
     const fixture = fixtureServer(b, "parley-fixture-server", target, optimize) orelse return;
     const process_module = package.module("parley.process");
     const test_options = b.addOptions();
@@ -254,8 +252,7 @@ pub fn dev(b: *std.Build, tools: type) void {
     });
     // A project that depends on parley by path, with only the packages
     // parley needs: the build a consumer gets.
-    // glint-ignore: Z026 -- a lazy dependency not fetched yet ends this configure pass; the build fetches it and configures again
-    tools.preflight.addConsumerCheck(b, p, .{ .package = "parley", .program = p.path("ci/consumer.zig"), .packages = &.{ aegis, strand, uplink_package, p.dependencyLazy("conduit", .{ .target = target, .optimize = optimize }) catch return, clearance_package }, .modules = &.{ "parley", "parley.http", "parley.process", "parley.oauth" } });
+    tools.preflight.addConsumerCheck(b, p, .{ .package = "parley", .program = p.path("ci/consumer.zig"), .packages = &.{ aegis, strand, uplink_package, conduit_package, clearance_package }, .modules = &.{ "parley", "parley.http", "parley.process", "parley.oauth" } });
 }
 
 /// The tests run in the `parley` module itself, which gets shakedown for
