@@ -95,11 +95,15 @@ pub const Task = struct {
     running: bool = false,
     /// Rounds run back to back without asking the client for anything.
     quiet_rounds: u8 = 0,
+    /// Private: `message` and `outcome` are the out-of-memory failure's
+    /// constants (`Table.failOutOfMemory`), which nothing frees.
+    failed_for_memory: bool = false,
 
-    /// Asks the round running the task to stop; asked again, the first ask stands.
+    /// Asks the round running the task to stop; asked again, the first ask
+    /// stands. Under the table's lock, as every change to a task is.
     pub fn stop(t: *Task, io: Io) void {
-        // glint-ignore: Z026 -- asked already: the round sees the first ask
-        t.cancel.set(io, {}) catch {};
+        if (t.stopping()) return;
+        t.cancel.set(io, {}) catch aegis.assert.never("a task's cancel is set by its first stop alone, under the table's lock");
     }
 
     /// Whether the task was asked to stop.
@@ -114,12 +118,13 @@ pub const Task = struct {
     fn deinit(t: *Task, gpa: Allocator) void {
         if (t.principal) |p| gpa.free(p);
         gpa.free(t.params);
-        if (t.message) |m| gpa.free(m);
         t.clearAsked(gpa);
         t.asked.deinit(gpa);
         t.clearAnswers(gpa);
         t.answers.deinit(gpa);
         if (t.state) |s| gpa.free(s);
+        if (t.failed_for_memory) return;
+        if (t.message) |m| gpa.free(m);
         if (t.outcome) |o| gpa.free(o);
     }
 
@@ -250,7 +255,7 @@ pub const Table = struct {
             task.asked.appendAssumeCapacity(.{ .key = key, .request = try t.gpa.dupe(u8, a.request) });
         }
         try t.keepState(h, task, state);
-        _ = task.lifecycle.step(.ask) catch unreachable; // glint-ignore: Z026 -- a round runs only while the task is working
+        _ = task.lifecycle.step(.ask) catch aegis.assert.never("a round runs only while its task is working");
         task.updated = at;
     }
 
@@ -292,14 +297,14 @@ pub const Table = struct {
         }
         w.writeByte('}') catch return error.OutOfMemory;
         task.clearAnswers(t.gpa);
-        _ = task.lifecycle.step(.@"resume") catch unreachable; // glint-ignore: Z026 -- the status was checked above
+        _ = task.lifecycle.step(.@"resume") catch aegis.assert.never("the task's input was required, checked above under the table's lock");
         task.updated = at;
         return out.written();
     }
 
     pub fn complete(t: *Table, _: *Held, task: *Task, at: Instant, result: []const u8) Allocator.Error!void {
         task.outcome = try t.gpa.dupe(u8, result);
-        _ = task.lifecycle.step(.complete) catch unreachable; // glint-ignore: Z026 -- a round runs only while the task is working
+        _ = task.lifecycle.step(.complete) catch aegis.assert.never("a round runs only while its task is working");
         task.updated = at;
     }
 
@@ -312,7 +317,21 @@ pub const Table = struct {
         if (task.message) |old| t.gpa.free(old);
         task.message = text;
         task.outcome = owned;
-        _ = task.lifecycle.step(.fail) catch unreachable; // glint-ignore: Z026 -- not terminal, checked above
+        _ = task.lifecycle.step(.fail) catch aegis.assert.never("a task not ended fails, checked above under the table's lock");
+        task.updated = at;
+    }
+
+    /// Fails for want of memory, as a JSON-RPC internal error: nothing is
+    /// allocated, so what could not record a round's outcome still ends
+    /// its task.
+    pub fn failOutOfMemory(t: *Table, _: *Held, task: *Task, at: Instant) void {
+        if (task.lifecycle.isTerminal()) return;
+        if (task.message) |old| t.gpa.free(old);
+        if (task.outcome) |old| t.gpa.free(old);
+        task.message = "out of memory";
+        task.outcome = "{\"code\":-32603,\"message\":\"out of memory\"}";
+        task.failed_for_memory = true;
+        _ = task.lifecycle.step(.fail) catch aegis.assert.never("a task not ended fails, checked above under the table's lock");
         task.updated = at;
     }
 
@@ -321,7 +340,7 @@ pub const Table = struct {
         const owned = try t.gpa.dupe(u8, message);
         if (task.message) |old| t.gpa.free(old);
         task.message = owned;
-        _ = task.lifecycle.step(.cancel) catch unreachable; // glint-ignore: Z026 -- not terminal, checked above
+        _ = task.lifecycle.step(.cancel) catch aegis.assert.never("a task not ended is cancelled, checked above under the table's lock");
         task.updated = at;
     }
 };

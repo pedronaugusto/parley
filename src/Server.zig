@@ -446,7 +446,7 @@ pub const Body = union(enum) {
             .content => |c| {
                 const out = try arena.alloc(u8, c.len);
                 var w: Writer = .fixed(out);
-                c.write(&w) catch unreachable; // glint-ignore: Z026 -- counted to fit exactly
+                c.write(&w) catch aegis.assert.never("a content's body was counted, and fits its length exactly");
                 return out;
             },
         };
@@ -839,8 +839,7 @@ fn listPage(s: *Server, io: Io, arena: Allocator, comptime which: List, params: 
     }
     r.w().writeByte(']') catch return error.OutOfMemory;
     if (i < items.len) {
-        var buffer: [32]u8 = undefined;
-        try r.field("nextCursor", std.mem.print(&buffer, "{d}.{d}", .{ generation, i }) catch unreachable); // glint-ignore: Z026 -- two integers fit 32 bytes
+        try r.field("nextCursor", try arena.print("{d}.{d}", .{ generation, i }));
     }
     try r.end(s, hint, s.options.filter != null);
     return .{ .result = try r.body() };
@@ -1172,7 +1171,7 @@ fn become(hook: *Call.TaskHook) Call.Error!bool {
     run.call.sink = .none;
     // One side decides: the round's end only while the call is attached, and here only once this
     // detached it, both under the table's lock.
-    run.decided.set(table.io, .detached) catch unreachable; // glint-ignore: Z026 -- decided once, here or at the round's end
+    run.decided.set(table.io, .detached) catch aegis.assert.never("a round is decided once: here, once this detached it, or at its end while attached");
     return true;
 }
 
@@ -1249,8 +1248,7 @@ fn recordRound(s: *Server, run: *Run, returned: Call.Error!registry.ToolResult) 
         defer held.deinit(io);
         if (run.attached) break :recorded null;
         const again = s.recordOutcome(table, held.value(), run, returned) catch blk: {
-            // glint-ignore: Z026 -- out of memory while recording: the task fails with what fits, or stays as it was
-            table.fail(held.value(), task, tasks.now(io), "{\"code\":-32603,\"message\":\"out of memory\"}", "out of memory") catch {};
+            table.failOutOfMemory(held.value(), task, tasks.now(io));
             break :blk false;
         };
         task.running = again;
@@ -1259,7 +1257,7 @@ fn recordRound(s: *Server, run: *Run, returned: Call.Error!registry.ToolResult) 
     };
     // Attached: the waiting call answers with the outcome.
     const n = next orelse {
-        run.decided.set(io, .{ .done = returned }) catch unreachable; // glint-ignore: Z026 -- decided once: attached, the round's end decides, never `become`
+        run.decided.set(io, .{ .done = returned }) catch aegis.assert.never("a round is decided once: attached, its end decides, never `become`");
         run.release();
         return;
     };
@@ -1355,8 +1353,7 @@ fn startRound(s: *Server, task: *tasks.Task, handler: *registry.ToolHandler, res
     const run = Run.create(s, task, handler, false, .{ .string = &task.id }, .none, responses, state_in) catch {
         var held = table.lock();
         defer held.deinit(table.io);
-        // glint-ignore: Z026 -- out of memory: the task fails if that fits, and is let go at its time either way
-        table.fail(held.value(), task, tasks.now(table.io), "{\"code\":-32603,\"message\":\"out of memory\"}", "out of memory") catch {};
+        table.failOutOfMemory(held.value(), task, tasks.now(table.io));
         task.running = false;
         return;
     };
