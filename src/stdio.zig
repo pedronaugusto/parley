@@ -28,6 +28,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const ReadEnd = aegis.io.ReadEnd;
 const WriteEnd = aegis.io.WriteEnd;
+const log = std.log.scoped(.parley);
 
 pub const Options = struct {
     /// The session an `initialize` opens (2025-11-25 and before).
@@ -120,11 +121,11 @@ pub const Connection = struct {
     taking: aegis.BlockingGuarded(Taking) = .init(.open),
     /// Private: the requests being answered.
     jobs: aegis.BlockingGuarded(std.ArrayList(*Job)) = .init(.empty),
+    /// Private: the requests' tasks, and the one writing the session's
+    /// list changes.
     group: Io.Group = .init,
     /// The process's session, once a client opens one with `initialize`.
     session: ?*compat.Session = null,
-    /// The task writing the session's list changes.
-    session_stream: ?Io.Future(Io.Cancelable!void) = null,
     /// Private: where lines that belong to no request go.
     target: Sink.Target = .{ .sendFn = sendLine },
 
@@ -294,7 +295,7 @@ pub const Connection = struct {
         if (std.mem.eql(u8, n.method, "notifications/initialized")) if (c.session) |session| {
             if (session.initialized(c.io)) {
                 // The session's list changes go out on stdout from here.
-                c.session_stream = try c.io.concurrent(streamSession, .{ c, session });
+                try c.group.concurrent(c.io, streamSession, .{ c, session });
             }
         };
     }
@@ -362,15 +363,10 @@ pub const Connection = struct {
         }
     }
 
-    /// Ends the session's stream and waits for it: ended, it returns on
-    /// its own.
+    /// Ends the session's stream, which returns on its own: the connection's
+    /// group waits for it, as for the requests.
     fn endSession(c: *Connection) void {
-        if (c.session_stream) |*task| {
-            c.session.?.end(c.io);
-            // glint-ignore: Z026 -- the session stream ends with the connection; its result says nothing more
-            task.await(c.io) catch {};
-            c.session_stream = null;
-        }
+        if (c.session) |session| session.end(c.io);
     }
 
     fn setsSession(method: []const u8) bool {
@@ -440,10 +436,16 @@ pub const Connection = struct {
     /// passed over (cancellation §error handling).
     fn cancel(c: *Connection, arena: Allocator, params: ?[]const u8) ServeError!void {
         const limits = c.server.jsonLimits();
-        // glint-ignore: Z026 -- a cancellation that does not read names no request; it is passed over (cancellation, error handling)
-        const p = strand.json.parseLeaky(types.CancelledParams, arena, params orelse return, types.readOptions(limits)) catch return;
-        // glint-ignore: Z026 -- a cancellation naming no valid id names no request; it is passed over (cancellation, error handling)
-        const id = wire.idFrom(arena, p.request_id.bytes, limits) catch return;
+        const p = strand.json.parseLeaky(types.CancelledParams, arena, params orelse return, types.readOptions(limits)) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // One that does not read names no request.
+            else => return,
+        };
+        const id = wire.idFrom(arena, p.request_id.bytes, limits) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // One naming no valid id names no request.
+            error.Invalid => return,
+        };
         var held = try c.jobs.acquire(c.io);
         defer held.deinit(c.io);
         for (held.value().items) |j| if (j.request.id.eql(id)) j.stop(c.io);
@@ -475,7 +477,7 @@ pub const Connection = struct {
         wire.writeFailure(&w, id, code, message, null) catch {
             // An id too long for the buffer: answered without it.
             w = .fixed(&buffer);
-            wire.writeFailure(&w, null, code, message, null) catch unreachable; // glint-ignore: Z026 -- a fixed message fits
+            wire.writeFailure(&w, null, code, message, null) catch aegis.assert.never("each of the connection's own failure messages fits the buffer");
         };
         return c.send(w.buffered());
     }
@@ -614,9 +616,9 @@ const Job = struct {
     /// written for the request. A stream is ended, and returns on its own;
     /// anything else is stopped where it is.
     fn stop(job: *Job, io: Io) void {
-        job.canceled.store(.canceled, .release);
-        // glint-ignore: Z026 -- stopped already: the request's task sees the first stop
-        if (job.streams()) job.end.end(io) else job.cancel.set(io, {}) catch {};
+        // Stopped already: the request's task sees the first stop.
+        if (job.canceled.swap(.canceled, .acq_rel) == .canceled) return;
+        if (job.streams()) job.end.end(io) else job.cancel.set(io, {}) catch aegis.assert.never("a request's cancel is set by its first stop alone");
     }
 
     fn destroy(job: *Job) void {
@@ -743,7 +745,8 @@ pub const Channel = struct {
     writing: aegis.BlockingGuarded(Writing),
     /// Private: the requests waiting for their answers.
     waiting: aegis.BlockingGuarded(Waiting) = .init(.{}),
-    reading: ?Io.Future(void) = null,
+    /// Private: the task reading the server's output.
+    reading: Io.Group = .init,
     client: ?*Client = null,
     /// Private: the channel as a client's transport (`transport`).
     transporting: Client.Transport = .{ .vtable = &.{ .request = request, .notify = notify, .opened = opened } },
@@ -762,8 +765,17 @@ pub const Channel = struct {
 
     const Waiter = struct {
         id: wire.Id,
-        /// The answer, on the channel's allocator, once it comes; null when the channel ends first.
-        answer: aegis.Signal(?[]u8) = .{},
+        /// The answer, once it comes or the channel ends first.
+        answer: aegis.Signal(Answered) = .{},
+    };
+
+    const Answered = union(enum) {
+        /// On the channel's allocator.
+        bytes: []u8,
+        /// The channel ended first.
+        closed,
+        /// The answer came, and could not be copied for want of memory.
+        out_of_memory,
     };
 
     pub fn init(gpa: Allocator, in: ReadEnd, out: WriteEnd) Channel {
@@ -774,12 +786,12 @@ pub const Channel = struct {
     /// message within the client's message limit.
     pub fn start(ch: *Channel, io: Io, client: *Client) Io.ConcurrentError!void {
         ch.client = client;
-        ch.reading = try io.concurrent(readLoop, .{ ch, io });
+        try ch.reading.concurrent(io, readLoop, .{ ch, io });
     }
 
     /// Stops reading; the requests still waiting fail.
     pub fn deinit(ch: *Channel, io: Io) void {
-        if (ch.reading) |*task| task.cancel(io);
+        ch.reading.cancel(io);
         ch.waiting.teardown().list.deinit(ch.gpa);
     }
 
@@ -813,41 +825,55 @@ pub const Channel = struct {
         }
         defer {
             ch.retire(io, &waiter);
-            if (waiter.answer.get()) |a| if (a.*) |bytes| ch.gpa.free(bytes);
+            if (waiter.answer.get()) |a| switch (a.*) {
+                .bytes => |bytes| ch.gpa.free(bytes),
+                .closed, .out_of_memory => {},
+            };
         }
         try ch.write(io, exchange.message);
         const got = waiter.answer.waitTimeout(io, .{ .duration = .{ .raw = exchange.timeout, .clock = .awake } }) catch |err| {
-            // Canceled or out of time: the server is told, and stops.
-            var buffer: [128]u8 = undefined;
-            var w: Io.Writer = .fixed(&buffer);
-            w.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":") catch unreachable; // glint-ignore: Z026 -- the buffer holds it
-            // glint-ignore: Z026 -- an id the buffer cannot hold sends no notice; the request ends either way
-            if (exchange.id.write(&w)) |_| {
-                w.writeAll("}}") catch unreachable; // glint-ignore: Z026 -- an integer id fits the buffer
-                // glint-ignore: Z026 -- the request ends either way; a notice the server cannot take changes nothing
-                ch.write(io, w.buffered()) catch {};
-            } else |write_err| switch (write_err) {
-                // An id the buffer cannot hold sends no notice; the request ends either way.
-                error.WriteFailed => {},
-            }
+            // Canceled or out of time: the server is told, and stops. A
+            // cancel of this task while it is told is the request's end.
+            ch.writeLine(io, exchange.id, writeCancelled) catch |write_err| switch (write_err) {
+                error.Canceled => return error.Canceled,
+                // The server's input is gone: it is told nothing, and the
+                // request ends either way.
+                error.Closed => {},
+            };
             return switch (err) {
                 error.Canceled => error.Canceled,
                 error.Timeout => error.TimedOut,
             };
         };
-        // Freed with the waiter, as it is retired.
-        return arena.dupe(u8, got.* orelse return error.Closed);
+        return switch (got.*) {
+            // Freed with the waiter, as it is retired.
+            .bytes => |bytes| arena.dupe(u8, bytes),
+            .closed => error.Closed,
+            .out_of_memory => error.OutOfMemory,
+        };
+    }
+
+    /// `notifications/cancelled` for the request `id`.
+    fn writeCancelled(w: *Io.Writer, id: wire.Id) Io.Writer.Error!void {
+        try w.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":");
+        try id.write(w);
+        try w.writeAll("}}");
     }
 
     /// `Closed`: the channel was ended, or the server's input broke.
     /// `Canceled`: the writing task was.
     fn write(ch: *Channel, io: Io, message: []const u8) error{ Closed, Canceled }!void {
+        return ch.writeLine(io, message, Io.Writer.writeAll);
+    }
+
+    /// A line `body` writes from `content`, whole: as `write`.
+    fn writeLine(ch: *Channel, io: Io, content: anytype, comptime body: fn (*Io.Writer, @TypeOf(content)) Io.Writer.Error!void) error{ Closed, Canceled }!void {
         var held = ch.writing.acquireUncancelable(io);
         defer held.deinit(io);
         const w = held.value();
         if (w.ended) return error.Closed;
         const out = w.out.writer();
-        out.writeAll(message) catch return closed(w.out);
+        body(out, content) catch return closed(w.out);
         out.writeByte('\n') catch return closed(w.out);
         out.flush() catch return closed(w.out);
     }
@@ -876,14 +902,17 @@ pub const Channel = struct {
         };
     }
 
-    fn readLoop(ch: *Channel, io: Io) void {
+    /// `Canceled`: `deinit` stopped the reading.
+    fn readLoop(ch: *Channel, io: Io) Io.Cancelable!void {
         defer {
             var held = ch.waiting.acquireUncancelable(io);
             defer held.deinit(io);
             const waiting = held.value();
             waiting.closed = true;
-            // glint-ignore: Z026 -- a waiter answered already keeps its answer
-            for (waiting.list.items) |w| w.answer.set(io, null) catch {};
+            // A waiter answered already keeps its answer.
+            for (waiting.list.items) |w| if (w.answer.get() == null) {
+                w.answer.set(io, .closed) catch aegis.assert.never("an answer is set under the waiting list's lock, checked unset here");
+            };
         }
         var line_buffer: Io.Writer.Allocating = .init(ch.gpa);
         defer line_buffer.deinit();
@@ -891,8 +920,15 @@ pub const Channel = struct {
             line_buffer.clearRetainingCapacity();
             _ = ch.in.reader().streamDelimiterLimit(&line_buffer.writer, '\n', .limited(@as(usize, ch.client.?.options.limits.message.raw()) + 1)) catch |err| switch (err) {
                 error.StreamTooLong => {
-                    // glint-ignore: Z026 -- the server's output ending within an overlong line ends the reading
-                    _ = ch.in.reader().discardDelimiterInclusive('\n') catch return;
+                    _ = ch.in.reader().discardDelimiterInclusive('\n') catch |discard_err| switch (discard_err) {
+                        // The server's output ended within the overlong line,
+                        // or broke: the reading ends, with a cancel of it.
+                        error.ReadFailed => return switch (ch.in.settle(error.ReadFailed)) {
+                            error.Canceled => error.Canceled,
+                            error.ReadFailed => {},
+                        },
+                        error.EndOfStream => return,
+                    };
                     continue;
                 },
                 else => return,
@@ -902,10 +938,11 @@ pub const Channel = struct {
                 break :blk false;
             } else |_| true;
             const bytes = std.mem.trimEnd(u8, line_buffer.written(), "\r");
-            // glint-ignore: Z026 -- a cancel is `deinit` stopping the reading
             if (bytes.len != 0) ch.handle(io, bytes) catch |err| switch (err) {
-                // `deinit` stops the reading.
-                error.Canceled => return,
+                error.Canceled => return error.Canceled,
+                // The line's requests go unanswered, and time out at the
+                // server; the reading goes on.
+                error.OutOfMemory => log.warn("a line from the server is passed over: out of memory", .{}),
             };
             if (at_end) return;
         }
@@ -915,14 +952,18 @@ pub const Channel = struct {
     /// session's revision has them. The answers to its requests go back
     /// together, as `Client.Replies` has them. `Canceled`: the reading was,
     /// while the application answered a request of the server's, or while
-    /// the answers were written.
-    fn handle(ch: *Channel, io: Io, bytes: []const u8) Io.Cancelable!void {
+    /// the answers were written. `OutOfMemory`: the frame, or its answers,
+    /// could not be held.
+    fn handle(ch: *Channel, io: Io, bytes: []const u8) (Io.Cancelable || Allocator.Error)!void {
         const client = ch.client.?;
         var arena: std.heap.ArenaAllocator = .init(ch.gpa);
         defer arena.deinit();
         const a = arena.allocator();
-        // glint-ignore: Z026 -- a line that is no message is passed over; the reading goes on
-        const elements = wire.decodeFrame(a, bytes, client.revision.batches(), .{ .limits = client.jsonLimits() }) catch return;
+        const elements = wire.decodeFrame(a, bytes, client.revision.batches(), .{ .limits = client.jsonLimits() }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // A line that is no message is passed over.
+            error.Malformed, error.Invalid => return,
+        };
         var replies: Client.Replies = .init(a, bytes);
         for (elements) |element| switch (element.read) {
             // An element the server got wrong is passed over, as a line is.
@@ -933,14 +974,12 @@ pub const Channel = struct {
                 // A session server's own request: answered by the client.
                 .request => {
                     var exchange: Client.Exchange = .{ .id = .{ .integer = 0 }, .method = "", .message = "", .revision = client.revision, .timeout = .zero, .client = client };
-                    // glint-ignore: Z026 -- with no memory for more answers, the frame's requests go unanswered and time out at the server
-                    replies.add(try exchange.inbound(io, a, message)) catch return;
+                    try replies.add(try exchange.inbound(io, a, message));
                 },
                 .notification => {},
             },
         };
-        // glint-ignore: Z026 -- answers that cannot be written for want of memory go unanswered and time out at the server
-        const answer = (replies.message() catch return) orelse return;
+        const answer = (try replies.message()) orelse return;
         ch.write(io, answer) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             // The server's input broke: its output's end is read next.
@@ -954,10 +993,10 @@ pub const Channel = struct {
         var held = ch.waiting.acquireUncancelable(io);
         defer held.deinit(io);
         for (held.value().list.items) |w| if (w.id.eql(id) and w.answer.get() == null) {
-            // glint-ignore: Z026 -- an answer that cannot be copied for want of memory leaves its request waiting until its timeout
-            const copy = ch.gpa.dupe(u8, bytes) catch return;
+            // One that cannot be copied fails its request for want of memory.
+            const answer: Answered = if (ch.gpa.dupe(u8, bytes)) |copy| .{ .bytes = copy } else |_| .out_of_memory;
             // Under the waiting list's lock, where the channel's end sets it too: unset here.
-            w.answer.set(io, copy) catch unreachable; // glint-ignore: Z026 -- checked unset above, under the same lock
+            w.answer.set(io, answer) catch aegis.assert.never("an answer is set under the waiting list's lock, checked unset above");
             return;
         };
     }

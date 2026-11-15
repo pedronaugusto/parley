@@ -436,9 +436,8 @@ fn withDefaults(arena: Allocator, limits: strand.core.Limits, params: []const u8
     var each: strand.json.Members = undefined;
     each.init(properties.bytes, .{ .limits = limits });
     while (each.next() catch null) |p| {
-        var name_buffer: [256]u8 = undefined;
-        // glint-ignore: Z026 -- a property whose name does not fit 256 bytes gets no default; the schema's others are read
-        const name = p.nameInto(&name_buffer) catch continue;
+        // Unescaped, a name is no longer than as written.
+        const name = p.nameInto(try arena.alloc(u8, p.name.len)) catch aegis.assert.never("a buffer as long as a name holds it unescaped");
         if (hasMember(content, limits, name)) continue;
         var fields: strand.json.Members = undefined;
         fields.init(p.value, .{ .limits = limits });

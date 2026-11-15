@@ -62,12 +62,13 @@ test "a program that is not there is not spawned" {
     }));
 }
 
-/// Set once a `concurrent` of `refusing` waits for the task's cancel.
+/// Set once a group's `concurrent` of `refusing` waits for the task's cancel.
 var refusing_waits: std.atomic.Value(bool) = .init(false);
 
-/// `concurrent` for `refusing`: waits until the calling task is canceled,
-/// then refuses, the cancel held for the task's next cancelation point.
-fn refuseOnceCanceled(_: ?*anyopaque, _: usize, _: std.mem.Alignment, _: []const u8, _: std.mem.Alignment, _: *const fn (*const anyopaque, *anyopaque) void) std.Io.ConcurrentError!*std.Io.AnyFuture {
+/// A group's `concurrent` for `refusing`: waits until the calling task is
+/// canceled, then refuses, the cancel held for the task's next cancelation
+/// point.
+fn refuseOnceCanceled(_: ?*anyopaque, _: *std.Io.Group, _: []const u8, _: std.mem.Alignment, _: *const fn (*const anyopaque) void) std.Io.ConcurrentError!void {
     refusing_waits.store(true, .release);
     testing.io.sleep(.fromSeconds(60), .awake) catch |err| switch (err) {
         error.Canceled => testing.io.recancel(),
@@ -82,7 +83,8 @@ fn spawnRefused(io: std.Io) !void {
         .argv = &.{options.server},
         .client = client_options,
         .stderr = .ignore,
-        // No task of conduit's own: the first `concurrent` is the client's.
+        // No task of conduit's own: the first `concurrent` is the client's
+        // channel's reading, in its group.
         .descendants = .survive,
     }));
     return io.checkCancel();
@@ -90,7 +92,7 @@ fn spawnRefused(io: std.Io) !void {
 
 test "a cancel that lands while a failed spawn reaps its child is the caller's after it" {
     var vtable = testing.io.vtable.*;
-    vtable.concurrent = refuseOnceCanceled;
+    vtable.groupConcurrent = refuseOnceCanceled;
     const refusing: std.Io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
     refusing_waits.store(false, .release);
     var spawning = try testing.io.concurrent(spawnRefused, .{refusing});

@@ -105,10 +105,10 @@ const Session = struct {
     /// The connection's messages, an event each.
     out: parley.stdio.Out = .{ .beginFn = begin, .endFn = end, .keepAliveFn = keepAlive },
 
-    /// Lets the POSTs waiting through: the endpoint event is written, or the stream ended first.
+    /// Lets the POSTs waiting through: the endpoint event is written, or
+    /// the stream ended first. Its stream's task alone calls it, once.
     fn open(s: *Session, io: Io) void {
-        // glint-ignore: Z026 -- opened already: the stream's end after its event changes nothing
-        s.opened.set(io, {}) catch {};
+        s.opened.set(io, {}) catch aegis.assert.never("a session is opened once, by its stream");
     }
 
     fn begin(o: *parley.stdio.Out) parley.stdio.Out.Error!aegis.io.WriteEnd {
@@ -196,23 +196,11 @@ fn serveStream(e: *SseEndpoint, io: Io, request: *Request, response: *Response, 
         e.forget(io, session);
         session.connection.deinit();
     }
-    // A POST waiting finds the session ended, where its stream never opens.
-    defer session.open(io);
-
-    try response.header("Content-Type", "text/event-stream");
-    try response.header("Cache-Control", "no-cache");
-    try response.header("X-Accel-Buffering", "no");
-    {
-        var endpoint_buffer: [512]u8 = undefined;
-        const endpoint = std.mem.print(&endpoint_buffer, "{s}?{s}={s}", .{ request.path, session_parameter, &session.id }) catch
-            return refuse(io, response, .uri_too_long, null, .invalid_request, "The endpoint's path is longer than its stream names");
-        // Nothing else writes yet: a POST names the session only once the
-        // client has this event, which it may have before the flush
-        // returns, so a POST waits for `opened`.
-        try sse.writeEvent(try response.writer(io), .{ .type = "endpoint", .data = endpoint });
-        try response.flush(io);
-        session.open(io);
-    }
+    // Opened once the endpoint event is written, or where the stream ends
+    // before it: a POST waiting then finds the session ended.
+    const announced = announce(io, request, response, session);
+    session.open(io);
+    if (!try announced) return;
     // The stream is open until the client leaves or the server stops; a
     // quiet one is kept open with a comment.
     const keep_alive = e.options.keep_alive.toIoDuration();
@@ -227,6 +215,25 @@ fn serveStream(e: *SseEndpoint, io: Io, request: *Request, response: *Response, 
             error.WriteFailed => break,
         };
     }
+}
+
+/// The stream's headers and its endpoint event: false where the endpoint
+/// was refused instead.
+fn announce(io: Io, request: *Request, response: *Response, session: *Session) anyerror!bool {
+    try response.header("Content-Type", "text/event-stream");
+    try response.header("Cache-Control", "no-cache");
+    try response.header("X-Accel-Buffering", "no");
+    var endpoint_buffer: [512]u8 = undefined;
+    const endpoint = std.mem.print(&endpoint_buffer, "{s}?{s}={s}", .{ request.path, session_parameter, &session.id }) catch {
+        try refuse(io, response, .uri_too_long, null, .invalid_request, "The endpoint's path is longer than its stream names");
+        return false;
+    };
+    // Nothing else writes yet: a POST names the session only once the
+    // client has this event, which it may have before the flush returns,
+    // so a POST waits for `opened`.
+    try sse.writeEvent(try response.writer(io), .{ .type = "endpoint", .data = endpoint });
+    try response.flush(io);
+    return true;
 }
 
 /// POST: a message for the session it names, answered on its stream.

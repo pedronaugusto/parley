@@ -508,7 +508,7 @@ fn register(a: *Authorizer, io: Io, as: *const oauth.metadata.AuthorizationServe
             const given = r.client_secret.?;
             var secret: aegis.SecretBytes = try .init(a.gpa, given.len);
             errdefer secret.deinit(a.gpa);
-            secret.replace(given) catch unreachable; // glint-ignore: Z026 -- allocated to its length, and apart from it
+            secret.replace(given) catch aegis.assert.never("a secret allocated to its length, apart from what it copies, holds it");
             return .{ .id = id, .secret = secret, .method = method };
         },
     }

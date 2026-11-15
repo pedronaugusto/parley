@@ -14,6 +14,7 @@ const parley = @import("parley");
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
+const log = std.log.scoped(.parley);
 
 /// How a server process ended.
 pub const Term = conduit.Term;
@@ -108,8 +109,9 @@ pub const Child = struct {
             // the error that ended the spawn is the one returned.
             const protection = io.swapCancelProtection(.blocked);
             defer _ = io.swapCancelProtection(protection);
-            // glint-ignore: Z026 -- a child that could not be given its client is ended however that goes; no cancel lands here
-            _ = c.process.killWait(io, .fromRaw(0)) catch {};
+            // The spawn's own error is the one returned: one ending the
+            // child is told here, where nothing else would say it.
+            if (c.process.killWait(io, .fromRaw(0))) |_| {} else |err| log.warn("a server that could not be given its client was not ended: {t}", .{err});
             c.process.deinit(io);
         }
         c.gpa = gpa;
@@ -160,8 +162,9 @@ pub const Child = struct {
 
     /// Frees the child, ending the server first if `close` did not.
     pub fn deinit(c: *Child, io: Io) void {
-        // glint-ignore: Z026 -- the end of a child nobody closed reports nothing; `close` is the call that does
-        if (!c.closed) _ = c.close(io) catch {};
+        // `close` is the call that reports how the server ended; one nobody
+        // closed is told here only where ending it failed.
+        if (!c.closed) if (c.close(io)) |_| {} else |err| log.warn("a server freed unclosed was not ended: {t}", .{err});
         // The server has ended: its output is at its end, or the reading is
         // stopped; then nothing borrows the streams the process closes.
         c.channel.deinit(io);
@@ -193,8 +196,15 @@ pub const Child = struct {
         const file = c.process.stderrFile() orelse unreachable;
         var buffer: [4096]u8 = undefined;
         while (true) {
-            // glint-ignore: Z026 -- the server's stderr ends with the server; what it wrote is forwarded until then
-            const n = file.readStreaming(io, &.{&buffer}) catch return;
+            const n = file.readStreaming(io, &.{&buffer}) catch |err| switch (err) {
+                // The server's stderr ends with the server, or `deinit`
+                // stops the reading: what it wrote is kept until then.
+                error.EndOfStream, error.Canceled => return,
+                else => |e| {
+                    log.warn("the server's standard error is read no more: {t}", .{e});
+                    return;
+                },
+            };
             if (n == 0) return;
             k.append(io, buffer[0..n]);
         }

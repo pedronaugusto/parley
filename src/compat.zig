@@ -167,9 +167,10 @@ pub const Session = struct {
 
     /// An answer from the client to one of the server's requests.
     pub fn deliver(s: *Session, io: Io, message: wire.Message) void {
-        const id: ?wire.Id, const outcome: Outcome = switch (message) {
-            .result => |r| .{ r.id, .{ .result = r.result } },
-            .failure => |f| .{ f.id, .{ .failure = f.message } },
+        // A failure's result is null.
+        const id: ?wire.Id, const result: ?[]const u8 = switch (message) {
+            .result => |r| .{ r.id, r.result },
+            .failure => |f| .{ f.id, null },
             else => return,
         };
         const n = switch (id orelse return) {
@@ -179,15 +180,15 @@ pub const Session = struct {
         var guard = s.held.acquireUncancelable(io);
         defer guard.deinit(io);
         for (guard.value().outgoing.items) |o| if (o.id == n and o.answer.get() == null) {
-            const answer: Outcome = switch (outcome) {
-                // Copied on the session's allocator: the asking task owns its
-                // arena, and is waiting.
-                // glint-ignore: Z026 -- an answer that cannot be copied for want of memory leaves its request unanswered, which times out
-                .result => |bytes| .{ .result = s.gpa.dupe(u8, bytes) catch return },
-                .failure => .{ .failure = "" },
-            };
+            // Copied on the session's allocator: the asking task owns its
+            // arena, and is waiting. One that cannot be copied fails the
+            // request for want of memory.
+            const answer: Outcome = if (result) |bytes|
+                (if (s.gpa.dupe(u8, bytes)) |copy| .{ .result = copy } else |_| .out_of_memory)
+            else
+                .{ .failure = "" };
             // Under the session's lock, the one place it is set: unset here.
-            o.answer.set(io, answer) catch unreachable; // glint-ignore: Z026 -- checked unset above, under the same lock
+            o.answer.set(io, answer) catch aegis.assert.never("an answer is set under the session's lock, checked unset above");
             return;
         };
     }
@@ -260,7 +261,7 @@ pub const Session = struct {
         h.revision = if (Revision.named(p.protocolVersion)) |r| (if (r.stateless()) Revision.latest_legacy else r) else Revision.latest_legacy;
         h.client = p.capabilities;
         h.client_info = p.clientInfo;
-        _ = h.lifecycle.step(.initialize) catch unreachable; // glint-ignore: Z026 -- awaiting was checked above
+        _ = h.lifecycle.step(.initialize) catch aegis.assert.never("the session awaits its handshake, checked above under its lock");
         var out: Writer.Allocating = .init(arena);
         const w = &out.writer;
         w.print("{{\"protocolVersion\":\"{s}\",\"capabilities\":", .{h.revision.text()}) catch return error.OutOfMemory;
@@ -336,6 +337,7 @@ pub const Session = struct {
             const answer = switch (got.*) {
                 .result => |bytes| bytes,
                 .failure => return error.Refused,
+                .out_of_memory => return error.OutOfMemory,
             };
             if (i != 0) w.writeByte(',') catch return error.OutOfMemory;
             wire.writeString(w, r.key) catch return error.OutOfMemory;
@@ -351,7 +353,7 @@ pub const Session = struct {
         defer guard.deinit(io);
         if (o.answer.get()) |answer| switch (answer.*) {
             .result => |bytes| s.gpa.free(bytes),
-            .failure => {},
+            .failure, .out_of_memory => {},
         };
         const outgoing = &guard.value().outgoing;
         for (outgoing.items, 0..) |x, i| if (x == o) {
@@ -361,7 +363,9 @@ pub const Session = struct {
     }
 };
 
-const Outcome = union(enum) { result: []const u8, failure: []const u8 };
+/// The client's answer: its result, its failure, or none, where the result
+/// came and could not be copied for want of memory.
+const Outcome = union(enum) { result: []const u8, failure: []const u8, out_of_memory };
 
 /// A request of the server's, waiting for the client's answer.
 const Outgoing = struct {
