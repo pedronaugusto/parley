@@ -114,11 +114,11 @@ defer web.deinit(io);
 var listener = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{ .reuse_address = true });
 defer listener.deinit(io);
 var serving = try io.concurrent(uplink.Server.serve, .{ &web, io, &listener });
-defer {
-    web.shutdown(io);
-    // glint-ignore: Z026 -- serve ends with the shutdown; the example only shows it starting
-    serving.await(io) catch {};
-}
+// Clients reach it at the listener's address until it is shut down;
+// `serve` returns then, and its error says why it stopped before.
+const asked = askOverHttp(io, gpa, listener.socket.address.getPort());
+web.shutdown(io);
+try serving.await(io);
 ```
 <!-- END GENERATED -->
 
