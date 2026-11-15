@@ -121,6 +121,13 @@ const listed_tools = "100";
 /// The long call the rows that must not wait on it run beside: longer than
 /// any row.
 const long_call_ms = 600_000;
+/// The hundred wide tools' names: `wide_0` to `wide_99`.
+const wide_names = names: {
+    @setEvalBranchQuota(100 * 1000);
+    var names: [100][]const u8 = undefined;
+    for (&names, 0..) |*name, i| name.* = std.fmt.comptimePrint("wide_{d}", .{i});
+    break :names names;
+};
 /// TM Dev Lab's clients at once.
 const load_clients = 50;
 /// What the memory mode echoes.
@@ -145,8 +152,11 @@ const echo_params = "\"name\":\"echo\",\"arguments\":{\"text\":\"hello\"}";
 /// Whether `line` is the answer to request `id`: it names the id and is no
 /// request or notification of the server's own.
 fn answers(line: []const u8, id: u64) bool {
-    var buffer: [32]u8 = undefined;
-    const key = std.mem.print(&buffer, "\"id\":{d}", .{id}) catch unreachable; // glint-ignore: Z026 -- a u64 prints in 32 bytes
+    const prefix = "\"id\":";
+    // A u64 prints in 20 digits.
+    var buffer: [prefix.len + 20]u8 = undefined;
+    @memcpy(buffer[0..prefix.len], prefix);
+    const key = buffer[0 .. prefix.len + std.fmt.printInt(buffer[prefix.len..], id, 10, .lower, .{})];
     var at: usize = 0;
     while (std.mem.findPos(u8, line, at, key)) |found| {
         const after = found + key.len;
@@ -197,9 +207,9 @@ const Process = struct {
     /// over HTTP, which reads no input, is killed at once.
     fn stop(p: *Process, gpa: Allocator, io: Io, grace: bool) void {
         p.child.closeStdin(io);
-        const ended = if (grace) p.child.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } }) catch null else null;
-        // glint-ignore: Z026 -- the benchmark has its numbers; a server that outlives a kill is the system's
-        if (ended == null) _ = p.child.killWait(io, .fromRaw(0)) catch {};
+        if (grace) _ = p.child.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } }) catch null;
+        // A server still running is killed and reaped here: its descendants
+        // are contained, which `deinit` ends.
         p.child.deinit(io);
         gpa.destroy(p);
     }
@@ -383,9 +393,7 @@ const Bench = struct {
     fn serverSetup(b: *Bench) WorkloadError!void {
         b.arena = .init(b.gpa);
         b.server = try parley.Server.init(b.gpa, b.io, .{ .info = .{ .name = "bench", .version = "0" } });
-        var name_buffer: [16]u8 = undefined;
-        for (0..100) |i| {
-            const name = std.mem.print(&name_buffer, "wide_{d}", .{i}) catch unreachable; // glint-ignore: Z026 -- the name fits
+        for (wide_names) |name| {
             try b.server.addTool(b.io, .{ .name = name, .description = "A tool with twenty arguments" }, wide);
         }
         try b.server.addTool(b.io, .{ .name = "echo" }, echo);
@@ -532,8 +540,7 @@ const Bench = struct {
     fn startLongCall(b: *Bench, era: Era) WorkloadError!void {
         b.pending = b.next;
         b.next += 1;
-        var params: [128]u8 = undefined;
-        const sleep_params = std.mem.print(&params, "\"name\":\"sleep\",\"arguments\":{{\"ms\":{d}}}", .{long_call_ms}) catch unreachable; // glint-ignore: Z026 -- it fits
+        const sleep_params = std.fmt.comptimePrint("\"name\":\"sleep\",\"arguments\":{{\"ms\":{d}}}", .{long_call_ms});
         try b.process.?.send(try request(&b.line, era, b.pending, "tools/call", sleep_params));
         _ = switch (era) {
             .session => try b.askProcess(era, "ping", ""),
@@ -574,15 +581,19 @@ const Bench = struct {
 
     fn listen(b: *Bench) WorkloadError!void {
         // A port the system gave and took back, for the server to take.
-        var probe = (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(b.io, .{}) catch return error.ServerFailed; // glint-ignore: Z026 -- the address is literal
+        const loopback: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        var probe = loopback.listen(b.io, .{}) catch return error.ServerFailed;
         const port = probe.socket.address.getPort();
         probe.deinit(b.io);
-        var port_text: [8]u8 = undefined;
-        b.url = std.mem.print(&b.url_buffer, "http://127.0.0.1:{d}/mcp", .{port}) catch unreachable; // glint-ignore: Z026 -- it fits
-        b.process = try Process.start(b.gpa, b.io, b.command, &.{ "--tools", listed_tools, "--port", std.mem.print(&port_text, "{d}", .{port}) catch unreachable }); // glint-ignore: Z026 -- a port fits
+        var url: Io.Writer = .fixed(&b.url_buffer);
+        try url.print("http://127.0.0.1:{d}/mcp", .{port});
+        b.url = url.buffered();
+        var port_buffer: [5]u8 = undefined;
+        const port_text = port_buffer[0..std.fmt.printInt(&port_buffer, port, 10, .lower, .{})];
+        b.process = try Process.start(b.gpa, b.io, b.command, &.{ "--tools", listed_tools, "--port", port_text });
         errdefer b.stopProcess();
         // Ready once it accepts a connection.
-        const address = Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable; // glint-ignore: Z026 -- the address is literal
+        const address: Io.net.IpAddress = .{ .ip4 = .loopback(port) };
         for (0..1000) |_| {
             if (address.connect(b.io, .{ .mode = .stream })) |stream| {
                 stream.close(b.io);
