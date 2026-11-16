@@ -424,8 +424,8 @@ fn keep(a: *Authorizer, h: *Held, io: Io, key: []const u8, set: TokenSet) RenewE
 
 /// Forgets the server: its tokens, here and kept, and the client it
 /// registered.
-fn forgetServer(a: *Authorizer, h: *Held, io: Io, arena: Allocator) Allocator.Error!void {
-    a.store().forget(io, try a.storeKey(h, arena));
+fn forgetServer(a: *Authorizer, h: *Held, io: Io, arena: Allocator) (Allocator.Error || Io.Cancelable)!void {
+    try a.store().forget(io, try a.storeKey(h, arena));
     if (h.active) |*set| set.deinit();
     h.active = null;
     if (h.registered) |*r| r.deinit(a.gpa);

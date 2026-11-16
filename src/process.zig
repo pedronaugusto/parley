@@ -98,7 +98,7 @@ pub const Child = struct {
                 .stderr = switch (options.stderr) {
                     .inherit => .inherit,
                     .ignore => .ignore,
-                    .file => |f| .{ .file = f.get() },
+                    .file => |f| .{ .file = f },
                     .kept => .pipe,
                 },
             } },

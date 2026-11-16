@@ -110,7 +110,7 @@ const Harness = struct {
             .{ .name = "Accept", .value = "application/json, text/event-stream" },
         });
         try fields.appendSlice(arena, extra);
-        var response = try h.client.send(io, .{ .method = .POST, .url = url, .headers = fields.items, .body = .{ .bytes = body } });
+        var response = try h.client.send(io, .{ .method = .post, .url = url, .headers = fields.items, .body = .{ .bytes = body } });
         defer response.deinit(io);
         const content_type = try arena.dupe(u8, response.headers.get("Content-Type") orelse "");
         return .{ .status = response.status, .content_type = content_type, .body = try response.collect(arena, io, .limited(4 << 20)) };
@@ -175,7 +175,7 @@ test "an answer larger than a buffer goes out as it is written: as JSON of its l
     // The last event is the answer, read back by uplink's own reader.
     var in: Io.Reader = .fixed(events.body);
     var data: [1 << 20]u8 = undefined;
-    var reader: uplink.wire.sse.Reader = .init(&in, &data);
+    var reader: uplink.wire.sse.Reader = .init(.causeless(&in), &data);
     var last: ?[]const u8 = null;
     while (try reader.next()) |event| last = try a.dupe(u8, event.data);
     const answer = last.?;
@@ -327,7 +327,7 @@ test "a session's stream ends when the session is deleted" {
     defer arena.deinit();
     var url_buffer: [64]u8 = undefined;
     const url = try std.mem.print(&url_buffer, "http://127.0.0.1:{d}/mcp", .{h.port});
-    var opened = try h.client.send(io, .{ .method = .POST, .url = url, .headers = &.{
+    var opened = try h.client.send(io, .{ .method = .post, .url = url, .headers = &.{
         .{ .name = "Content-Type", .value = "application/json" },
         .{ .name = "Accept", .value = "application/json, text/event-stream" },
     }, .body = .{ .bytes = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}" } });
@@ -339,7 +339,7 @@ test "a session's stream ends when the session is deleted" {
     // reached only when the test failed first; how the reader ends is not what it checks
     defer streaming.cancel(io) catch {};
     try Stall.until(&stream_open);
-    var deleted = try h.client.send(io, .{ .method = .DELETE, .url = url, .headers = &.{
+    var deleted = try h.client.send(io, .{ .method = .delete, .url = url, .headers = &.{
         .{ .name = "Mcp-Session-Id", .value = session },
         .{ .name = "MCP-Protocol-Version", .value = "2025-11-25" },
     } });
@@ -355,7 +355,7 @@ var stream_open: std.atomic.Value(bool) = .init(false);
 fn readStream(h: *Harness, io: Io, url: []const u8, session: []const u8) !void {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    var stream = try h.client.send(io, .{ .method = .GET, .url = url, .headers = &.{
+    var stream = try h.client.send(io, .{ .method = .get, .url = url, .headers = &.{
         .{ .name = "Accept", .value = "text/event-stream" },
         .{ .name = "Mcp-Session-Id", .value = session },
         .{ .name = "MCP-Protocol-Version", .value = "2025-11-25" },
@@ -545,7 +545,7 @@ fn openSession(h: *Harness, io: Io, arena: std.mem.Allocator, version: []const u
     var url_buffer: [64]u8 = undefined;
     const url = try std.mem.print(&url_buffer, "http://127.0.0.1:{d}/mcp", .{h.port});
     const body = try arena.print("{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{s}\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"t\",\"version\":\"0\"}}}}}}", .{version});
-    var opened = try h.client.send(io, .{ .method = .POST, .url = url, .headers = &.{
+    var opened = try h.client.send(io, .{ .method = .post, .url = url, .headers = &.{
         .{ .name = "Content-Type", .value = "application/json" },
         .{ .name = "Accept", .value = "application/json, text/event-stream" },
     }, .body = .{ .bytes = body } });
@@ -623,13 +623,13 @@ const SseClient = struct {
         const url = try std.mem.print(&url_buffer, "http://127.0.0.1:{d}/sse", .{h.port});
         // The stream is left open, never read to an end: its connection is
         // not one to keep.
-        c.stream = try h.client.send(io, .{ .method = .GET, .url = url, .headers = &.{
+        c.stream = try h.client.send(io, .{ .method = .get, .url = url, .headers = &.{
             .{ .name = "Accept", .value = "text/event-stream" },
             .{ .name = "Connection", .value = "close" },
         } });
         errdefer c.stream.deinit(io);
         try testing.expectEqual(std.http.Status.ok, c.stream.status);
-        c.events = .init(c.stream.reader(io), &c.data);
+        c.events = .init(c.stream.readEnd(io), &c.data);
         const first = (try c.events.next()).?;
         try testing.expectEqualStrings("endpoint", first.type);
         try testing.expect(std.mem.startsWith(u8, first.data, "/sse?sessionId="));
@@ -641,7 +641,7 @@ const SseClient = struct {
     }
 
     fn post(c: *SseClient, io: Io, body: []const u8) !std.http.Status {
-        var response = try c.h.client.send(io, .{ .method = .POST, .url = c.url, .headers = &.{.{ .name = "Content-Type", .value = "application/json" }}, .body = .{ .bytes = body } });
+        var response = try c.h.client.send(io, .{ .method = .post, .url = c.url, .headers = &.{.{ .name = "Content-Type", .value = "application/json" }}, .body = .{ .bytes = body } });
         defer response.deinit(io);
         return response.status;
     }
@@ -693,7 +693,7 @@ test "HTTP+SSE: a POST naming no session, or one whose stream has ended, is refu
     defer h.stop(io);
     var url_buffer: [96]u8 = undefined;
     const unknown = try std.mem.print(&url_buffer, "http://127.0.0.1:{d}/sse?sessionId=00", .{h.port});
-    var refused = try h.client.send(io, .{ .method = .POST, .url = unknown, .headers = &.{.{ .name = "Content-Type", .value = "application/json" }}, .body = .{ .bytes = initialize_2024 } });
+    var refused = try h.client.send(io, .{ .method = .post, .url = unknown, .headers = &.{.{ .name = "Content-Type", .value = "application/json" }}, .body = .{ .bytes = initialize_2024 } });
     defer refused.deinit(io);
     try testing.expectEqual(std.http.Status.not_found, refused.status);
 

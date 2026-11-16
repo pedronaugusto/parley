@@ -211,7 +211,7 @@ fn readSession(t: *Transport, io: Io, arena: Allocator, client: *Client) (Io.Can
         .{ .name = headers.protocol_version, .value = client.revision.text() },
     });
     if (t.session) |id| try fields.append(arena, .{ .name = headers.session_id, .value = id });
-    var response = t.send(io, arena, .{ .method = .GET, .url = t.url, .headers = fields.items }) catch |err| switch (err) {
+    var response = t.send(io, arena, .{ .method = .get, .url = t.url, .headers = fields.items }) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         error.OutOfMemory => return error.OutOfMemory,
         // A server with no stream for the session, or one out of reach:
@@ -221,12 +221,12 @@ fn readSession(t: *Transport, io: Io, arena: Allocator, client: *Client) (Io.Can
     defer response.deinit(io);
     if (response.status != .ok) return;
     const data = try arena.alloc(u8, client.options.limits.message.raw());
-    var reader: uplink.wire.sse.Reader = .init(response.reader(io), data);
+    var reader: uplink.wire.sse.Reader = .init(response.readEnd(io), data);
     while (reader.next() catch |err| switch (err) {
         // A read the task's cancel stopped returns it; any other failure
         // is the stream's end.
-        error.ReadFailed => if (response.failure() == error.Canceled) return error.Canceled else return,
-        error.DataTooLong, error.FieldTooLong => return,
+        error.Canceled => return error.Canceled,
+        error.ReadFailed, error.DataTooLong, error.FieldTooLong => return,
     }) |event| {
         t.sessionEvent(io, client, event.data) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
@@ -338,7 +338,7 @@ fn request(ct: *Client.Transport, io: Io, arena: Allocator, exchange: *Client.Ex
     } else if (t.session) |id| try fields.append(arena, .{ .name = headers.session_id, .value = id });
 
     var response = t.send(io, arena, .{
-        .method = .POST,
+        .method = .post,
         .url = t.url,
         .headers = fields.items,
         .body = .{ .bytes = exchange.message },
@@ -384,12 +384,12 @@ fn events(t: *Transport, io: Io, arena: Allocator, exchange: *Client.Exchange, f
     var attempts: u8 = 0;
     while (true) {
         const data = try arena.alloc(u8, exchange.client.options.limits.message.raw());
-        var reader: uplink.wire.sse.Reader = .init(response.reader(io), data);
+        var reader: uplink.wire.sse.Reader = .init(response.readEnd(io), data);
         while (reader.next() catch |err| return switch (err) {
             // A read the request's cancel stopped returns it; any other
             // failure is the stream gone.
-            error.ReadFailed => if (response.failure() == error.Canceled) error.Canceled else error.Closed,
-            error.DataTooLong, error.FieldTooLong => error.Closed,
+            error.Canceled => error.Canceled,
+            error.ReadFailed, error.DataTooLong, error.FieldTooLong => error.Closed,
         }) |event| {
             if (event.id.len != 0) last_id = try arena.dupe(u8, event.id);
             if (event.retry) |r| retry = r;
@@ -433,7 +433,7 @@ fn events(t: *Transport, io: Io, arena: Allocator, exchange: *Client.Exchange, f
         });
         if (t.session) |id| try fields.append(arena, .{ .name = headers.session_id, .value = id });
         if (reopened) |*r| r.deinit(io);
-        reopened = t.send(io, arena, .{ .method = .GET, .url = t.url, .headers = fields.items, .timeout = .{ .duration = .{ .raw = exchange.timeout, .clock = .awake } } }) catch |err| return sendError(err);
+        reopened = t.send(io, arena, .{ .method = .get, .url = t.url, .headers = fields.items, .timeout = .{ .duration = .{ .raw = exchange.timeout, .clock = .awake } } }) catch |err| return sendError(err);
         response = &reopened.?;
     }
 }
@@ -451,7 +451,7 @@ fn postAnswer(t: *Transport, io: Io, arena: Allocator, revision: parley.Revision
         .{ .name = headers.protocol_version, .value = revision.text() },
     });
     if (t.session) |id| try fields.append(arena, .{ .name = headers.session_id, .value = id });
-    var response = t.send(io, arena, .{ .method = .POST, .url = t.url, .headers = fields.items, .body = .{ .bytes = message } }) catch |err| return sendError(err);
+    var response = t.send(io, arena, .{ .method = .post, .url = t.url, .headers = fields.items, .body = .{ .bytes = message } }) catch |err| return sendError(err);
     response.deinit(io);
 }
 
@@ -465,7 +465,7 @@ fn notify(ct: *Client.Transport, io: Io, message: []const u8) Client.RequestErro
         .{ .name = "Accept", .value = "application/json, text/event-stream" },
     });
     if (t.session) |id| try fields.append(arena.allocator(), .{ .name = headers.session_id, .value = id });
-    var response = t.send(io, arena.allocator(), .{ .method = .POST, .url = t.url, .headers = fields.items, .body = .{ .bytes = message } }) catch |err| return sendError(err);
+    var response = t.send(io, arena.allocator(), .{ .method = .post, .url = t.url, .headers = fields.items, .body = .{ .bytes = message } }) catch |err| return sendError(err);
     response.deinit(io);
 }
 

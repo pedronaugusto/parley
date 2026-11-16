@@ -281,7 +281,7 @@ const Client = struct {
             fields[count] = .{ .name = "Mcp-Session-Id", .value = s };
             count += 1;
         }
-        var response = c.http.send(io, .{ .method = .POST, .url = c.url, .headers = fields[0..count], .body = .{ .bytes = body } }) catch |err| return switch (err) {
+        var response = c.http.send(io, .{ .method = .post, .url = c.url, .headers = fields[0..count], .body = .{ .bytes = body } }) catch |err| return switch (err) {
             error.Canceled => error.Canceled,
             else => error.HttpFailed,
         };
@@ -330,7 +330,7 @@ const Client = struct {
         const s = c.session orelse return;
         c.session = null;
         const fields = [_]std.http.Header{ .{ .name = "Mcp-Session-Id", .value = s }, .{ .name = "MCP-Protocol-Version", .value = "2025-11-25" } };
-        var response = c.http.send(io, .{ .method = .DELETE, .url = c.url, .headers = &fields }) catch |err| return switch (err) {
+        var response = c.http.send(io, .{ .method = .delete, .url = c.url, .headers = &fields }) catch |err| return switch (err) {
             error.Canceled => error.Canceled,
             else => error.HttpFailed,
         };
