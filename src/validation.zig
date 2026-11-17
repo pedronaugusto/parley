@@ -1,4 +1,4 @@
-//! JSON Schema validation through strand's `strand_schema`, in a parley built
+//! JSON Schema validation through the strand_schema package, in a parley built
 //! with it (the build option `schema`, on by default). The client checks a
 //! tool's structured content against the output schema `tools/list` gave for
 //! it; the server checks the arguments of a tool whose input schema it was

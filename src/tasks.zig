@@ -391,15 +391,12 @@ pub fn write(w: *Writer, task: *const Task, form: Form, ttl: Duration, poll: Dur
 pub fn writeTime(w: *Writer, at: Instant) Writer.Error!void {
     const from_epoch: Instant = .fromRaw(@max(at.raw(), 0));
     const t = almanac.instant.toDateTime(from_epoch, .utc) catch almanac.instant.toDateTime(almanac.instant.max, .utc) catch aegis.assert.never("almanac's last instant is in its calendar");
-    try w.print("\"{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z\"", .{
-        @as(u16, @intCast(t.date.year.raw())), // safe: from 1970 to almanac's last year, 9999; unsigned, so no sign is written
-        t.date.month.raw(),
-        t.date.day.raw(),
-        t.time.hour.raw(),
-        t.time.minute.raw(),
-        t.time.second.raw(),
-        t.time.nanosecond.raw() / std.time.ns_per_ms,
-    });
+    // The second's fraction to the millisecond, rounded down: a conversion that cannot fail.
+    const ms = aegis.units.Duration(.nanosecond, u32).fromRanged(t.time.nanosecond).convert(.millisecond, u32, .down);
+    try w.writeByte('"');
+    // From 1970 to almanac's last year, 9999: four digits, no sign.
+    try t.date.format(w);
+    try w.print("T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z\"", .{ t.time.hour.raw(), t.time.minute.raw(), t.time.second.raw(), ms.raw() });
 }
 
 test "a time is written as ISO 8601 to the millisecond" {

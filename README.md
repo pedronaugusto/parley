@@ -323,11 +323,12 @@ at each revision, batches on each transport, and the TypeScript SDK's
 
 ## Built with
 
-- [strand](https://github.com/pedronaugusto/strand): JSON, the JSON Schemas
-  of Zig types, and JSON Schema validation (`strand_schema`, behind the build
-  option `schema`, on by default): a tool's structured content against its
-  output schema on the client; given input schemas and elicitation answers on
-  the server.
+- [strand](https://github.com/pedronaugusto/strand): JSON and the JSON
+  Schemas of Zig types.
+- [strand_schema](https://github.com/pedronaugusto/strand-schema): JSON Schema
+  validation, behind the build option `schema` (on by default): a tool's
+  structured content against its output schema on the client; given input
+  schemas and elicitation answers on the server.
 - [aegis](https://github.com/pedronaugusto/aegis): checked types.
 - [almanac](https://github.com/pedronaugusto/almanac): civil time, for a
   task's times.

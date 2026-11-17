@@ -278,7 +278,7 @@ var dynamic_prompt_present: bool = false;
 fn triggerToolChange(call: *Call) Call.Error!ToolResult {
     const server = server_handle.?;
     if (dynamic_present) {
-        _ = server.removeTool(call.io, "test_dynamic_tool") catch return error.Canceled;
+        _ = server.removeTool(call.io, "test_dynamic_tool", call) catch return error.Canceled;
     } else server.addTool(call.io, .{ .name = "test_dynamic_tool", .description = "A tool added and removed at run time" }, simpleText) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Canceled => return error.Canceled,
@@ -295,7 +295,7 @@ fn dynamicPrompt(_: *Call) error{}!parley.PromptResult {
 fn triggerPromptChange(call: *Call) Call.Error!ToolResult {
     const server = server_handle.?;
     if (dynamic_prompt_present) {
-        _ = server.removePrompt(call.io, "test_dynamic_prompt") catch return error.Canceled;
+        _ = server.removePrompt(call.io, "test_dynamic_prompt", call) catch return error.Canceled;
     } else server.addPrompt(call.io, .{ .name = "test_dynamic_prompt", .description = "A prompt added and removed at run time" }, dynamicPrompt) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Canceled => return error.Canceled,

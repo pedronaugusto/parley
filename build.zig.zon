@@ -26,8 +26,14 @@
         },
 
         .strand = .{
-            .url = "git+https://github.com/pedronaugusto/strand#cb3d74c1d706376899172b921459f99958bb3159",
-            .hash = "strand-0.15.0-8LNWVs2dNwAUUxHJE0TrcXd-rO4EGm7paRc3lKe1ppzt",
+            .url = "git+https://github.com/pedronaugusto/strand#7658e111b4cfe55c0ca8c0cd38ffe3f84aca0c07",
+            .hash = "strand-0.15.0-8LNWVjZmMgCZ_nUQh6qOGakZj0P6EqUAxoI4EmnAifjr",
+        },
+
+        .strand_schema = .{
+            .url = "git+https://github.com/pedronaugusto/strand-schema#97cf7478dd1aa635ada647167427322e1a4fab95",
+            .hash = "strand_schema-0.1.0-_ZWmIyxGBQDPyyjyyJTaPawIszHuOMI6RPkruaLsJOJz",
+            .lazy = true,
         },
 
         .uplink = .{
