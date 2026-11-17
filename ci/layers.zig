@@ -13,7 +13,7 @@ pub const layers: []const gantry.rules.Layer = &.{
         "src/context.zig",
         "src/state.zig",
     } },
-    .{ .name = "validation", .patterns = &.{"src/validation.zig"} },
+    .{ .name = "validation", .patterns = &.{"src/Validator.zig"} },
     .{ .name = "handlers", .patterns = &.{"src/Call.zig"} },
     .{ .name = "what a server offers", .patterns = &.{"src/registry.zig"} },
     .{ .name = "the tasks held", .patterns = &.{"src/tasks.zig"} },
@@ -39,6 +39,7 @@ pub const layers: []const gantry.rules.Layer = &.{
         "src/oauth/ResourceMetadata.zig",
     } },
     .{ .name = "authorization public", .patterns = &.{"src/oauth.zig"} },
+    .{ .name = "JSON Schema validation", .patterns = &.{"src/validation.zig"} },
 };
 
 pub const entries: []const []const u8 = &.{};
@@ -48,6 +49,8 @@ pub const modules: []const gantry.NamedModule = &.{
     .{ .name = "parley", .path = "src/parley.zig", .from = "src/process*.zig" },
     .{ .name = "parley", .path = "src/parley.zig", .from = "src/oauth/**" },
     .{ .name = "parley.http", .path = "src/http.zig", .from = "src/oauth/**" },
+    .{ .name = "parley", .path = "src/parley.zig", .from = "src/validation.zig" },
+    .{ .name = "parley.validation", .path = "src/validation.zig", .from = "src/*_test.zig" },
 };
 
 const package_references = [_]gantry.rules.ReferenceRule{
@@ -57,7 +60,6 @@ const package_references = [_]gantry.rules.ReferenceRule{
         "aegis",
         "strand",
         "strand_schema",
-        "parley_options",
         "almanac",
         "uplink",
         "conduit",
@@ -65,6 +67,7 @@ const package_references = [_]gantry.rules.ReferenceRule{
         "test_options",
         "parley",
         "parley.http",
+        "parley.validation",
         "clearance",
         "clearance.oauth",
         "cloak",
@@ -82,6 +85,7 @@ pub const required = [_][]const u8{
     "src/http.zig",
     "src/process.zig",
     "src/oauth.zig",
+    "src/validation.zig",
     "src/wire.zig",
     "src/Server.zig",
     "src/tests.zig",
