@@ -17,6 +17,7 @@ const strand = @import("strand");
 const types = @import("types.zig");
 const wire = @import("wire.zig");
 const meta = @import("meta.zig");
+const validation = @import("validation.zig");
 const Revision = @import("revision.zig").Revision;
 
 const tasks_extension = "io.modelcontextprotocol/tasks";
@@ -42,6 +43,17 @@ server_capabilities: ?[]const u8 = null,
 server_info: ?types.Implementation = null,
 instructions: ?[]const u8 = null,
 next_id: aegis.Atomic(Requests) = .init(.fromRaw(1)),
+/// Private: the output schema of each tool `tools/list` named, compiled
+/// (`Options.validate_output`), by the tool's name.
+outputs: aegis.BlockingGuarded(Outputs) = .init(.empty),
+
+const Outputs = std.StringHashMapUnmanaged(Output);
+
+/// A listed tool's output schema, compiled, or why it did not compile.
+const Output = union(enum) {
+    compiled: validation.Compiled,
+    refused: validation.Failure,
+};
 
 /// The requests the client has sent, which number the next: one at a time,
 /// it never reaches 2^63.
@@ -73,6 +85,13 @@ pub const Options = struct {
     /// runs as a task is polled to its end, its input given as it asks,
     /// and answers as if it had been answered at once.
     tasks: bool = true,
+    /// Check a tool call's `structuredContent` against the `outputSchema`
+    /// `tools/list` gave for the tool (MCP: a client SHOULD), by
+    /// `strand_schema` with every `format` asserted; a `pattern` it cannot
+    /// run in linear time is left unchecked and named in the outcome
+    /// (`ToolOutcome.unchecked`). A tool never listed is not checked. Has
+    /// no effect in a parley built without `schema`.
+    validate_output: bool = true,
     limits: Limits = .{},
 };
 
@@ -218,7 +237,24 @@ pub fn init(gpa: Allocator, transport: *Transport, options: Options) Client {
 }
 
 pub fn deinit(c: *Client) void {
+    const outputs = c.outputs.teardown();
+    var it = outputs.iterator();
+    while (it.next()) |e| {
+        c.gpa.free(e.key_ptr.*);
+        freeOutput(c.gpa, e.value_ptr);
+    }
+    outputs.deinit(c.gpa);
     c.arena.deinit();
+}
+
+fn freeOutput(gpa: Allocator, output: *Output) void {
+    switch (output.*) {
+        .compiled => |*compiled| if (validation.built) compiled.release(),
+        .refused => |f| {
+            gpa.free(f.message);
+            gpa.free(f.schema_location);
+        },
+    }
 }
 
 /// Learns the server's era and what it offers: `server/discover`, and when
@@ -467,8 +503,12 @@ fn encode(arena: Allocator, limits: strand.core.Limits, value: anytype) error{Wr
 }
 
 /// `Failed`: the server answered with a JSON-RPC error, which `failure`
-/// holds after the call.
-pub const CallError = RequestError || error{ Protocol, Failed, TooManyRounds };
+/// holds after the call. `StructuredContentInvalid`: a tool's result is
+/// not valid against its output schema, or has no structured content
+/// though the tool has one; `OutputSchemaRefused`: the tool's output
+/// schema did not compile, so its result cannot be checked. `schema`
+/// holds why after either (`Options.validate_output`).
+pub const CallError = RequestError || error{ Protocol, Failed, TooManyRounds, StructuredContentInvalid, OutputSchemaRefused };
 
 /// The error a call's answer carried.
 pub const Failure = struct {
@@ -479,6 +519,8 @@ pub const Failure = struct {
 
 pub const Diagnostics = struct {
     failure: ?Failure = null,
+    /// Why a tool's structured content was refused, or its output schema.
+    schema: ?validation.Failure = null,
 };
 
 /// A result, as JSON, after any rounds of input it took.
@@ -689,8 +731,87 @@ pub fn list(c: *Client, io: Io, arena: Allocator, method: []const u8, cursor: ?[
     }
     out.writer.writeByte('}') catch return error.OutOfMemory;
     const result = try c.call(io, arena, method, out.written(), null, null, diagnostics);
-    if (std.mem.eql(u8, method, "tools/list")) if (c.transport.vtable.listed) |f| return f(c.transport, io, c, arena, result);
+    if (std.mem.eql(u8, method, "tools/list")) {
+        if (validation.built and c.options.validate_output) try c.learnOutputs(io, arena, result, cursor == null);
+        if (c.transport.vtable.listed) |f| return f(c.transport, io, c, arena, result);
+    }
     return result;
+}
+
+/// Compiles the output schema of each tool a `tools/list` page names, in
+/// place of what an earlier listing gave for it; the first page of a
+/// listing (`fresh`) forgets every tool before it.
+fn learnOutputs(c: *Client, io: Io, arena: Allocator, result: []const u8, fresh: bool) CallError!void {
+    const Listed = struct { tools: []const struct { name: []const u8, outputSchema: ?Raw = null } = &.{} };
+    const page = strand.json.parseLeaky(Listed, arena, result, types.readOptions(c.jsonLimits())) catch return error.Protocol;
+    // Compiled before the lock is taken, and released after it.
+    var learned: std.ArrayList(struct { name: []const u8, output: ?Output }) = .empty;
+    defer {
+        for (learned.items) |*l| if (l.output) |*o| freeOutput(c.gpa, o);
+        learned.deinit(arena);
+    }
+    for (page.tools) |tool| {
+        try learned.append(arena, .{ .name = tool.name, .output = null });
+        const schema = tool.outputSchema orelse continue;
+        var failure: validation.Failure = .{};
+        learned.items[learned.items.len - 1].output = if (validation.compile(c.gpa, io, schema.bytes, .downgrade, arena, &failure)) |compiled|
+            .{ .compiled = compiled }
+        else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => return error.Canceled,
+            error.Refused => .{ .refused = .{
+                .message = try c.gpa.dupe(u8, failure.message),
+                .schema_location = try c.gpa.dupe(u8, failure.schema_location),
+            } },
+        };
+    }
+    var stale: std.ArrayList(Output) = .empty;
+    defer {
+        for (stale.items) |*o| freeOutput(c.gpa, o);
+        stale.deinit(arena);
+    }
+    var held = c.outputs.acquire(io) catch return error.Canceled;
+    defer held.deinit(io);
+    const outputs = held.value();
+    if (fresh) {
+        var it = outputs.iterator();
+        while (it.next()) |e| {
+            try stale.append(arena, e.value_ptr.*);
+            c.gpa.free(e.key_ptr.*);
+        }
+        outputs.clearRetainingCapacity();
+    }
+    for (learned.items) |*l| {
+        if (outputs.fetchRemove(l.name)) |old| {
+            c.gpa.free(old.key);
+            try stale.append(arena, old.value);
+        }
+        const output = l.output orelse continue;
+        const key = try c.gpa.dupe(u8, l.name);
+        outputs.put(c.gpa, key, output) catch |err| {
+            c.gpa.free(key);
+            return err;
+        };
+        l.output = null;
+    }
+}
+
+/// The output schema `tools/list` gave for `name`, held for the caller, or
+/// null when it gave none; `OutputSchemaRefused` when it did not compile.
+fn outputSchema(c: *Client, io: Io, arena: Allocator, name: []const u8, diagnostics: ?*Diagnostics) CallError!?validation.Compiled {
+    var held = c.outputs.acquire(io) catch return error.Canceled;
+    defer held.deinit(io);
+    const output = held.value().getPtr(name) orelse return null;
+    switch (output.*) {
+        .compiled => |*compiled| return compiled.retain(),
+        .refused => |f| {
+            if (diagnostics) |d| d.schema = .{
+                .message = try arena.dupe(u8, f.message),
+                .schema_location = try arena.dupe(u8, f.schema_location),
+            };
+            return error.OutputSchemaRefused;
+        },
+    }
 }
 
 /// Arguments as the object a request carries: a `Raw` as it is, an empty
@@ -707,6 +828,10 @@ pub const ToolOutcome = struct {
     content: []const types.ContentBlock = &.{},
     structured: ?Raw = null,
     is_error: bool = false,
+    /// The output schema's keywords the structured content was not checked
+    /// against, by their locations: patterns `strand_schema` cannot run in
+    /// linear time (`Options.validate_output`).
+    unchecked: []const []const u8 = &.{},
 };
 
 /// Calls the tool `name` with `arguments` (any value strand writes, or a
@@ -727,7 +852,23 @@ pub fn callTool(c: *Client, io: Io, arena: Allocator, name: []const u8, argument
         isError: bool = false,
     };
     const o = strand.json.parseLeaky(Outcome, arena, result, types.readOptions(c.jsonLimits())) catch return error.Protocol;
-    return .{ .content = o.content, .structured = o.structuredContent, .is_error = o.isError };
+    var outcome: ToolOutcome = .{ .content = o.content, .structured = o.structuredContent, .is_error = o.isError };
+    // An error result answers the model, not the schema.
+    if (!validation.built or !c.options.validate_output or o.isError) return outcome;
+    var schema = try c.outputSchema(io, arena, name, diagnostics) orelse return outcome;
+    defer schema.release();
+    const structured = o.structuredContent orelse {
+        if (diagnostics) |d| d.schema = .{ .message = "the result has no structuredContent, and the tool has an outputSchema" };
+        return error.StructuredContentInvalid;
+    };
+    switch (try validation.check(&schema, io, arena, structured.bytes)) {
+        .valid => |unchecked| outcome.unchecked = unchecked,
+        .invalid => |failure| {
+            if (diagnostics) |d| d.schema = failure;
+            return error.StructuredContentInvalid;
+        },
+    }
+    return outcome;
 }
 
 /// Reads the resource `uri`: its contents.

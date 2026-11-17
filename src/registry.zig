@@ -6,6 +6,7 @@ const std = @import("std");
 const strand = @import("strand");
 const types = @import("types.zig");
 const Call = @import("Call.zig");
+const validation = @import("validation.zig");
 
 const Allocator = std.mem.Allocator;
 const Raw = strand.json.Raw;
@@ -96,6 +97,11 @@ pub const Tool = struct {
     /// The arguments its schema mirrors into `Mcp-Param-{name}` headers.
     headers: []const HeaderParam = &.{},
     task: TaskSupport = .forbidden,
+    /// The input schema it was given (`ToolSpec.input_schema`), compiled:
+    /// what a call's arguments are checked against before its handler
+    /// runs. Null for a schema derived from the handler's type, which
+    /// decoding checks.
+    input: ?validation.Compiled = null,
 };
 
 /// An argument a tool's input schema marks with `x-mcp-header`: an HTTP

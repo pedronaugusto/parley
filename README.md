@@ -323,8 +323,11 @@ at each revision, batches on each transport, and the TypeScript SDK's
 
 ## Built with
 
-- [strand](https://github.com/pedronaugusto/strand): JSON, and the JSON
-  Schemas of Zig types.
+- [strand](https://github.com/pedronaugusto/strand): JSON, the JSON Schemas
+  of Zig types, and JSON Schema validation (`strand_schema`, behind the build
+  option `schema`, on by default): a tool's structured content against its
+  output schema on the client; given input schemas and elicitation answers on
+  the server.
 - [aegis](https://github.com/pedronaugusto/aegis): checked types.
 - [uplink](https://github.com/pedronaugusto/uplink) (`parley.http`): HTTP.
 - [clearance](https://github.com/pedronaugusto/clearance) (`parley.oauth`):

@@ -20,6 +20,7 @@ const std = @import("std");
 const strand = @import("strand");
 const types = @import("types.zig");
 const wire = @import("wire.zig");
+const validation = @import("validation.zig");
 const Context = @import("context.zig").Context;
 const Sink = @import("context.zig").Sink;
 
@@ -101,10 +102,29 @@ pub fn input(call: *Call, key: []const u8, request: types.InputRequest) Error!?R
     return null;
 }
 
-/// Asks the user, through the client, to fill a form or open a URL.
+/// Asks the user, through the client, to fill a form or open a URL. A
+/// form's accepted content is checked against its requested schema (in a
+/// parley built with `schema`): content it refuses is `InvalidInput`, as
+/// an answer that does not read is; a requested schema that does not
+/// compile is `HandlerFailed`.
 pub fn elicit(call: *Call, key: []const u8, request: types.Elicit) Error!?types.ElicitResult {
     const raw = try call.input(key, .{ .elicit = request }) orelse return null;
-    return try parseAnswer(types.ElicitResult, call.arena, raw, call.limits);
+    const answer = try parseAnswer(types.ElicitResult, call.arena, raw, call.limits);
+    if (!validation.built or answer.action != .accept) return answer;
+    const form = switch (request) {
+        .form => |f| f,
+        .url => return answer,
+    };
+    var schema = validation.compile(call.arena, call.io, form.requested_schema.bytes, .refuse, call.arena, null) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Canceled => error.Canceled,
+        error.Refused => error.HandlerFailed,
+    };
+    defer schema.release();
+    return switch (try validation.check(&schema, call.io, call.arena, if (answer.content) |c| c.bytes else "{}")) {
+        .valid => answer,
+        .invalid => error.InvalidInput,
+    };
 }
 
 /// Asks the client's model for a completion.

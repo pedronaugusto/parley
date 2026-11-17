@@ -15,6 +15,7 @@ const registry = @import("registry.zig");
 const subscriptions = @import("subscriptions.zig");
 const tasks = @import("tasks.zig");
 const Call = @import("Call.zig");
+const validation = @import("validation.zig");
 const Revision = @import("revision.zig").Revision;
 const Context = @import("context.zig").Context;
 const Sink = @import("context.zig").Sink;
@@ -203,6 +204,7 @@ pub fn deinit(s: *Server) void {
 fn freeEntry(s: *Server, entry: anytype) void {
     if (@TypeOf(entry) == *registry.Tool) {
         registry.freeHeaderParams(s.gpa, entry.headers);
+        if (validation.built) if (entry.input) |*input| input.release();
     }
     inline for (@typeInfo(@TypeOf(entry.*)).@"struct".field_names) |name| {
         const F = @FieldType(@TypeOf(entry.*), name);
@@ -234,7 +236,8 @@ pub fn addTool(s: *Server, io: Io, spec: registry.ToolSpec, comptime handler: an
 }
 
 /// Adds a tool with a handler that takes its arguments as JSON; `spec`
-/// must give its input schema.
+/// must give its input schema, which every call's arguments are checked
+/// against before the handler runs (in a parley built with `schema`).
 pub fn addDynamicTool(s: *Server, io: Io, spec: registry.ToolSpec, handler: *registry.ToolHandler) AddError!void {
     return s.addToolWith(io, spec, spec.input_schema orelse return error.InvalidSchema, spec.output_schema, .{ .dynamic = handler });
 }
@@ -249,7 +252,18 @@ fn addToolWith(s: *Server, io: Io, spec: registry.ToolSpec, input: []const u8, o
     errdefer s.gpa.free(listed);
     const params = try registry.headerParams(s.gpa, input, s.jsonLimits());
     errdefer registry.freeHeaderParams(s.gpa, params);
-    tool.* = .{ .name = name, .listed = listed, .handling = handling, .headers = params, .task = spec.task };
+    // A schema given, not derived from a type: decoding cannot check it.
+    var compiled: ?validation.Compiled = null;
+    if (validation.built and spec.input_schema != null) {
+        var scratch: std.heap.ArenaAllocator = .init(s.gpa);
+        defer scratch.deinit();
+        compiled = validation.compile(s.gpa, io, input, .refuse, scratch.allocator(), null) catch |err| return switch (err) {
+            error.Refused => error.InvalidSchema,
+            else => |e| e,
+        };
+    }
+    errdefer if (validation.built) if (compiled) |*c| c.release();
+    tool.* = .{ .name = name, .listed = listed, .handling = handling, .headers = params, .task = spec.task, .input = compiled };
     try s.insert(io, .tools, tool, name);
 }
 
@@ -953,13 +967,32 @@ pub fn inputRequiredJson(s: *const Server, arena: Allocator, ir: InputRequired) 
 fn callTool(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink) BuildError!Reply {
     const p = try s.parseParams(types.CallToolParams, arena, request.params) orelse return failure(.invalid_params, "params are not what the schema says");
     if (p.arguments) |a| if (a.bytes[0] != '{') return failure(.invalid_params, "arguments is not an object");
-    const handler, const task_support = found: {
+    const handler, const task_support, var input = found: {
         var held = s.lists.acquire(io) catch return error.Canceled;
         defer held.deinit(io);
-        for (held.value().tools.items) |t| if (std.mem.eql(u8, t.name, p.name)) break :found .{ t.handling.handler(), t.task };
+        for (held.value().tools.items) |t| if (std.mem.eql(u8, t.name, p.name)) {
+            // Held past the lock: the tool may be removed while it runs.
+            const input: ?validation.Compiled = if (validation.built) if (t.input) |*i| i.retain() else null else null;
+            break :found .{ t.handling.handler(), t.task, input };
+        };
         break :found null;
     } orelse return try unknown(arena, "Unknown tool: ", p.name);
+    defer if (validation.built) if (input) |*i| i.release();
     if (!s.admitted(context, .tools, p.name)) return try unknown(arena, "Unknown tool: ", p.name);
+    if (validation.built) if (input) |*schema| {
+        // Arguments the given schema refuses are an execution error, as
+        // arguments a type does not decode are: the model may correct them.
+        switch (validation.check(schema, io, arena, if (p.arguments) |a| a.bytes else "{}") catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Canceled => error.Canceled,
+        }) {
+            .valid => {},
+            .invalid => |refused| {
+                const message = try std.mem.concat(arena, u8, &.{ "invalid arguments: ", try validation.describe(arena, refused) });
+                return .{ .result = try Content.body(s, arena, context.revision, .{ .tool = .{ .result = .failure(message), .identify = true } }) };
+            },
+        }
+    };
     const tasks_declared = s.options.tasks != null and context.revision.stateless() and context.client.hasExtension(tasks.extension, s.jsonLimits());
     // A tool that cannot answer but as a task, asked by a client that
     // cannot take one (tasks extension: required capabilities).

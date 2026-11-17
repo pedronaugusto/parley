@@ -313,3 +313,72 @@ test "an RFC 6570 template matches what it describes and nothing else" {
     try testing.expect(Server.matches("file:///{+path}", "file:///a/b/c.txt"));
     try testing.expect(!Server.matches("test://static", "test://static/x"));
 }
+
+/// A dynamic tool: answers with the arguments it was given.
+fn echoArguments(_: *parley.ToolHandler, call: *Call, arguments: ?[]const u8) Call.Error!parley.ToolResult {
+    return .ofText(try call.arena.dupe(u8, arguments orelse "{}"));
+}
+
+test "a given input schema checks every call's arguments before the handler runs, as an execution error" {
+    if (!parley.validation.built) return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var s = try newServer(testing.io);
+    defer s.deinit();
+    var r: Recorder = .{ .gpa = testing.allocator };
+    defer r.deinit();
+    var handler: parley.ToolHandler = .{ .callFn = echoArguments };
+    try s.addDynamicTool(testing.io, .{ .name = "book", .input_schema =
+        \\{"type":"object","properties":{"code":{"type":"string","pattern":"^[A-Z]{3}$"},"day":{"type":"string","format":"date"}},
+        \\ "required":["code"],"additionalProperties":false}
+    }, &handler);
+    const Case = struct { arguments: []const u8, answer: []const u8 };
+    const cases = [_]Case{
+        .{ .arguments = "{\"code\":\"LIS\",\"day\":\"2026-11-17\"}", .answer = "\"text\":\"{\\\"code\\\":\\\"LIS\\\",\\\"day\\\":\\\"2026-11-17\\\"}\"}]" },
+        // The pattern, the format asserted, a member required, one not allowed.
+        .{ .arguments = "{\"code\":\"lis\"}", .answer = "\"text\":\"invalid arguments: " },
+        .{ .arguments = "{\"code\":\"LIS\",\"day\":\"2026-02-30\"}", .answer = "at /day\"}],\"isError\":true" },
+        .{ .arguments = "{\"day\":\"2026-11-17\"}", .answer = "\"isError\":true" },
+        .{ .arguments = "{\"code\":\"LIS\",\"seat\":1}", .answer = "\"isError\":true" },
+    };
+    for (cases) |c| {
+        const answer = try ask(&s, a, &r, "tools/call", try a.print("{{\"name\":\"book\",\"arguments\":{s},{s}}}", .{ c.arguments, meta }));
+        try expectContains(answer, c.answer);
+    }
+    // No arguments are the empty object, which lacks `code`.
+    try expectContains(try ask(&s, a, &r, "tools/call", "{\"name\":\"book\"," ++ meta ++ "}"), "\"isError\":true");
+    // A typed tool given a schema stricter than its type is checked by both.
+    try s.addTool(testing.io, .{ .name = "short", .input_schema = "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\",\"maxLength\":3}},\"required\":[\"text\"]}" }, echo);
+    try expectContains(try ask(&s, a, &r, "tools/call", "{\"name\":\"short\",\"arguments\":{\"text\":\"abc\"}," ++ meta ++ "}"), "\"text\":\"abc\"}]");
+    try expectContains(try ask(&s, a, &r, "tools/call", "{\"name\":\"short\",\"arguments\":{\"text\":\"abcd\"}," ++ meta ++ "}"), "\"text\":\"invalid arguments: ");
+    // A schema strand_schema does not compile, or a pattern it cannot run in
+    // linear time, is refused when the tool is added.
+    try testing.expectError(error.InvalidSchema, s.addDynamicTool(testing.io, .{ .name = "bad", .input_schema = "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":12}}}" }, &handler));
+    try testing.expectError(error.InvalidSchema, s.addDynamicTool(testing.io, .{ .name = "slow", .input_schema = "{\"type\":\"object\",\"properties\":{\"a\":{\"pattern\":\"(a)\\\\1\"}}}" }, &handler));
+    // A tool removed while nothing holds its schema frees it.
+    try testing.expect(try s.removeTool(testing.io, "book"));
+}
+
+test "an accepted elicitation's content is checked against the schema it asked with" {
+    if (!parley.validation.built) return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var s = try newServer(testing.io);
+    defer s.deinit();
+    var r: Recorder = .{ .gpa = testing.allocator };
+    defer r.deinit();
+    const first = try ask(&s, a, &r, "tools/call", "{\"name\":\"greet\"," ++ meta ++ "}");
+    const Answer = struct { result: struct { requestState: []const u8 } };
+    const sealed = (try strand.json.parseLeaky(Answer, a, first, .{ .ignore_unknown_fields = true })).result.requestState;
+    // `name` is required and a string: content without it, or with a
+    // number, is not the answer to what was asked.
+    for ([_][]const u8{ "{}", "{\"name\":5}" }) |content| {
+        const retry = try a.print("{{\"name\":\"greet\",\"inputResponses\":{{\"name\":{{\"action\":\"accept\",\"content\":{s}}}}},\"requestState\":\"{s}\",{s}}}", .{ content, sealed, meta });
+        try expectContains(try ask(&s, a, &r, "tools/call", retry), "\"error\":{\"code\":-32602,\"message\":\"an input response is not the answer to what was asked\"}");
+    }
+    // What it asked for, accepted.
+    const retry = try a.print("{{\"name\":\"greet\",\"inputResponses\":{{\"name\":{{\"action\":\"accept\",\"content\":{{\"name\":\"ada\"}}}}}},\"requestState\":\"{s}\",{s}}}", .{ sealed, meta });
+    try expectContains(try ask(&s, a, &r, "tools/call", retry), "\"text\":\"hello ada\"");
+}

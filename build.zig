@@ -7,15 +7,22 @@ const std = @import("std");
 /// default) `parley.process`, a server launched as a child process, on
 /// conduit, fetched only then; with `oauth` (the default, and `http`)
 /// `parley.oauth`, MCP's authorization on clearance's OAuth 2.1, fetched only
-/// then.
+/// then; with `schema` (the default) JSON Schema validation on both sides,
+/// through strand's `strand_schema`, which fetches spectra, almanac and
+/// uplink's `wire` alone (no reactor, no TLS).
 pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const with_http = b.option(bool, "http", "Build parley.http, Streamable HTTP on uplink, which fetches uplink") orelse true;
     const with_process = b.option(bool, "process", "Build parley.process, a server launched as a child process, which fetches conduit") orelse true;
     const with_oauth = b.option(bool, "oauth", "Build parley.oauth, MCP's authorization on OAuth 2.1, which fetches clearance") orelse true;
+    const with_schema = b.option(bool, "schema", "Validate against JSON Schema through strand_schema (a tool's structured content on the client; given input schemas and elicitation answers on the server), which fetches spectra, almanac and uplink's wire") orelse true;
     const aegis = b.dependency("aegis", .{ .target = target, .optimize = optimize }).module("aegis");
     const strand = b.dependency("strand", .{ .target = target, .optimize = optimize }).module("strand");
+    const options = b.addOptions();
+    // Its own name: an options file the same as strand_options would be one
+    // file in two modules, which Zig refuses.
+    options.addOption(bool, "validation", with_schema);
     const parley = b.addModule("parley", .{
         .root_source_file = b.path("src/parley.zig"),
         .target = target,
@@ -23,8 +30,19 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
         .imports = &.{
             .{ .name = "aegis", .module = aegis },
             .{ .name = "strand", .module = strand },
+            .{ .name = "parley_options", .module = options.createModule() },
         },
     });
+    // strand adds `strand_schema` once its own lazy dependencies are
+    // fetched: until then this pass has marked them, and configures again.
+    // It reads through the `strand` every other package has (clearance's,
+    // a consumer's), not the one strand builds beside it, which is the same
+    // file in another module, which Zig refuses in one program.
+    const strand_schema = if (with_schema) b.dependency("strand", .{ .target = target, .optimize = optimize, .schema = true }).builder.modules.get("strand_schema") else null;
+    if (strand_schema) |m| {
+        m.addImport("strand", strand);
+        parley.addImport("strand_schema", m);
+    }
     // Each module is declared before what it needs is fetched: a consumer's
     // first pass must find the module it asks for, and only learns here
     // what to fetch.
@@ -68,6 +86,10 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
     if (try uplink) |u| {
         if (http) |m| m.addImport("uplink", u.module("uplink"));
         if (oauth) |m| m.addImport("uplink", u.module("uplink"));
+        // strand_schema reads URIs through uplink's wire, asked for without
+        // the client: the same file as this uplink's own wire, which a
+        // program holding both must have as one module.
+        if (strand_schema) |m| m.addImport("uplink.wire", u.module("uplink.wire"));
     }
     if (try clearance) |c| if (oauth) |m| {
         m.addImport("clearance", c.module("clearance"));

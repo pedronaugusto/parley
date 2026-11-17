@@ -328,3 +328,69 @@ test "a 2024-11-05 server: its revision taken, a batch from it taken, its reques
     task.await(io);
     try testing.expectEqualStrings("[{\"jsonrpc\":\"2.0\",\"id\":900,\"result\":{}}]", server.answer[0..server.answer_len]);
 }
+
+/// A dynamic tool whose structured content its arguments choose: valid,
+/// invalid, missing, or an error result.
+fn report(_: *parley.ToolHandler, _: *Call, arguments: ?[]const u8) Call.Error!parley.ToolResult {
+    const args = arguments orelse "{}";
+    if (std.mem.find(u8, args, "\"bad\"") != null) return .{ .text = "many", .structured = .{ .bytes = "{\"count\":\"many\"}" } };
+    if (std.mem.find(u8, args, "\"none\"") != null) return .ofText("no structure");
+    if (std.mem.find(u8, args, "\"fail\"") != null) return .failure("it failed");
+    return .{ .text = "3", .structured = .{ .bytes = "{\"count\":3,\"tag\":\"aa\"}" } };
+}
+
+test "a tool's structured content is checked against the output schema tools/list gave for it" {
+    if (!parley.validation.built) return error.SkipZigTest;
+    const io = testing.io;
+    var server = try parley.Server.init(testing.allocator, io, .{ .info = .{ .name = "s", .version = "1" } });
+    defer server.deinit();
+    var handler: parley.ToolHandler = .{ .callFn = report };
+    const input = "{\"type\":\"object\",\"properties\":{\"mode\":{\"type\":\"string\"}}}";
+    try server.addDynamicTool(io, .{ .name = "count", .input_schema = input, .output_schema = "{\"type\":\"object\",\"properties\":{\"count\":{\"type\":\"integer\"}},\"required\":[\"count\"]}" }, &handler);
+    // A backreference: a pattern strand_schema does not run, so left unchecked and said to be.
+    try server.addDynamicTool(io, .{ .name = "tagged", .input_schema = input, .output_schema = "{\"type\":\"object\",\"properties\":{\"tag\":{\"type\":\"string\",\"pattern\":\"(a)\\\\1\"}}}" }, &handler);
+    try server.addDynamicTool(io, .{ .name = "broken", .input_schema = input, .output_schema = "{\"type\":\"object\",\"properties\":{\"count\":{\"type\":12}}}" }, &handler);
+    try server.addDynamicTool(io, .{ .name = "unlisted", .input_schema = input }, &handler);
+
+    var wiring: Wiring = .{ .to_server = undefined, .from_server = undefined };
+    wiring.init(io);
+    var task = try io.concurrent(serveTask, .{ io, &server, &wiring.to_server, &wiring.from_server });
+    defer task.cancel(io);
+    var writer_buffer: [4096]u8 = undefined;
+    var out = PipeWriter.init(&wiring.to_server, &writer_buffer);
+    var channel: stdio.Channel = .init(testing.allocator, .causeless(&wiring.from_server.reader), .causeless(&out.writer));
+    var client: Client = .init(testing.allocator, channel.transport(), .{ .info = .{ .name = "c", .version = "1" } });
+    defer client.deinit();
+    try channel.start(io, &client);
+    defer channel.deinit(io);
+    try client.connect(io);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Before a listing there is nothing to check against.
+    _ = try client.callTool(io, a, "count", .{ .mode = "bad" }, null);
+    _ = try client.list(io, a, "tools/list", null, null);
+    const counted = try client.callTool(io, a, "count", .{ .mode = "good" }, null);
+    try testing.expectEqualStrings("{\"count\":3,\"tag\":\"aa\"}", counted.structured.?.bytes);
+    try testing.expectEqual(0, counted.unchecked.len);
+    var why: Client.Diagnostics = .{};
+    try testing.expectError(error.StructuredContentInvalid, client.callTool(io, a, "count", .{ .mode = "bad" }, &why));
+    try testing.expectEqualStrings("/count", why.schema.?.instance_location);
+    why = .{};
+    try testing.expectError(error.StructuredContentInvalid, client.callTool(io, a, "count", .{ .mode = "none" }, &why));
+    try testing.expect(why.schema.?.message.len != 0);
+    // An error result answers the model, and is not checked.
+    try testing.expect((try client.callTool(io, a, "count", .{ .mode = "fail" }, null)).is_error);
+    const tagged = try client.callTool(io, a, "tagged", .{ .mode = "good" }, null);
+    try testing.expectEqual(1, tagged.unchecked.len);
+    why = .{};
+    try testing.expectError(error.OutputSchemaRefused, client.callTool(io, a, "broken", .{ .mode = "good" }, &why));
+    try testing.expect(std.mem.endsWith(u8, why.schema.?.schema_location, "/properties/count/type"));
+    // A tool with no output schema is not checked.
+    _ = try client.callTool(io, a, "unlisted", .{ .mode = "bad" }, null);
+    // Switched off, nothing is.
+    client.options.validate_output = false;
+    _ = try client.callTool(io, a, "count", .{ .mode = "bad" }, null);
+    wiring.to_server.close();
+}
