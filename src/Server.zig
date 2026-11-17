@@ -37,6 +37,9 @@ sealer: state.Sealer,
 identity: []const u8,
 /// Private: the four lists and their generations.
 lists: aegis.BlockingGuarded(Lists) = .init(.{}),
+/// Signaled, under `lists`, when the last call holding a tool or a prompt
+/// ends: what a remove waiting on it wakes to.
+released: aegis.Condition = .init(),
 completer: ?*Completer = null,
 /// The open change streams.
 hub: subscriptions.Hub = .{},
@@ -284,9 +287,29 @@ pub fn toolHeaders(s: *Server, io: Io, arena: Allocator, name: []const u8) (Allo
     return null;
 }
 
-/// Removes the tool named `name`; false when there is none.
-pub fn removeTool(s: *Server, io: Io, name: []const u8) Io.Cancelable!bool {
-    return s.remove(io, .tools, name);
+/// What removing a tool or a prompt can fail with.
+pub const RemoveError = Io.Cancelable || error{
+    /// Asked by a call to the very tool or prompt it removes (`from`): the
+    /// remove would wait for the call making it.
+    RemovesItsOwnCall,
+    /// More removes wait at once than the server's wait admits (65535).
+    WaiterLimit,
+};
+
+/// Removes the tool named `name`; false when there is none. `from` is the
+/// call asking, when a handler removes a tool, and null outside any call.
+///
+/// No new call reaches the tool once it is unlinked, at the start; a call
+/// that found it before, a task's round among them, may still run its
+/// handler, so the remove returns only when the last of them has ended:
+/// then nothing runs the handler, and an application may free one it
+/// owns. A handler that removes its own tool would wait for itself:
+/// given its call as `from`, that is refused (`RemovesItsOwnCall`), the
+/// tool left as it was. Canceled while it waits, the remove returns
+/// `Canceled` with the tool already unlinked, and the last of those calls
+/// to end frees it; the handler may still be running then.
+pub fn removeTool(s: *Server, io: Io, name: []const u8, from: ?*const Call) RemoveError!bool {
+    return s.remove(io, .tools, name, from);
 }
 
 /// Adds a resource read by `read`.
@@ -302,7 +325,10 @@ pub fn addResource(s: *Server, io: Io, spec: registry.ResourceSpec, handler: *re
 }
 
 pub fn removeResource(s: *Server, io: Io, uri: []const u8) Io.Cancelable!bool {
-    return s.remove(io, .resources, uri);
+    return s.remove(io, .resources, uri, null) catch |err| switch (err) {
+        error.Canceled => error.Canceled,
+        error.RemovesItsOwnCall, error.WaiterLimit => unreachable, // unreachable: a resource has no calls held on it
+    };
 }
 
 /// Adds a resource template: a URI that matches it (RFC 6570, `{name}` a
@@ -347,8 +373,11 @@ fn addPromptWith(s: *Server, io: Io, spec: registry.PromptSpec, arguments: []con
     try s.insert(io, .prompts, prompt, name);
 }
 
-pub fn removePrompt(s: *Server, io: Io, name: []const u8) Io.Cancelable!bool {
-    return s.remove(io, .prompts, name);
+/// Removes the prompt named `name`, as `removeTool` removes a tool: it
+/// returns once no call runs its handler, refuses a removal by a call to
+/// the prompt itself, and canceled, leaves the free to the last call.
+pub fn removePrompt(s: *Server, io: Io, name: []const u8, from: ?*const Call) RemoveError!bool {
+    return s.remove(io, .prompts, name, from);
 }
 
 /// Completes prompt and template arguments with `completer`, which
@@ -382,27 +411,71 @@ fn insert(s: *Server, io: Io, comptime which: List, entry: anytype, key: []const
     s.hub.listChanged(io, changeOf(which));
 }
 
-fn remove(s: *Server, io: Io, comptime which: List, key: []const u8) Io.Cancelable!bool {
-    const gone = found: {
+fn remove(s: *Server, io: Io, comptime which: List, key: []const u8, from: ?*const Call) RemoveError!bool {
+    const gone: std.meta.Elem(@FieldType(@FieldType(Lists, @tagName(which)), "items")), const failed: ?RemoveError = found: {
         var held = try s.lists.acquire(io);
         defer held.deinit(io);
         const l = held.value();
         const items = &@field(l, @tagName(which));
-        for (items.items, 0..) |e, i| if (std.mem.eql(u8, keyOf(e), key)) {
-            l.generations.getPtr(which).* +%= 1;
-            // Order kept: a list is written in the order it was made.
-            break :found items.orderedRemove(i);
+        const index = for (items.items, 0..) |e, i| {
+            if (std.mem.eql(u8, keyOf(e), key)) break i;
+        } else return false;
+        const entry = items.items[index];
+        if (from) |call| if (call.holding == @as(*const anyopaque, entry)) return error.RemovesItsOwnCall;
+        l.generations.getPtr(which).* +%= 1;
+        // Order kept: a list is written in the order it was made.
+        _ = items.orderedRemove(index);
+        // No call finds it now; one that found it before may still run its
+        // handler, which may be the entry's own.
+        if (@hasField(@TypeOf(entry.*), "use")) while (entry.use.calls != 0) held.wait(&s.released, io, .none) catch |err| {
+            // The last call to end frees it.
+            entry.use.orphaned = true;
+            break :found .{
+                entry,
+                switch (err) {
+                    error.Canceled => error.Canceled,
+                    error.WaiterLimit => error.WaiterLimit,
+                    error.Timeout => unreachable, // unreachable: the wait has no timeout
+                },
+            };
         };
-        return false;
+        break :found .{ entry, null };
     };
-    // A handler running now holds no pointer into the entry: it was copied out.
-    if (which == .prompts) {
-        for (gone.required) |r| s.gpa.free(r);
-        s.gpa.free(gone.required);
-    }
-    s.freeEntry(gone);
     s.hub.listChanged(io, changeOf(which));
+    if (failed) |err| return err;
+    s.destroyEntry(which, gone);
     return true;
+}
+
+/// Frees an entry no list holds and no call runs.
+fn destroyEntry(s: *Server, comptime which: List, entry: anytype) void {
+    if (which == .prompts) {
+        for (entry.required) |r| s.gpa.free(r);
+        s.gpa.free(entry.required);
+    }
+    s.freeEntry(entry);
+}
+
+/// Takes a call's hold on `entry`, a tool or a prompt a list holds or a
+/// held one: removing it waits until `letGo`.
+fn holdAgain(s: *Server, io: Io, entry: anytype) void {
+    var held = s.lists.acquireUncancelable(io);
+    defer held.deinit(io);
+    entry.use.calls += 1;
+}
+
+/// Ends a call's hold on `entry`, a tool or a prompt: the last wakes a
+/// remove waiting on it, or frees it where a canceled remove left it.
+fn letGo(s: *Server, io: Io, comptime which: List, entry: anytype) void {
+    const orphaned = last: {
+        var held = s.lists.acquireUncancelable(io);
+        defer held.deinit(io);
+        entry.use.calls -= 1;
+        if (entry.use.calls != 0) return;
+        s.released.broadcast(io);
+        break :last entry.use.orphaned;
+    };
+    if (orphaned) s.destroyEntry(which, entry);
 }
 
 fn changeOf(which: List) subscriptions.Kind {
@@ -967,19 +1040,22 @@ pub fn inputRequiredJson(s: *const Server, arena: Allocator, ir: InputRequired) 
 fn callTool(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink) BuildError!Reply {
     const p = try s.parseParams(types.CallToolParams, arena, request.params) orelse return failure(.invalid_params, "params are not what the schema says");
     if (p.arguments) |a| if (a.bytes[0] != '{') return failure(.invalid_params, "arguments is not an object");
-    const handler, const task_support, var input = found: {
+    const tool = found: {
         var held = s.lists.acquire(io) catch return error.Canceled;
         defer held.deinit(io);
         for (held.value().tools.items) |t| if (std.mem.eql(u8, t.name, p.name)) {
-            // Held past the lock: the tool may be removed while it runs.
-            const input: ?validation.Compiled = if (validation.built) if (t.input) |*i| i.retain() else null else null;
-            break :found .{ t.handling.handler(), t.task, input };
+            // Held past the lock: removing the tool waits for this call.
+            t.use.calls += 1;
+            break :found t;
         };
         break :found null;
     } orelse return try unknown(arena, "Unknown tool: ", p.name);
-    defer if (validation.built) if (input) |*i| i.release();
+    defer s.letGo(io, .tools, tool);
+    const handler = tool.handling.handler();
+    const task_support = tool.task;
+    const input: ?*const validation.Compiled = if (validation.built) if (tool.input) |*i| i else null else null;
     if (!s.admitted(context, .tools, p.name)) return try unknown(arena, "Unknown tool: ", p.name);
-    if (validation.built) if (input) |*schema| {
+    if (validation.built) if (input) |schema| {
         // Arguments the given schema refuses are an execution error, as
         // arguments a type does not decode are: the model may correct them.
         switch (validation.check(schema, io, arena, if (p.arguments) |a| a.bytes else "{}") catch |err| return switch (err) {
@@ -1001,8 +1077,9 @@ fn callTool(s: *Server, io: Io, arena: Allocator, request: wire.Request, context
         .ok => |r| r,
         .refused => |reply| return reply,
     };
-    if (task_support != .forbidden and tasks_declared) return s.callAsTask(io, arena, request, context, sink, handler, p.name, r);
+    if (task_support != .forbidden and tasks_declared) return s.callAsTask(io, arena, request, context, sink, tool, p.name, r);
     var call = s.newCall(io, arena, request, context, sink, r);
+    call.holding = tool;
     const returned = handler.call(&call, if (p.arguments) |a| a.bytes else null);
     return s.answerTool(io, arena, &call, returned, request.method, p.name, context.revision);
 }
@@ -1041,6 +1118,9 @@ const Decided = union(enum) {
 const Run = struct {
     server: *Server,
     task: *tasks.Task,
+    /// The tool whose handler the round runs, held until the round is freed:
+    /// removing it waits for the round.
+    tool: *registry.Tool,
     handler: *registry.ToolHandler,
     arena: std.heap.ArenaAllocator,
     context: Context,
@@ -1060,13 +1140,14 @@ const Run = struct {
     hook: Call.TaskHook = .{ .becomeFn = become },
 
     /// A round over `task`'s call, with the answers and state given.
-    fn create(s: *Server, task: *tasks.Task, handler: *registry.ToolHandler, attached: bool, id: wire.Id, sink: Sink, responses: ?[]const u8, state_in: ?[]const u8) Allocator.Error!*Run {
+    fn create(s: *Server, task: *tasks.Task, tool: *registry.Tool, attached: bool, id: wire.Id, sink: Sink, responses: ?[]const u8, state_in: ?[]const u8) Allocator.Error!*Run {
         const run = try s.gpa.create(Run);
         errdefer s.gpa.destroy(run);
         run.* = .{
             .server = s,
             .task = task,
-            .handler = handler,
+            .tool = tool,
+            .handler = tool.handling.handler(),
             .arena = .init(s.gpa),
             .context = undefined,
             .call = undefined,
@@ -1107,27 +1188,31 @@ const Run = struct {
             .responses = if (responses) |r| try a.dupe(u8, r) else null,
             .state_in = if (state_in) |st| try a.dupe(u8, st) else null,
             .task = &run.hook,
+            .holding = tool,
         };
+        // Last, past every failure: the round's hold, let go when it is freed.
+        s.holdAgain(s.task_table.?.io, tool);
         return run;
     }
 
     /// Lets go of the round; the last holder frees it.
     fn release(run: *Run) void {
         if (!run.holders.fetchSubWrapping(.fromRaw(1), .acq_rel).eql(.fromRaw(1))) return;
+        run.server.letGo(run.call.io, .tools, run.tool);
         const gpa = run.server.gpa;
         run.arena.deinit();
         gpa.destroy(run);
     }
 };
 
-fn callAsTask(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink, handler: *registry.ToolHandler, name: []const u8, r: Round) BuildError!Reply {
+fn callAsTask(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink, tool: *registry.Tool, name: []const u8, r: Round) BuildError!Reply {
     const table = &s.task_table.?;
     const task = table.create(context.principal, request.params orelse "{}", tasks.now(io)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Canceled => return error.Canceled,
         error.EntropyUnavailable => return failure(.internal_error, "no entropy for a task's id"),
     };
-    const run = Run.create(s, task, handler, true, request.id, sink, r.responses, r.state) catch |err| {
+    const run = Run.create(s, task, tool, true, request.id, sink, r.responses, r.state) catch |err| {
         table.destroy(task);
         return err;
     };
@@ -1295,9 +1380,9 @@ fn recordRound(s: *Server, run: *Run, returned: Call.Error!registry.ToolResult) 
         return;
     };
     s.hub.changed(io, .task, &n.id);
-    const handler = run.handler;
-    run.release();
-    if (n.again) try s.startRound(task, handler, null, n.state);
+    // Let go after the next round holds the tool: between, a remove could free it.
+    defer run.release();
+    if (n.again) try s.startRound(task, run.tool, null, n.state);
 }
 
 /// Records `returned` on the run's task (the caller holds the table's lock):
@@ -1381,9 +1466,9 @@ fn recordOutcome(s: *Server, table: *tasks.Table, h: *tasks.Table.Held, run: *Ru
 /// Starts a round of `task`'s handler with `responses` (its `inputResponses`)
 /// and `state`; one that cannot start ends the task failed. `Canceled`: no
 /// task was free, the round ran on this one, and this one was canceled.
-fn startRound(s: *Server, task: *tasks.Task, handler: *registry.ToolHandler, responses: ?[]const u8, state_in: ?[]const u8) Io.Cancelable!void {
+fn startRound(s: *Server, task: *tasks.Task, tool: *registry.Tool, responses: ?[]const u8, state_in: ?[]const u8) Io.Cancelable!void {
     const table = &s.task_table.?;
-    const run = Run.create(s, task, handler, false, .{ .string = &task.id }, .none, responses, state_in) catch {
+    const run = Run.create(s, task, tool, false, .{ .string = &task.id }, .none, responses, state_in) catch {
         var held = table.lock();
         defer held.deinit(table.io);
         table.failOutOfMemory(held.value(), task, tasks.now(table.io));
@@ -1407,7 +1492,9 @@ fn taskRequest(s: *Server, io: Io, arena: Allocator, request: wire.Request, cont
     };
     var next: ?[]const u8 = null;
     var changed = false;
-    var handler: ?*registry.ToolHandler = null;
+    // Held from the lookup until the round holds it too.
+    var tool: ?*registry.Tool = null;
+    defer if (tool) |t| s.letGo(io, .tools, t);
     var task: *tasks.Task = undefined;
     var id: tasks.Id = undefined;
     {
@@ -1431,11 +1518,11 @@ fn taskRequest(s: *Server, io: Io, arena: Allocator, request: wire.Request, cont
                     error.Invalid => return failure(.invalid_params, "inputResponses is not an object"),
                 };
                 if (next != null) {
-                    handler = s.toolOf(io, task) catch |err| switch (err) {
+                    tool = s.toolOf(io, task) catch |err| switch (err) {
                         error.Canceled => return error.Canceled,
                         error.OutOfMemory => return error.OutOfMemory,
                     };
-                    if (handler == null) {
+                    if (tool == null) {
                         try table.fail(h, task, tasks.now(io), "{\"code\":-32602,\"message\":\"the task's tool is gone\"}", "the task's tool is gone");
                         next = null;
                     } else task.running = true;
@@ -1454,7 +1541,7 @@ fn taskRequest(s: *Server, io: Io, arena: Allocator, request: wire.Request, cont
         }
     }
     if (changed) s.hub.changed(io, .task, &id);
-    if (next) |responses| try s.startRound(task, handler.?, responses, task.state);
+    if (next) |responses| try s.startRound(task, tool.?, responses, task.state);
     var out: Result = .begin(s, arena, context.revision);
     try out.end(s, null, false);
     return .{ .result = try out.body() };
@@ -1471,14 +1558,17 @@ fn taskJson(s: *Server, io: Io, arena: Allocator, id: []const u8, principal: ?[]
     return out.written();
 }
 
-/// The handler of the tool `task` calls, or null when it is gone.
-fn toolOf(s: *Server, io: Io, task: *const tasks.Task) (Allocator.Error || Io.Cancelable)!?*registry.ToolHandler {
+/// The tool `task` calls, held (`letGo`), or null when it is gone.
+fn toolOf(s: *Server, io: Io, task: *const tasks.Task) (Allocator.Error || Io.Cancelable)!?*registry.Tool {
     var scratch: std.heap.ArenaAllocator = .init(s.gpa);
     defer scratch.deinit();
     const p = (try s.parseParams(types.CallToolParams, scratch.allocator(), task.params)) orelse return null;
     var held = try s.lists.acquire(io);
     defer held.deinit(io);
-    for (held.value().tools.items) |t| if (std.mem.eql(u8, t.name, p.name)) return t.handling.handler();
+    for (held.value().tools.items) |t| if (std.mem.eql(u8, t.name, p.name)) {
+        t.use.calls += 1;
+        return t;
+    };
     return null;
 }
 
@@ -1565,15 +1655,16 @@ fn getPrompt(s: *Server, io: Io, arena: Allocator, request: wire.Request, contex
         var held = s.lists.acquire(io) catch return error.Canceled;
         defer held.deinit(io);
         for (held.value().prompts.items) |item| if (std.mem.eql(u8, item.name, p.name)) {
-            // Copied out: the prompt may be removed while it runs.
-            var required: std.ArrayList([]const u8) = .empty;
-            for (item.required) |name| try required.append(arena, try arena.dupe(u8, name));
-            break :found .{ item.handling.handler(), required.items };
+            // Held past the lock: removing the prompt waits for this call.
+            item.use.calls += 1;
+            break :found item;
         };
         break :found null;
     } orelse return try unknown(arena, "Unknown prompt: ", p.name);
+    defer s.letGo(io, .prompts, prompt);
     if (!s.admitted(context, .prompts, p.name)) return try unknown(arena, "Unknown prompt: ", p.name);
-    const handler, const required = prompt;
+    const handler = prompt.handling.handler();
+    const required = prompt.required;
     for (required) |name| {
         const given = if (p.arguments) |a| has(a.bytes, name, s.jsonLimits()) else false;
         if (!given) return failure(.invalid_params, try std.mem.concat(arena, u8, &.{ "Missing required argument: ", name }));
@@ -1583,6 +1674,7 @@ fn getPrompt(s: *Server, io: Io, arena: Allocator, request: wire.Request, contex
         .refused => |reply| return reply,
     };
     var call = s.newCall(io, arena, request, context, sink, r);
+    call.holding = prompt;
     const result = handler.get(&call, if (p.arguments) |a| a.bytes else null) catch |err|
         return s.outcome(io, arena, &call, err, request.method, p.name);
     var out: Result = .begin(s, arena, context.revision);

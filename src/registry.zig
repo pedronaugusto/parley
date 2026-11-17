@@ -89,6 +89,17 @@ pub fn Handling(comptime Handler: type) type {
     };
 }
 
+/// The calls running an entry's handler, kept under the server's lock on
+/// its lists: a remove waits for them, so it frees no handler a call runs.
+pub const Use = struct {
+    /// The calls that found the entry and run, or will run, its handler: a
+    /// tool's call, a task's round, a prompt's get.
+    calls: u32 = 0,
+    /// Unlinked by a remove canceled while it waited: the last call to end
+    /// frees the entry.
+    orphaned: bool = false,
+};
+
 pub const Tool = struct {
     name: []const u8,
     /// The `Tool` object, as `tools/list` writes it.
@@ -102,6 +113,7 @@ pub const Tool = struct {
     /// runs. Null for a schema derived from the handler's type, which
     /// decoding checks.
     input: ?validation.Compiled = null,
+    use: Use = .{},
 };
 
 /// An argument a tool's input schema marks with `x-mcp-header`: an HTTP
@@ -307,6 +319,7 @@ pub const Prompt = struct {
     /// The names of the arguments that must be given.
     required: []const []const u8,
     handling: Handling(PromptHandler),
+    use: Use = .{},
 };
 
 /// `Tool` JSON for `spec`, on `gpa`.

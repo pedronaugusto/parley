@@ -133,6 +133,21 @@ test "a call runs as a task the client polls to its result" {
     try testing.expect(std.mem.find(u8, result, "_meta") == null);
 }
 
+test "removing a tool a task's round still runs returns once the round has ended" {
+    var s = try newServer(testing.io);
+    defer s.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const created = try ask(&s, a, "tools/call", "\"name\":\"slow\",\"arguments\":{\"seconds\":0.1}", true);
+    const id = try field(a, created, "taskId");
+    // The round holds the tool: the remove waits for it, and its handler has
+    // answered by the time the remove returns.
+    try testing.expect(try s.removeTool(testing.io, "slow", null));
+    const after = try ask(&s, a, "tasks/get", try a.print("\"taskId\":\"{s}\"", .{id}), true);
+    try testing.expectEqualStrings("completed", try field(a, after, "status"));
+}
+
 test "a client that did not declare the extension: answered as asked, or -32021" {
     var s = try newServer(testing.io);
     defer s.deinit();

@@ -53,6 +53,10 @@ missing: ?types.InputKind = null,
 progress_sent: ?f64 = null,
 /// Private: how the call becomes a task, when it may.
 task: ?*TaskHook = null,
+/// Private: the tool or prompt whose handler this call runs: what `Server.removeTool`
+/// and `Server.removePrompt`, given this call, refuse to remove, since the
+/// remove would wait for this call to end.
+holding: ?*const anyopaque = null,
 
 /// How a call becomes a task: given by the server for a call that may.
 /// Its owner embeds it and recovers itself with `@fieldParentPtr`.
