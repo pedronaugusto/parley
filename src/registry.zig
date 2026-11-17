@@ -6,7 +6,7 @@ const std = @import("std");
 const strand = @import("strand");
 const types = @import("types.zig");
 const Call = @import("Call.zig");
-const validation = @import("validation.zig");
+const Validator = @import("Validator.zig");
 
 const Allocator = std.mem.Allocator;
 const Raw = strand.json.Raw;
@@ -111,8 +111,8 @@ pub const Tool = struct {
     /// The input schema it was given (`ToolSpec.input_schema`), compiled:
     /// what a call's arguments are checked against before its handler
     /// runs. Null for a schema derived from the handler's type, which
-    /// decoding checks.
-    input: ?validation.Compiled = null,
+    /// decoding checks, and on a server without a validator.
+    input: ?Validator.Compiled = null,
     use: Use = .{},
 };
 

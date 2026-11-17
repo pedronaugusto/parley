@@ -17,7 +17,7 @@ const strand = @import("strand");
 const types = @import("types.zig");
 const wire = @import("wire.zig");
 const meta = @import("meta.zig");
-const validation = @import("validation.zig");
+const Validator = @import("Validator.zig");
 const Revision = @import("revision.zig").Revision;
 
 const tasks_extension = "io.modelcontextprotocol/tasks";
@@ -44,15 +44,15 @@ server_info: ?types.Implementation = null,
 instructions: ?[]const u8 = null,
 next_id: aegis.Atomic(Requests) = .init(.fromRaw(1)),
 /// Private: the output schema of each tool `tools/list` named, compiled
-/// (`Options.validate_output`), by the tool's name.
+/// (`Options.validator`), by the tool's name.
 outputs: aegis.BlockingGuarded(Outputs) = .init(.empty),
 
 const Outputs = std.StringHashMapUnmanaged(Output);
 
 /// A listed tool's output schema, compiled, or why it did not compile.
 const Output = union(enum) {
-    compiled: validation.Compiled,
-    refused: validation.Failure,
+    compiled: Validator.Compiled,
+    refused: Validator.Failure,
 };
 
 /// The requests the client has sent, which number the next: one at a time,
@@ -85,13 +85,16 @@ pub const Options = struct {
     /// runs as a task is polled to its end, its input given as it asks,
     /// and answers as if it had been answered at once.
     tasks: bool = true,
-    /// Check a tool call's `structuredContent` against the `outputSchema`
-    /// `tools/list` gave for the tool (MCP: a client SHOULD), by
-    /// `strand_schema` with every `format` asserted; a `pattern` it cannot
-    /// run in linear time is left unchecked and named in the outcome
-    /// (`ToolOutcome.unchecked`). A tool never listed is not checked. Has
-    /// no effect in a parley built without `schema`.
-    validate_output: bool = true,
+    /// What checks a tool call's `structuredContent` against the
+    /// `outputSchema` `tools/list` gave for the tool (MCP: a client SHOULD):
+    /// `&parley.validation.json_schema`, every `format` asserted; a
+    /// `pattern` it cannot run in linear time is left unchecked and named in
+    /// the outcome (`ToolOutcome.unchecked`). A tool never listed is not
+    /// checked. Outlives the client. No default: every client states its
+    /// choice. Null gives up the check MCP asks a client for: a server's
+    /// structured content is handed on as it came, whatever its tool's
+    /// output schema says.
+    validator: ?*const Validator,
     limits: Limits = .{},
 };
 
@@ -249,7 +252,7 @@ pub fn deinit(c: *Client) void {
 
 fn freeOutput(gpa: Allocator, output: *Output) void {
     switch (output.*) {
-        .compiled => |*compiled| if (validation.built) compiled.release(),
+        .compiled => |*compiled| compiled.release(),
         .refused => |f| {
             gpa.free(f.message);
             gpa.free(f.schema_location);
@@ -507,7 +510,7 @@ fn encode(arena: Allocator, limits: strand.core.Limits, value: anytype) error{Wr
 /// not valid against its output schema, or has no structured content
 /// though the tool has one; `OutputSchemaRefused`: the tool's output
 /// schema did not compile, so its result cannot be checked. `schema`
-/// holds why after either (`Options.validate_output`).
+/// holds why after either (`Options.validator`).
 pub const CallError = RequestError || error{ Protocol, Failed, TooManyRounds, StructuredContentInvalid, OutputSchemaRefused };
 
 /// The error a call's answer carried.
@@ -520,7 +523,7 @@ pub const Failure = struct {
 pub const Diagnostics = struct {
     failure: ?Failure = null,
     /// Why a tool's structured content was refused, or its output schema.
-    schema: ?validation.Failure = null,
+    schema: ?Validator.Failure = null,
 };
 
 /// A result, as JSON, after any rounds of input it took.
@@ -732,7 +735,7 @@ pub fn list(c: *Client, io: Io, arena: Allocator, method: []const u8, cursor: ?[
     out.writer.writeByte('}') catch return error.OutOfMemory;
     const result = try c.call(io, arena, method, out.written(), null, null, diagnostics);
     if (std.mem.eql(u8, method, "tools/list")) {
-        if (validation.built and c.options.validate_output) try c.learnOutputs(io, arena, result, cursor == null);
+        if (c.options.validator) |validator| try c.learnOutputs(io, arena, validator, result, cursor == null);
         if (c.transport.vtable.listed) |f| return f(c.transport, io, c, arena, result);
     }
     return result;
@@ -741,7 +744,7 @@ pub fn list(c: *Client, io: Io, arena: Allocator, method: []const u8, cursor: ?[
 /// Compiles the output schema of each tool a `tools/list` page names, in
 /// place of what an earlier listing gave for it; the first page of a
 /// listing (`fresh`) forgets every tool before it.
-fn learnOutputs(c: *Client, io: Io, arena: Allocator, result: []const u8, fresh: bool) CallError!void {
+fn learnOutputs(c: *Client, io: Io, arena: Allocator, validator: *const Validator, result: []const u8, fresh: bool) CallError!void {
     const Listed = struct { tools: []const struct { name: []const u8, outputSchema: ?Raw = null } = &.{} };
     const page = strand.json.parseLeaky(Listed, arena, result, types.readOptions(c.jsonLimits())) catch return error.Protocol;
     // Compiled before the lock is taken, and released after it.
@@ -753,8 +756,8 @@ fn learnOutputs(c: *Client, io: Io, arena: Allocator, result: []const u8, fresh:
     for (page.tools) |tool| {
         try learned.append(arena, .{ .name = tool.name, .output = null });
         const schema = tool.outputSchema orelse continue;
-        var failure: validation.Failure = .{};
-        learned.items[learned.items.len - 1].output = if (validation.compile(c.gpa, io, schema.bytes, .downgrade, arena, &failure)) |compiled|
+        var failure: Validator.Failure = .{};
+        learned.items[learned.items.len - 1].output = if (validator.compile(c.gpa, io, schema.bytes, .downgrade, arena, &failure)) |compiled|
             .{ .compiled = compiled }
         else |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -798,7 +801,7 @@ fn learnOutputs(c: *Client, io: Io, arena: Allocator, result: []const u8, fresh:
 
 /// The output schema `tools/list` gave for `name`, held for the caller, or
 /// null when it gave none; `OutputSchemaRefused` when it did not compile.
-fn outputSchema(c: *Client, io: Io, arena: Allocator, name: []const u8, diagnostics: ?*Diagnostics) CallError!?validation.Compiled {
+fn outputSchema(c: *Client, io: Io, arena: Allocator, name: []const u8, diagnostics: ?*Diagnostics) CallError!?Validator.Compiled {
     var held = c.outputs.acquire(io) catch return error.Canceled;
     defer held.deinit(io);
     const output = held.value().getPtr(name) orelse return null;
@@ -830,7 +833,7 @@ pub const ToolOutcome = struct {
     is_error: bool = false,
     /// The output schema's keywords the structured content was not checked
     /// against, by their locations: patterns `strand_schema` cannot run in
-    /// linear time (`Options.validate_output`).
+    /// linear time (`Options.validator`).
     unchecked: []const []const u8 = &.{},
 };
 
@@ -854,14 +857,14 @@ pub fn callTool(c: *Client, io: Io, arena: Allocator, name: []const u8, argument
     const o = strand.json.parseLeaky(Outcome, arena, result, types.readOptions(c.jsonLimits())) catch return error.Protocol;
     var outcome: ToolOutcome = .{ .content = o.content, .structured = o.structuredContent, .is_error = o.isError };
     // An error result answers the model, not the schema.
-    if (!validation.built or !c.options.validate_output or o.isError) return outcome;
+    if (c.options.validator == null or o.isError) return outcome;
     var schema = try c.outputSchema(io, arena, name, diagnostics) orelse return outcome;
     defer schema.release();
     const structured = o.structuredContent orelse {
         if (diagnostics) |d| d.schema = .{ .message = "the result has no structuredContent, and the tool has an outputSchema" };
         return error.StructuredContentInvalid;
     };
-    switch (try validation.check(&schema, io, arena, structured.bytes)) {
+    switch (try Validator.check(&schema, io, arena, structured.bytes)) {
         .valid => |unchecked| outcome.unchecked = unchecked,
         .invalid => |failure| {
             if (diagnostics) |d| d.schema = failure;

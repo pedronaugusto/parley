@@ -1,6 +1,7 @@
 //! README.md's Usage blocks, built and run by the tests.
 const std = @import("std");
 const parley = @import("parley");
+const validation = @import("parley.validation");
 const http = @import("parley.http");
 const uplink = @import("uplink");
 const process = @import("parley.process");
@@ -42,7 +43,7 @@ fn overProcess(io: Io, gpa: std.mem.Allocator, self: []const u8) !void {
     // grace to exit before it is asked to stop.
     const child = try process.Child.spawn(gpa, io, .{
         .argv = &.{ self, "--serve" },
-        .client = .{ .info = .{ .name = "weather-app", .version = "1.0.0" } },
+        .client = .{ .info = .{ .name = "weather-app", .version = "1.0.0" }, .validator = &validation.json_schema },
     });
     defer child.deinit(io);
     try child.client.connect(io);
@@ -84,6 +85,7 @@ fn greet(call: *parley.Call) parley.Call.Error!parley.ToolResult {
 fn newServer(gpa: std.mem.Allocator, io: Io) !parley.Server {
     var server = try parley.Server.init(gpa, io, .{
         .info = .{ .name = "weather", .version = "1.0.0" },
+        .validator = &validation.json_schema,
         .cache = .{ .tools = .{ .ttl = .literal("5m") } },
     });
     errdefer server.deinit();
@@ -135,7 +137,7 @@ fn askOverHttp(io: Io, gpa: std.mem.Allocator, port: u16) !void {
     var remote: http.Transport = .init(gpa, &web, url, .{});
     defer remote.deinit();
     defer remote.close(io);
-    var client: parley.Client = .init(gpa, remote.transport(), .{ .info = .{ .name = "weather-app", .version = "1.0.0" } });
+    var client: parley.Client = .init(gpa, remote.transport(), .{ .info = .{ .name = "weather-app", .version = "1.0.0" }, .validator = &validation.json_schema });
     defer client.deinit();
     try client.connect(io);
 

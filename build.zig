@@ -1,28 +1,20 @@
 const std = @import("std");
 
-/// What a project that depends on parley builds: `parley`, on std, aegis and
-/// strand alone; with `http` (the default) `parley.http`, Streamable HTTP on
-/// uplink, which is fetched only then: a project that serves over stdio
-/// alone sets `.http = false` and fetches no uplink; with `process` (the
-/// default) `parley.process`, a server launched as a child process, on
-/// conduit, fetched only then; with `oauth` (the default, and `http`)
-/// `parley.oauth`, MCP's authorization on clearance's OAuth 2.1, fetched only
-/// then; with `schema` (the default) JSON Schema validation on both sides,
-/// through the strand_schema package, fetched only then, which fetches
-/// spectra and uplink (its `wire` alone is built: no reactor, no TLS).
-/// Every dependency is taken with its default options: options are the
-/// application's to set.
+/// What a project that depends on parley builds, every module always
+/// declared and none compiled unless a program imports it: `parley`, on std,
+/// aegis, strand and almanac; `parley.http`, Streamable HTTP on uplink;
+/// `parley.process`, a server launched as a child process, on conduit;
+/// `parley.oauth`, MCP's authorization on clearance's OAuth 2.1; and
+/// `parley.validation`, JSON Schema validation through strand_schema, the
+/// validator a client or a server is given. uplink, conduit, clearance and
+/// strand_schema are lazy dependencies, fetched with parley. No build
+/// options: a library takes every dependency with its default options, so
+/// every project reaching parley builds the same one.
 pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const with_http = b.option(bool, "http", "Build parley.http, Streamable HTTP on uplink, which fetches uplink") orelse true;
-    const with_process = b.option(bool, "process", "Build parley.process, a server launched as a child process, which fetches conduit") orelse true;
-    const with_oauth = b.option(bool, "oauth", "Build parley.oauth, MCP's authorization on OAuth 2.1, which fetches clearance") orelse true;
-    const with_schema = b.option(bool, "schema", "Validate against JSON Schema through strand_schema (a tool's structured content on the client; given input schemas and elicitation answers on the server), which fetches strand_schema, spectra and uplink") orelse true;
     const aegis = b.dependency("aegis", .{ .target = target, .optimize = optimize }).module("aegis");
     const strand = b.dependency("strand", .{ .target = target, .optimize = optimize }).module("strand");
-    const options = b.addOptions();
-    options.addOption(bool, "validation", with_schema);
     // almanac writes a task's times.
     const almanac = b.dependency("almanac", .{ .target = target, .optimize = optimize }).module("almanac");
     const parley = b.addModule("parley", .{
@@ -32,14 +24,13 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
         .imports = &.{
             .{ .name = "aegis", .module = aegis },
             .{ .name = "strand", .module = strand },
-            .{ .name = "parley_options", .module = options.createModule() },
             .{ .name = "almanac", .module = almanac },
         },
     });
     // Each module is declared before what it needs is fetched: a consumer's
     // first pass must find the module it asks for, and only learns here
     // what to fetch.
-    const process = if (with_process) b.addModule("parley.process", .{
+    const process = b.addModule("parley.process", .{
         .root_source_file = b.path("src/process.zig"),
         .target = target,
         .optimize = optimize,
@@ -47,8 +38,8 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
             .{ .name = "aegis", .module = aegis },
             .{ .name = "parley", .module = parley },
         },
-    }) else null;
-    const http = if (with_http) b.addModule("parley.http", .{
+    });
+    const http = b.addModule("parley.http", .{
         .root_source_file = b.path("src/http.zig"),
         .target = target,
         .optimize = optimize,
@@ -57,41 +48,39 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
             .{ .name = "strand", .module = strand },
             .{ .name = "parley", .module = parley },
         },
-    }) else null;
-    const oauth = if (http) |h| if (with_oauth) b.addModule("parley.oauth", .{
+    });
+    const oauth = b.addModule("parley.oauth", .{
         .root_source_file = b.path("src/oauth.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "aegis", .module = aegis },
             .{ .name = "parley", .module = parley },
-            .{ .name = "parley.http", .module = h },
+            .{ .name = "parley.http", .module = http },
         },
-    }) else null else null;
+    });
+    const validation = b.addModule("parley.validation", .{
+        .root_source_file = b.path("src/validation.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "parley", .module = parley }},
+    });
     // Every lazy dependency the modules need is asked for before any is
     // used, so one pass marks each one not fetched yet; the build then
     // returns `error.LazyDependencyNeeded`, and Zig fetches them and
     // configures again (std.Build.dependencyLazy).
-    const conduit = lazy(b, process != null, "conduit", .{ .target = target, .optimize = optimize });
-    const uplink = lazy(b, http != null, "uplink", .{ .target = target, .optimize = optimize });
-    const clearance = lazy(b, oauth != null, "clearance", .{ .target = target, .optimize = optimize, .oauth = true });
-    const strand_schema = lazy(b, with_schema, "strand_schema", .{ .target = target, .optimize = optimize });
-    if (try conduit) |c| if (process) |m| m.addImport("conduit", c.module("conduit"));
-    if (try uplink) |u| {
-        if (http) |m| m.addImport("uplink", u.module("uplink"));
-        if (oauth) |m| m.addImport("uplink", u.module("uplink"));
-    }
-    if (try clearance) |c| if (oauth) |m| {
-        m.addImport("clearance", c.module("clearance"));
-        m.addImport("clearance.oauth", c.module("clearance.oauth"));
-    };
-    if (try strand_schema) |s| parley.addImport("strand_schema", s.module("strand_schema"));
-}
-
-/// The lazy dependency `name` where it is `wanted`, null where it is not.
-fn lazy(b: *std.Build, wanted: bool, name: []const u8, args: anytype) error{LazyDependencyNeeded}!?*std.Build.Dependency {
-    if (!wanted) return null;
-    return try b.dependencyLazy(name, args);
+    const conduit = b.dependencyLazy("conduit", .{ .target = target, .optimize = optimize });
+    const uplink = b.dependencyLazy("uplink", .{ .target = target, .optimize = optimize });
+    const clearance = b.dependencyLazy("clearance", .{ .target = target, .optimize = optimize });
+    const strand_schema = b.dependencyLazy("strand_schema", .{ .target = target, .optimize = optimize });
+    process.addImport("conduit", (try conduit).module("conduit"));
+    const u = (try uplink).module("uplink");
+    http.addImport("uplink", u);
+    oauth.addImport("uplink", u);
+    const c = try clearance;
+    oauth.addImport("clearance", c.module("clearance"));
+    oauth.addImport("clearance.oauth", c.module("clearance.oauth"));
+    validation.addImport("strand_schema", (try strand_schema).module("strand_schema"));
 }
 
 /// parley's development: its tests, its properties, the example and the
@@ -129,7 +118,7 @@ pub fn dev(b: *std.Build, tools: type) void {
 
     // parley.oauth's tests: an authorization server, a guarded endpoint and
     // a client signing in, over loopback.
-    const clearance_package = p.dependency("clearance", .{ .target = target, .optimize = optimize, .oauth = true });
+    const clearance_package = p.dependency("clearance", .{ .target = target, .optimize = optimize });
     const oauth_module = package.module("parley.oauth");
     // The tests sign tokens with a cloak key.
     if (oauth_module.import_table.get("cloak") == null) {
@@ -183,6 +172,7 @@ pub fn dev(b: *std.Build, tools: type) void {
                 .{ .name = "parley", .module = module },
                 .{ .name = "parley.http", .module = package.module("parley.http") },
                 .{ .name = "parley.process", .module = package.module("parley.process") },
+                .{ .name = "parley.validation", .module = package.module("parley.validation") },
                 .{ .name = "uplink", .module = uplink_package.module("uplink") },
             },
         }),
@@ -200,7 +190,10 @@ pub fn dev(b: *std.Build, tools: type) void {
             .root_source_file = p.path("examples/stdio_server.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "parley", .module = module }},
+            .imports = &.{
+                .{ .name = "parley", .module = module },
+                .{ .name = "parley.validation", .module = package.module("parley.validation") },
+            },
         }),
     });
     b.step("stdio-server", "Build the example stdio server into zig-out/bin").dependOn(&b.addInstallArtifact(stdio_server, .{}).step);
@@ -217,6 +210,7 @@ pub fn dev(b: *std.Build, tools: type) void {
             .imports = &.{
                 .{ .name = "parley", .module = module },
                 .{ .name = "parley.http", .module = package.module("parley.http") },
+                .{ .name = "parley.validation", .module = package.module("parley.validation") },
                 .{ .name = "uplink", .module = uplink_package.module("uplink") },
                 .{ .name = "strand", .module = strand.module("strand") },
             },
@@ -238,6 +232,7 @@ pub fn dev(b: *std.Build, tools: type) void {
                 .{ .name = "parley", .module = module },
                 .{ .name = "parley.http", .module = package.module("parley.http") },
                 .{ .name = "parley.oauth", .module = package.module("parley.oauth") },
+                .{ .name = "parley.validation", .module = package.module("parley.validation") },
                 .{ .name = "uplink", .module = uplink_package.module("uplink") },
                 .{ .name = "strand", .module = strand.module("strand") },
                 .{ .name = "clearance", .module = clearance_package.module("clearance") },
@@ -267,7 +262,7 @@ pub fn dev(b: *std.Build, tools: type) void {
     // parley needs: the build a consumer gets.
     const almanac = p.dependency("almanac", .{ .target = target, .optimize = optimize });
     const strand_schema = p.dependency("strand_schema", .{ .target = target, .optimize = optimize });
-    tools.preflight.addConsumerCheck(b, p, .{ .package = "parley", .program = p.path("ci/consumer.zig"), .packages = &.{ aegis, strand, almanac, strand_schema, uplink_package, conduit_package, clearance_package }, .modules = &.{ "parley", "parley.http", "parley.process", "parley.oauth" } });
+    tools.preflight.addConsumerCheck(b, p, .{ .package = "parley", .program = p.path("ci/consumer.zig"), .packages = &.{ aegis, strand, almanac, strand_schema, uplink_package, conduit_package, clearance_package }, .modules = &.{ "parley", "parley.http", "parley.process", "parley.oauth", "parley.validation" } });
 }
 
 /// The tests run in the `parley` module itself, which gets shakedown for
@@ -276,6 +271,9 @@ fn suite(b: *std.Build, name: []const u8, target: std.Build.ResolvedTarget, opti
     const module = b.dependency("parley", .{ .target = target, .optimize = optimize }).module("parley");
     if (module.import_table.get("shakedown") == null) {
         module.addImport("shakedown", b.dependency("shakedown", .{ .target = target, .optimize = optimize }).module("shakedown"));
+        // The validation tests give their clients and servers strand_schema's
+        // validator: the one place parley's own module meets the module above it.
+        module.addImport("parley.validation", b.dependency("parley", .{ .target = target, .optimize = optimize }).module("parley.validation"));
     }
     return b.addTest(.{ .name = name, .filters = filters, .root_module = module });
 }

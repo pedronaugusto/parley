@@ -3,6 +3,7 @@
 //! know `server/discover`.
 const std = @import("std");
 const parley = @import("parley.zig");
+const validation = @import("parley.validation");
 const stdio = @import("stdio.zig");
 const Pipe = @import("testing/Pipe.zig");
 
@@ -52,7 +53,7 @@ fn serveTask(io: Io, server: *parley.Server, in: *Pipe, out: *Pipe) void {
 
 test "a 2026-07-28 server: discovered, listed, called, input given across rounds" {
     const io = testing.io;
-    var server = try parley.Server.init(testing.allocator, io, .{ .info = .{ .name = "s", .version = "1" }, .instructions = "be kind" });
+    var server = try parley.Server.init(testing.allocator, io, .{ .info = .{ .name = "s", .version = "1" }, .validator = &validation.json_schema, .instructions = "be kind" });
     defer server.deinit();
     try server.addTool(io, .{ .name = "echo" }, echo);
     try server.addTool(io, .{ .name = "greet" }, greet);
@@ -68,6 +69,7 @@ test "a 2026-07-28 server: discovered, listed, called, input given across rounds
     var answers: Client.Handlers = .{ .elicit = answerName };
     var client: Client = .init(testing.allocator, channel.transport(), .{
         .info = .{ .name = "c", .version = "1" },
+        .validator = &validation.json_schema,
         .handlers = &answers,
     });
     defer client.deinit();
@@ -115,7 +117,7 @@ fn callGreet(client: *Client, io: Io) Client.CallError!void {
 
 test "a call canceled while the application answers the server's input comes back Canceled" {
     const io = testing.io;
-    var server = try parley.Server.init(testing.allocator, io, .{ .info = .{ .name = "s", .version = "1" } });
+    var server = try parley.Server.init(testing.allocator, io, .{ .info = .{ .name = "s", .version = "1" }, .validator = &validation.json_schema });
     defer server.deinit();
     try server.addTool(io, .{ .name = "greet" }, greet);
 
@@ -130,6 +132,7 @@ test "a call canceled while the application answers the server's input comes bac
     var answers: Client.Handlers = .{ .elicit = answerSlowly };
     var client: Client = .init(testing.allocator, channel.transport(), .{
         .info = .{ .name = "c", .version = "1" },
+        .validator = &validation.json_schema,
         .handlers = &answers,
         .max_rounds = 1,
     });
@@ -166,7 +169,7 @@ fn refuseTask(call: *Call) Call.Error!parley.ToolResult {
 
 test "a call the server runs as a task: polled, its input given, answered as if at once" {
     const io = testing.io;
-    var server = try parley.Server.init(testing.allocator, io, .{ .info = .{ .name = "s", .version = "1" }, .tasks = .{ .poll_interval = .literal("5ms") } });
+    var server = try parley.Server.init(testing.allocator, io, .{ .info = .{ .name = "s", .version = "1" }, .validator = &validation.json_schema, .tasks = .{ .poll_interval = .literal("5ms") } });
     defer server.deinit();
     try server.addTool(io, .{ .name = "knock", .task = .required }, knock);
     try server.addTool(io, .{ .name = "refuse", .task = .optional }, refuseTask);
@@ -181,6 +184,7 @@ test "a call the server runs as a task: polled, its input given, answered as if 
     var answers: Client.Handlers = .{ .elicit = answerName };
     var client: Client = .init(testing.allocator, channel.transport(), .{
         .info = .{ .name = "c", .version = "1" },
+        .validator = &validation.json_schema,
         .handlers = &answers,
     });
     defer client.deinit();
@@ -256,7 +260,7 @@ test "a session server: discover not understood, so initialize, then requests wi
     var writer_buffer: [4096]u8 = undefined;
     var out = PipeWriter.init(&wiring.to_server, &writer_buffer);
     var channel: stdio.Channel = .init(testing.allocator, .causeless(&wiring.from_server.reader), .causeless(&out.writer));
-    var client: Client = .init(testing.allocator, channel.transport(), .{ .info = .{ .name = "c", .version = "1" } });
+    var client: Client = .init(testing.allocator, channel.transport(), .{ .info = .{ .name = "c", .version = "1" }, .validator = &validation.json_schema });
     defer client.deinit();
     try channel.start(io, &client);
     defer channel.deinit(io);
@@ -312,7 +316,7 @@ test "a 2024-11-05 server: its revision taken, a batch from it taken, its reques
     var writer_buffer: [4096]u8 = undefined;
     var out = PipeWriter.init(&wiring.to_server, &writer_buffer);
     var channel: stdio.Channel = .init(testing.allocator, .causeless(&wiring.from_server.reader), .causeless(&out.writer));
-    var client: Client = .init(testing.allocator, channel.transport(), .{ .info = .{ .name = "c", .version = "1" } });
+    var client: Client = .init(testing.allocator, channel.transport(), .{ .info = .{ .name = "c", .version = "1" }, .validator = &validation.json_schema });
     defer client.deinit();
     try channel.start(io, &client);
     defer channel.deinit(io);
@@ -340,9 +344,8 @@ fn report(_: *parley.ToolHandler, _: *Call, arguments: ?[]const u8) Call.Error!p
 }
 
 test "a tool's structured content is checked against the output schema tools/list gave for it" {
-    if (!parley.validation.built) return error.SkipZigTest;
     const io = testing.io;
-    var server = try parley.Server.init(testing.allocator, io, .{ .info = .{ .name = "s", .version = "1" } });
+    var server = try parley.Server.init(testing.allocator, io, .{ .info = .{ .name = "s", .version = "1" }, .validator = &validation.json_schema });
     defer server.deinit();
     var handler: parley.ToolHandler = .{ .callFn = report };
     const input = "{\"type\":\"object\",\"properties\":{\"mode\":{\"type\":\"string\"}}}";
@@ -359,7 +362,7 @@ test "a tool's structured content is checked against the output schema tools/lis
     var writer_buffer: [4096]u8 = undefined;
     var out = PipeWriter.init(&wiring.to_server, &writer_buffer);
     var channel: stdio.Channel = .init(testing.allocator, .causeless(&wiring.from_server.reader), .causeless(&out.writer));
-    var client: Client = .init(testing.allocator, channel.transport(), .{ .info = .{ .name = "c", .version = "1" } });
+    var client: Client = .init(testing.allocator, channel.transport(), .{ .info = .{ .name = "c", .version = "1" }, .validator = &validation.json_schema });
     defer client.deinit();
     try channel.start(io, &client);
     defer channel.deinit(io);
@@ -389,8 +392,8 @@ test "a tool's structured content is checked against the output schema tools/lis
     try testing.expect(std.mem.endsWith(u8, why.schema.?.schema_location, "/properties/count/type"));
     // A tool with no output schema is not checked.
     _ = try client.callTool(io, a, "unlisted", .{ .mode = "bad" }, null);
-    // Switched off, nothing is.
-    client.options.validate_output = false;
+    // Without a validator, nothing is.
+    client.options.validator = null;
     _ = try client.callTool(io, a, "count", .{ .mode = "bad" }, null);
     wiring.to_server.close();
 }

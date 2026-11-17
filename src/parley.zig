@@ -15,9 +15,9 @@ pub const Client = @import("Client.zig");
 /// The revisions before 2026-07-28: a session opened by `initialize`.
 pub const compat = @import("compat.zig");
 pub const Call = @import("Call.zig");
-/// JSON Schema validation through strand_schema: whether parley was built
-/// with it (`validation.built`), and why a schema or an instance failed.
-pub const validation = @import("validation.zig");
+/// A JSON Schema validator, given to a client or a server; the module
+/// `parley.validation` has strand_schema's (`json_schema`).
+pub const Validator = @import("Validator.zig");
 pub const Context = @import("context.zig").Context;
 pub const Sink = @import("context.zig").Sink;
 /// What a server offers, and the `x-mcp-header` marks of a tool's schema.

@@ -1,48 +1,29 @@
-//! JSON Schema validation through the strand_schema package, in a parley built
-//! with it (the build option `schema`, on by default). The client checks a
-//! tool's structured content against the output schema `tools/list` gave for
-//! it; the server checks the arguments of a tool whose input schema it was
-//! given (a dynamic tool's, or one stricter than the tool's type) and the
-//! content of an accepted elicitation against the schema it asked with.
-//! Built without it, nothing is checked but by decoding into a type.
+//! `parley.validation`: JSON Schema validation through strand_schema, the
+//! validator an application gives a client or a server
+//! (`.validator = &parley.validation.json_schema`). A module of its own over
+//! a lazy dependency: strand_schema is fetched with parley and compiled only
+//! in a program that imports this module.
 const std = @import("std");
-const aegis = @import("aegis");
-const strand = @import("strand");
+const parley = @import("parley");
+const strand_schema = @import("strand_schema");
+const strand = strand_schema.strand;
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+const Validator = parley.Validator;
 
-/// Whether parley was built with `strand_schema`.
-pub const built = @import("parley_options").validation;
-const strand_schema = if (built) @import("strand_schema") else struct {};
+/// strand_schema's validator: draft 2020-12 (and the drafts a schema's
+/// `$schema` names), every `format` asserted by its strict recognizer, no
+/// remote reference followed.
+pub const json_schema: Validator = .{ .ptr = null, .vtable = &.{ .compile = compile, .check = check, .destroy = destroy } };
 
-/// A compiled schema, held by whoever validates against it; the last
-/// release frees it.
-pub const Compiled = if (built) aegis.Shared(strand_schema.Schema, strand_schema.Schema.deinit) else void;
-
-/// What a schema `pattern` spectra cannot run in linear time becomes: the
-/// schema refused (a server's own schemas, which their author can change),
-/// or the keyword left unchecked and named in every verdict through it (a
-/// peer's).
-pub const Patterns = enum { refuse, downgrade };
-
-/// Why a schema did not compile, or an instance is not valid against it:
-/// the reason, and where (each empty when it does not apply). On the arena
-/// given.
-pub const Failure = struct {
-    message: []const u8 = "",
-    /// The JSON Pointer to the value that failed.
-    instance_location: []const u8 = "",
-    /// Where in the schema: the keyword's absolute location, or where the
-    /// schema failed to compile.
-    schema_location: []const u8 = "",
+/// A compiled schema and the allocator it is freed with.
+const Box = struct {
+    gpa: Allocator,
+    schema: strand_schema.Schema,
 };
 
-/// `schema`, written as JSON, compiled: every `format` asserted by its strict
-/// recognizer, no remote reference followed. `Refused`, with `failure` filled
-/// on `arena` when given, for a schema `strand_schema` does not compile.
-pub fn compile(gpa: Allocator, io: Io, schema: []const u8, patterns: Patterns, arena: Allocator, failure: ?*Failure) (Allocator.Error || Io.Cancelable || error{Refused})!Compiled {
-    comptime std.debug.assert(built);
+fn compile(_: ?*anyopaque, gpa: Allocator, io: Io, schema: []const u8, patterns: Validator.Patterns, arena: Allocator, failure: ?*Validator.Failure) Validator.CompileError!*anyopaque {
     var d: strand_schema.Schema.Diagnostic = .{};
     var s = strand_schema.Schema.compile(gpa, io, strand.json, .init(schema), .{
         .formats = .assert,
@@ -60,24 +41,15 @@ pub fn compile(gpa: Allocator, io: Io, schema: []const u8, patterns: Patterns, a
         },
     };
     errdefer s.deinit();
-    return .create(gpa, s);
+    const box = try gpa.create(Box);
+    box.* = .{ .gpa = gpa, .schema = s };
+    return box;
 }
 
-/// What one instance came to.
-pub const Verdict = union(enum) {
-    /// Valid: and the keywords left unchecked on the way, by their locations
-    /// (`Patterns.downgrade`).
-    valid: []const []const u8,
-    invalid: Failure,
-};
-
-/// `instance`, JSON, against `schema`: its slots, state and the verdict's
-/// text on `scratch`. An instance that does not read, or past the schema's
-/// limits, is invalid; only memory and cancellation are errors.
-pub fn check(schema: *const Compiled, io: Io, scratch: Allocator, instance: []const u8) (Allocator.Error || Io.Cancelable)!Verdict {
-    comptime std.debug.assert(built);
+fn check(_: ?*anyopaque, schema: *anyopaque, io: Io, scratch: Allocator, instance: []const u8) Validator.CheckError!Validator.Verdict {
+    const box: *Box = @ptrCast(@alignCast(schema));
     var errors: strand_schema.Schema.Errors = .{};
-    const valid = schema.get().validate(io, scratch, strand.json, .init(instance), .{ .basic = &errors }) catch |err| switch (err) {
+    const valid = box.schema.validate(io, scratch, strand.json, .init(instance), .{ .basic = &errors }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Canceled => return error.Canceled,
         else => |e| return .{ .invalid = .{ .message = @errorName(e) } },
@@ -91,9 +63,9 @@ pub fn check(schema: *const Compiled, io: Io, scratch: Allocator, instance: []co
     return .{ .valid = unchecked };
 }
 
-/// `failure` as one line: the message, then where.
-pub fn describe(arena: Allocator, failure: Failure) Allocator.Error![]const u8 {
-    if (failure.instance_location.len != 0) return arena.print("{s} at {s}", .{ failure.message, failure.instance_location });
-    if (failure.schema_location.len != 0) return arena.print("{s} at {s}", .{ failure.message, failure.schema_location });
-    return failure.message;
+fn destroy(_: ?*anyopaque, schema: *anyopaque) void {
+    const box: *Box = @ptrCast(@alignCast(schema));
+    const gpa = box.gpa;
+    box.schema.deinit();
+    gpa.destroy(box);
 }

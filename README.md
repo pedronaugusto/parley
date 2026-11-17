@@ -14,16 +14,23 @@ extension and authorization are built.
 ## Install
 
 Requires Zig 0.17.0. Fetch with `zig fetch --save
-git+https://github.com/pedronaugusto/parley`, then take the `parley` module,
-and `parley.http` for Streamable HTTP, through `b.dependency` and add them to
-your executable's imports. `parley` depends on std, strand (JSON) and aegis (a
-std-only library of checked types); `parley.http` adds uplink, which is fetched
-only when it is built: a server that speaks stdio alone passes `.http = false`
-to `b.dependency` and fetches no uplink. `parley.process`, a client launching a
-server as a child process, adds [conduit](https://github.com/pedronaugusto/conduit)
-the same way (`.process = false` leaves it out), and `parley.oauth`,
-authorization over HTTP, adds [clearance](https://github.com/pedronaugusto/clearance)
-(`.oauth = false` leaves it out).
+git+https://github.com/pedronaugusto/parley`, then take the modules you use
+through `b.dependency` and add them to your executable's imports: `parley`, on
+std, strand (JSON), almanac (a task's times) and aegis (a std-only library of
+checked types); `parley.http` for Streamable HTTP, on uplink; `parley.process`,
+a client launching a server as a child process, on
+[conduit](https://github.com/pedronaugusto/conduit); `parley.oauth`,
+authorization over HTTP, on [clearance](https://github.com/pedronaugusto/clearance);
+and `parley.validation`, JSON Schema validation through
+[strand_schema](https://github.com/pedronaugusto/strand-schema). parley has no
+build options: uplink, conduit, clearance and strand_schema are fetched with
+it, and each compiles only in a program that imports the module over it.
+
+Every client and server states whether it validates against JSON Schema:
+`.validator = &validation.json_schema` (with
+`const validation = @import("parley.validation");`), or `.validator = null`,
+which gives up the checks (a client then hands on a server's structured
+content whatever its output schema says; MCP asks a client to check it).
 
 ## Usage
 
@@ -69,6 +76,7 @@ fn greet(call: *parley.Call) parley.Call.Error!parley.ToolResult {
 fn newServer(gpa: std.mem.Allocator, io: Io) !parley.Server {
     var server = try parley.Server.init(gpa, io, .{
         .info = .{ .name = "weather", .version = "1.0.0" },
+        .validator = &validation.json_schema,
         .cache = .{ .tools = .{ .ttl = .literal("5m") } },
     });
     errdefer server.deinit();
@@ -138,7 +146,7 @@ defer web.deinit(io);
 var remote: http.Transport = .init(gpa, &web, url, .{});
 defer remote.deinit();
 defer remote.close(io);
-var client: parley.Client = .init(gpa, remote.transport(), .{ .info = .{ .name = "weather-app", .version = "1.0.0" } });
+var client: parley.Client = .init(gpa, remote.transport(), .{ .info = .{ .name = "weather-app", .version = "1.0.0" }, .validator = &validation.json_schema });
 defer client.deinit();
 try client.connect(io);
 
@@ -162,7 +170,7 @@ const process = @import("parley.process");
 // grace to exit before it is asked to stop.
 const child = try process.Child.spawn(gpa, io, .{
     .argv = &.{ self, "--serve" },
-    .client = .{ .info = .{ .name = "weather-app", .version = "1.0.0" } },
+    .client = .{ .info = .{ .name = "weather-app", .version = "1.0.0" }, .validator = &validation.json_schema },
 });
 defer child.deinit(io);
 try child.client.connect(io);
@@ -325,10 +333,10 @@ at each revision, batches on each transport, and the TypeScript SDK's
 
 - [strand](https://github.com/pedronaugusto/strand): JSON and the JSON
   Schemas of Zig types.
-- [strand_schema](https://github.com/pedronaugusto/strand-schema): JSON Schema
-  validation, behind the build option `schema` (on by default): a tool's
-  structured content against its output schema on the client; given input
-  schemas and elicitation answers on the server.
+- [strand_schema](https://github.com/pedronaugusto/strand-schema)
+  (`parley.validation`): JSON Schema validation, a tool's structured content
+  against its output schema on the client; given input schemas and
+  elicitation answers on the server.
 - [aegis](https://github.com/pedronaugusto/aegis): checked types.
 - [almanac](https://github.com/pedronaugusto/almanac): civil time, for a
   task's times.

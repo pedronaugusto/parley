@@ -1,4 +1,4 @@
-//! A consumer imports the four modules and reaches every part with only
+//! A consumer imports the five modules and reaches every part with only
 //! their runtime dependencies.
 const std = @import("std");
 const parley = @import("parley");
@@ -6,6 +6,7 @@ const wire_limits = parley.wire.limitsFor(parley.wire.default_message);
 const http = @import("parley.http");
 const process = @import("parley.process");
 const oauth = @import("parley.oauth");
+const validation = @import("parley.validation");
 
 pub fn main() !void {
     var buffer: [128]u8 = undefined;
@@ -14,7 +15,7 @@ pub fn main() !void {
     const message = try parley.wire.decode(std.heap.page_allocator, w.buffered(), .{ .limits = wire_limits });
     std.debug.assert(message == .result);
     std.debug.assert(http.headers.plain("tools/call"));
-    const options: process.Options = .{ .argv = &.{"server"}, .client = .{ .info = .{ .name = "c", .version = "1" } } };
+    const options: process.Options = .{ .argv = &.{"server"}, .client = .{ .info = .{ .name = "c", .version = "1" }, .validator = &validation.json_schema } };
     std.debug.assert(options.descendants == .contain);
     var location: [128]u8 = undefined;
     var l: std.Io.Writer = .fixed(&location);

@@ -7,7 +7,7 @@ const options = @import("test_options");
 
 const testing = std.testing;
 
-const client_options: parley.Client.Options = .{ .info = .{ .name = "c", .version = "1" } };
+const client_options: parley.Client.Options = .{ .info = .{ .name = "c", .version = "1" }, .validator = null };
 
 test "a server process answers its client, and ends when its input does" {
     const io = testing.io;

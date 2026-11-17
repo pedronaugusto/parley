@@ -69,7 +69,7 @@ const Harness = struct {
     }
 
     fn startWith(h: *Harness, io: Io, serving: Serving) !void {
-        h.core = try .init(testing.allocator, io, .{ .info = .{ .name = "http", .version = "0" } });
+        h.core = try .init(testing.allocator, io, .{ .info = .{ .name = "http", .version = "0" }, .validator = null });
         try h.core.addTool(io, .{ .name = "echo" }, echo);
         try h.core.addTool(io, .{ .name = "counted" }, counted);
         try h.core.addTool(io, .{ .name = "large" }, large);
@@ -258,6 +258,7 @@ fn clientRound(io: Io, h: *Harness, revisions: []const parley.Revision, expect: 
     var answers: parley.Client.Handlers = .{ .elicit = acceptEmpty };
     var client: parley.Client = .init(testing.allocator, remote.transport(), .{
         .info = .{ .name = "c", .version = "1" },
+        .validator = null,
         .handlers = &answers,
         .revisions = revisions,
     });
@@ -312,6 +313,7 @@ test "a session client with no task for the session's stream is refused at conne
     defer remote.close(io);
     var client: parley.Client = .init(testing.allocator, remote.transport(), .{
         .info = .{ .name = "c", .version = "1" },
+        .validator = null,
         .revisions = &.{.@"2025-11-25"},
     });
     defer client.deinit();
@@ -439,6 +441,7 @@ test "a call canceled while its answer's event stream is read comes back Cancele
     defer remote.close(io);
     var client: parley.Client = .init(testing.allocator, remote.transport(), .{
         .info = .{ .name = "c", .version = "1" },
+        .validator = null,
         .revisions = &.{.@"2026-07-28"},
     });
     defer client.deinit();

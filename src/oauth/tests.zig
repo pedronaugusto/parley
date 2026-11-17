@@ -330,7 +330,7 @@ const Guarded = struct {
     serving: Io.Future(uplink.Server.ServeError!void),
 
     fn start(g: *Guarded, gpa: std.mem.Allocator, io: Io, web: *uplink.Client, issuer: []const u8) !void {
-        g.core = try .init(gpa, io, .{ .info = .{ .name = "guarded", .version = "0" } });
+        g.core = try .init(gpa, io, .{ .info = .{ .name = "guarded", .version = "0" }, .validator = null });
         errdefer g.core.deinit();
         try g.core.addTool(io, .{ .name = "read" }, read);
         try g.core.addTool(io, .{ .name = "write" }, write);
@@ -400,7 +400,7 @@ test "a client signs in when the server asks, and steps up for a tool that needs
     var remote: http.Transport = .init(gpa, &web, url, .{ .authorization = authorizer.authorization() });
     defer remote.deinit();
     defer remote.close(io);
-    var client: parley.Client = .init(gpa, remote.transport(), .{ .info = .{ .name = "parley-test", .version = "0" } });
+    var client: parley.Client = .init(gpa, remote.transport(), .{ .info = .{ .name = "parley-test", .version = "0" }, .validator = null });
     defer client.deinit();
     try client.connect(io);
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
@@ -472,7 +472,7 @@ fn dpopRound(nonces: bool) !void {
     var remote: http.Transport = .init(gpa, &web, mcp.url, .{ .authorization = authorizer.authorization() });
     defer remote.deinit();
     defer remote.close(io);
-    var client: parley.Client = .init(gpa, remote.transport(), .{ .info = .{ .name = "parley-test", .version = "0" } });
+    var client: parley.Client = .init(gpa, remote.transport(), .{ .info = .{ .name = "parley-test", .version = "0" }, .validator = null });
     defer client.deinit();
     try client.connect(io);
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
@@ -523,7 +523,7 @@ test "enterprise-managed authorization: no sign-in; the identity provider's ID-J
     var remote: http.Transport = .init(gpa, &web, mcp.url, .{ .authorization = authorizer.authorization() });
     defer remote.deinit();
     defer remote.close(io);
-    var client: parley.Client = .init(gpa, remote.transport(), .{ .info = .{ .name = "parley-test", .version = "0" } });
+    var client: parley.Client = .init(gpa, remote.transport(), .{ .info = .{ .name = "parley-test", .version = "0" }, .validator = null });
     defer client.deinit();
     try client.connect(io);
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
@@ -566,7 +566,7 @@ test "a workload's token as the grant: no client, no sign-in" {
     var remote: http.Transport = .init(gpa, &web, mcp.url, .{ .authorization = authorizer.authorization() });
     defer remote.deinit();
     defer remote.close(io);
-    var client: parley.Client = .init(gpa, remote.transport(), .{ .info = .{ .name = "parley-test", .version = "0" } });
+    var client: parley.Client = .init(gpa, remote.transport(), .{ .info = .{ .name = "parley-test", .version = "0" }, .validator = null });
     defer client.deinit();
     try client.connect(io);
     var arena_state: std.heap.ArenaAllocator = .init(gpa);

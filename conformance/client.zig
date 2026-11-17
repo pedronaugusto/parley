@@ -15,6 +15,7 @@
 //! workload's token.
 const std = @import("std");
 const parley = @import("parley");
+const validation = @import("parley.validation");
 const http = @import("parley.http");
 const oauth = @import("parley.oauth");
 const clearance = @import("clearance");
@@ -215,6 +216,7 @@ pub fn main(init: std.process.Init) !void {
     var answers: Answers = .{ .scenario = scenario };
     var client: parley.Client = .init(gpa, remote.transport(), .{
         .info = .{ .name = "parley-conformance-client", .version = "1.0.0" },
+        .validator = &validation.json_schema,
         .revisions = if (asked != null) &only else &.{ .@"2026-07-28", .@"2025-11-25", .@"2025-06-18" },
         .handlers = &answers.handlers,
     });

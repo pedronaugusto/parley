@@ -3,6 +3,7 @@
 //! Codex runs it as an MCP server.
 const std = @import("std");
 const parley = @import("parley");
+const validation = @import("parley.validation");
 
 fn echo(_: *parley.Call, args: struct { text: []const u8 }) error{}![]const u8 {
     return args.text;
@@ -21,7 +22,7 @@ fn add(call: *parley.Call, args: struct { numbers: []const i64 }) parley.Call.Er
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    var server = try parley.Server.init(init.gpa, io, .{ .info = .{ .name = "parley-example", .version = "0.1.0" } });
+    var server = try parley.Server.init(init.gpa, io, .{ .info = .{ .name = "parley-example", .version = "0.1.0" }, .validator = &validation.json_schema });
     defer server.deinit();
     try server.addTool(io, .{ .name = "echo", .description = "Echoes the text it is given" }, echo);
     try server.addTool(io, .{ .name = "add", .description = "Adds whole numbers" }, add);

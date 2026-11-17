@@ -1,6 +1,7 @@
 //! Properties of every parser of what a peer sends, held to a model. Run
 //! seeded in every test run, and by the fuzzer under `bay properties --fuzz`.
 const std = @import("std");
+const validation = @import("parley.validation");
 const shake = @import("shakedown");
 const wire = @import("wire.zig");
 const wire_limits = wire.limitsFor(wire.default_message);
@@ -108,7 +109,7 @@ fn anyLines(_: void, c: *shake.Case) !void {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    var owned = try Server.init(gpa, io, .{ .info = .{ .name = "fuzz", .version = "0" } });
+    var owned = try Server.init(gpa, io, .{ .info = .{ .name = "fuzz", .version = "0" }, .validator = &validation.json_schema });
     defer owned.deinit();
     const server = &owned;
     try server.addTool(io, .{ .name = "echo" }, echo);

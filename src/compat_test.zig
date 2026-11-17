@@ -3,6 +3,7 @@
 //! of the client as requests of the server's, answered on stdin.
 const std = @import("std");
 const parley = @import("parley.zig");
+const validation = @import("parley.validation");
 const stdio = @import("stdio.zig");
 const Pipe = @import("testing/Pipe.zig");
 const shakedown = @import("shakedown");
@@ -29,7 +30,7 @@ fn chatty(call: *Call) Call.Error!parley.ToolResult {
 }
 
 fn newServer(io: std.Io) !parley.Server {
-    var s = try parley.Server.init(testing.allocator, io, .{ .info = .{ .name = "legacy", .version = "0" } });
+    var s = try parley.Server.init(testing.allocator, io, .{ .info = .{ .name = "legacy", .version = "0" }, .validator = &validation.json_schema });
     errdefer s.deinit();
     try s.addTool(io, .{ .name = "echo", .description = "Echo text" }, echo);
     try s.addTool(io, .{ .name = "greet" }, greet);

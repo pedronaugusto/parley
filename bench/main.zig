@@ -392,7 +392,7 @@ const Bench = struct {
 
     fn serverSetup(b: *Bench) WorkloadError!void {
         b.arena = .init(b.gpa);
-        b.server = try parley.Server.init(b.gpa, b.io, .{ .info = .{ .name = "bench", .version = "0" } });
+        b.server = try parley.Server.init(b.gpa, b.io, .{ .info = .{ .name = "bench", .version = "0" }, .validator = null });
         for (wide_names) |name| {
             try b.server.addTool(b.io, .{ .name = name, .description = "A tool with twenty arguments" }, wide);
         }

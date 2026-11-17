@@ -5,6 +5,7 @@
 const std = @import("std");
 const strand = @import("strand");
 const parley = @import("parley.zig");
+const validation = @import("parley.validation");
 const shakedown = @import("shakedown");
 
 const testing = std.testing;
@@ -107,6 +108,7 @@ fn review(_: *Call, args: struct { code: []const u8, style: ?[]const u8 = null }
 fn newServer(io: std.Io) !Server {
     var s = try Server.init(testing.allocator, io, .{
         .info = .{ .name = "test", .version = "1.0.0" },
+        .validator = &validation.json_schema,
         .instructions = "for tests",
         .cache = .{ .tools = .{ .ttl = .literal("5m") } },
     });
@@ -321,7 +323,6 @@ fn echoArguments(_: *parley.ToolHandler, call: *Call, arguments: ?[]const u8) Ca
 }
 
 test "a given input schema checks every call's arguments before the handler runs, as an execution error" {
-    if (!parley.validation.built) return error.SkipZigTest;
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -362,7 +363,6 @@ test "a given input schema checks every call's arguments before the handler runs
 }
 
 test "an accepted elicitation's content is checked against the schema it asked with" {
-    if (!parley.validation.built) return error.SkipZigTest;
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -436,7 +436,7 @@ fn removeSlow(s: *Server, io: std.Io, slow: *Slow, delay: u8) parley.Server.Remo
 
 /// A server at `s`, where it stays: the tool's handler holds its address.
 fn slowServer(s: *Server, io: std.Io, slow: *Slow) !void {
-    s.* = try Server.init(testing.allocator, io, .{ .info = .{ .name = "test", .version = "1.0.0" } });
+    s.* = try Server.init(testing.allocator, io, .{ .info = .{ .name = "test", .version = "1.0.0" }, .validator = &validation.json_schema });
     errdefer s.deinit();
     try addSlow(s, io, "slow", slow);
 }
@@ -503,7 +503,7 @@ test "two calls removing each other's tools never wait in a cycle: raced in the 
         fn run(io: std.Io) !void {
             var a: Slow = .{ .removes = "b" };
             var b: Slow = .{ .removes = "a" };
-            var s = try Server.init(testing.allocator, io, .{ .info = .{ .name = "test", .version = "1.0.0" } });
+            var s = try Server.init(testing.allocator, io, .{ .info = .{ .name = "test", .version = "1.0.0" }, .validator = &validation.json_schema });
             defer s.deinit();
             try addSlow(&s, io, "a", &a);
             try addSlow(&s, io, "b", &b);

@@ -6,6 +6,7 @@ const std = @import("std");
 const strand = @import("strand");
 const shakedown = @import("shakedown");
 const parley = @import("parley.zig");
+const validation = @import("parley.validation");
 
 const testing = std.testing;
 const Server = parley.Server;
@@ -65,7 +66,7 @@ fn protocolError(call: *Call) Call.Error!parley.ToolResult {
 }
 
 fn newServer(io: Io) !Server {
-    var s = try Server.init(testing.allocator, io, .{ .info = .{ .name = "tasks", .version = "1" }, .tasks = .{ .poll_interval = .literal("10ms") } });
+    var s = try Server.init(testing.allocator, io, .{ .info = .{ .name = "tasks", .version = "1" }, .validator = &validation.json_schema, .tasks = .{ .poll_interval = .literal("10ms") } });
     errdefer s.deinit();
     try s.addTool(io, .{ .name = "slow", .task = .optional }, slow);
     try s.addTool(io, .{ .name = "confirm", .task = .required }, confirm);
@@ -246,7 +247,7 @@ test "input asked before the task is the call's own round; the task comes after"
 }
 
 test "a tool that may run as a task needs a server that serves tasks" {
-    var s = try Server.init(testing.allocator, testing.io, .{ .info = .{ .name = "plain", .version = "1" } });
+    var s = try Server.init(testing.allocator, testing.io, .{ .info = .{ .name = "plain", .version = "1" }, .validator = &validation.json_schema });
     defer s.deinit();
     try testing.expectError(error.TasksNotServed, s.addTool(testing.io, .{ .name = "slow", .task = .optional }, slow));
 }
@@ -295,7 +296,7 @@ fn update(s: *Server, id: []const u8) !void {
 
 test "a round run on tasks/update's own task, canceled there, ends the request Canceled and the task cancelled" {
     var gate: Gate = .init(testing.io, .init(1));
-    var s = try Server.init(testing.allocator, gate.io(), .{ .info = .{ .name = "tasks", .version = "1" }, .tasks = .{ .poll_interval = .literal("10ms") } });
+    var s = try Server.init(testing.allocator, gate.io(), .{ .info = .{ .name = "tasks", .version = "1" }, .validator = &validation.json_schema, .tasks = .{ .poll_interval = .literal("10ms") } });
     defer s.deinit();
     try s.addTool(testing.io, .{ .name = "confirm_then_stall", .task = .required }, ConfirmThenStall.handle);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);

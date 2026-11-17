@@ -15,7 +15,7 @@ const registry = @import("registry.zig");
 const subscriptions = @import("subscriptions.zig");
 const tasks = @import("tasks.zig");
 const Call = @import("Call.zig");
-const validation = @import("validation.zig");
+const Validator = @import("Validator.zig");
 const Revision = @import("revision.zig").Revision;
 const Context = @import("context.zig").Context;
 const Sink = @import("context.zig").Sink;
@@ -70,6 +70,16 @@ pub const Options = struct {
     /// Serve the tasks extension (`io.modelcontextprotocol/tasks`): a tool
     /// call may run as a task the client polls. Null: not served.
     tasks: ?tasks.Options = null,
+    /// What checks, before a handler runs, the arguments of a tool whose
+    /// input schema was given (`addDynamicTool`, or `ToolSpec.input_schema`
+    /// stricter than the tool's type), and the content of an accepted
+    /// elicitation against its requested schema:
+    /// `&parley.validation.json_schema`. Outlives the server. No default:
+    /// every server states its choice. Null gives up both checks: a dynamic
+    /// tool's handler gets arguments no schema checked, a typed tool's only
+    /// what decoding its type checks, and an elicitation's content is taken
+    /// unchecked.
+    validator: ?*const Validator,
 };
 
 pub const Cache = struct {
@@ -207,7 +217,7 @@ pub fn deinit(s: *Server) void {
 fn freeEntry(s: *Server, entry: anytype) void {
     if (@TypeOf(entry) == *registry.Tool) {
         registry.freeHeaderParams(s.gpa, entry.headers);
-        if (validation.built) if (entry.input) |*input| input.release();
+        if (entry.input) |*input| input.release();
     }
     inline for (@typeInfo(@TypeOf(entry.*)).@"struct".field_names) |name| {
         const F = @FieldType(@TypeOf(entry.*), name);
@@ -256,16 +266,16 @@ fn addToolWith(s: *Server, io: Io, spec: registry.ToolSpec, input: []const u8, o
     const params = try registry.headerParams(s.gpa, input, s.jsonLimits());
     errdefer registry.freeHeaderParams(s.gpa, params);
     // A schema given, not derived from a type: decoding cannot check it.
-    var compiled: ?validation.Compiled = null;
-    if (validation.built and spec.input_schema != null) {
+    var compiled: ?Validator.Compiled = null;
+    if (s.options.validator) |validator| if (spec.input_schema != null) {
         var scratch: std.heap.ArenaAllocator = .init(s.gpa);
         defer scratch.deinit();
-        compiled = validation.compile(s.gpa, io, input, .refuse, scratch.allocator(), null) catch |err| return switch (err) {
+        compiled = validator.compile(s.gpa, io, input, .refuse, scratch.allocator(), null) catch |err| return switch (err) {
             error.Refused => error.InvalidSchema,
             else => |e| e,
         };
-    }
-    errdefer if (validation.built) if (compiled) |*c| c.release();
+    };
+    errdefer if (compiled) |*c| c.release();
     tool.* = .{ .name = name, .listed = listed, .handling = handling, .headers = params, .task = spec.task, .input = compiled };
     try s.insert(io, .tools, tool, name);
 }
@@ -978,7 +988,7 @@ fn round(s: *Server, io: Io, arena: Allocator, context: *const Context, method: 
 }
 
 fn newCall(s: *const Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink, r: Round) Call {
-    return .{ .io = io, .arena = arena, .context = context, .id = request.id, .sink = sink, .limits = s.jsonLimits(), .responses = r.responses, .state_in = r.state };
+    return .{ .io = io, .arena = arena, .context = context, .id = request.id, .sink = sink, .limits = s.jsonLimits(), .validator = s.options.validator, .responses = r.responses, .state_in = r.state };
 }
 
 /// What a handler's failure is answered with, or the input it asked for.
@@ -1064,22 +1074,22 @@ fn callTool(s: *Server, io: Io, arena: Allocator, request: wire.Request, context
     defer s.letGo(io, .tools, tool);
     const handler = tool.handling.handler();
     const task_support = tool.task;
-    const input: ?*const validation.Compiled = if (validation.built) if (tool.input) |*i| i else null else null;
+    const input: ?*const Validator.Compiled = if (tool.input) |*i| i else null;
     if (!s.admitted(context, .tools, p.name)) return try unknown(arena, "Unknown tool: ", p.name);
-    if (validation.built) if (input) |schema| {
+    if (input) |schema| {
         // Arguments the given schema refuses are an execution error, as
         // arguments a type does not decode are: the model may correct them.
-        switch (validation.check(schema, io, arena, if (p.arguments) |a| a.bytes else "{}") catch |err| return switch (err) {
+        switch (Validator.check(schema, io, arena, if (p.arguments) |a| a.bytes else "{}") catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.Canceled => error.Canceled,
         }) {
             .valid => {},
             .invalid => |refused| {
-                const message = try std.mem.concat(arena, u8, &.{ "invalid arguments: ", try validation.describe(arena, refused) });
+                const message = try std.mem.concat(arena, u8, &.{ "invalid arguments: ", try Validator.describe(arena, refused) });
                 return .{ .result = try Content.body(s, arena, context.revision, .{ .tool = .{ .result = .failure(message), .identify = true } }) };
             },
         }
-    };
+    }
     const tasks_declared = s.options.tasks != null and context.revision.stateless() and context.client.hasExtension(tasks.extension, s.jsonLimits());
     // A tool that cannot answer but as a task, asked by a client that
     // cannot take one (tasks extension: required capabilities).
@@ -1195,6 +1205,7 @@ const Run = struct {
             .id = owned_id,
             .sink = sink,
             .limits = s.jsonLimits(),
+            .validator = s.options.validator,
             .responses = if (responses) |r| try a.dupe(u8, r) else null,
             .state_in = if (state_in) |st| try a.dupe(u8, st) else null,
             .task = &run.hook,

@@ -43,8 +43,8 @@
         },
 
         .clearance = .{
-            .url = "git+https://github.com/pedronaugusto/clearance#61767a3d731675e52986240a64bf1ff9b840e76d",
-            .hash = "clearance-0.4.0--QKm-FojFgATmMFTKiczlCnze7De42BLDk0YWFFF7r6V",
+            .url = "git+https://github.com/pedronaugusto/clearance#c278fd182ad40929c88f61130a0d4b958b9830e4",
+            .hash = "clearance-0.4.0--QKm-FomFgC7o8I0de_LcbtQxsFCSAWeqCP4ufaOlMq_",
             .lazy = true,
         },
 

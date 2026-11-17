@@ -5,6 +5,7 @@
 //! conformance-server -- --port 3000`; it serves until it is stopped.
 const std = @import("std");
 const parley = @import("parley");
+const validation = @import("parley.validation");
 const http = @import("parley.http");
 const uplink = @import("uplink");
 const strand = @import("strand");
@@ -453,6 +454,7 @@ pub fn main(init: std.process.Init) !void {
 
     var server = try parley.Server.init(gpa, io, .{
         .info = .{ .name = "parley-conformance-server", .version = "1.0.0" },
+        .validator = &validation.json_schema,
         .cache = .{
             .tools = .{ .ttl = .literal("5m") },
             .prompts = .{ .ttl = .literal("5m") },

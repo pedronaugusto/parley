@@ -20,7 +20,7 @@ const std = @import("std");
 const strand = @import("strand");
 const types = @import("types.zig");
 const wire = @import("wire.zig");
-const validation = @import("validation.zig");
+const Validator = @import("Validator.zig");
 const Context = @import("context.zig").Context;
 const Sink = @import("context.zig").Sink;
 
@@ -39,6 +39,9 @@ sink: Sink,
 /// strand's limits for what the call reads and writes: the server's
 /// (`Server.jsonLimits`), for a handler that reads a value it is given.
 limits: strand.core.Limits,
+/// Private: the server's validator (`Server.Options.validator`), which
+/// checks an accepted form's content.
+validator: ?*const Validator,
 /// Private: the `inputResponses` object of the retry, if it carried one.
 responses: ?[]const u8 = null,
 /// Private: the handler's state from the round before, opened.
@@ -103,25 +106,26 @@ pub fn input(call: *Call, key: []const u8, request: types.InputRequest) Error!?R
 }
 
 /// Asks the user, through the client, to fill a form or open a URL. A
-/// form's accepted content is checked against its requested schema (in a
-/// parley built with `schema`): content it refuses is `InvalidInput`, as
-/// an answer that does not read is; a requested schema that does not
-/// compile is `HandlerFailed`.
+/// form's accepted content is checked against its requested schema by the
+/// server's validator (none: not checked): content it refuses is
+/// `InvalidInput`, as an answer that does not read is; a requested schema
+/// that does not compile is `HandlerFailed`.
 pub fn elicit(call: *Call, key: []const u8, request: types.Elicit) Error!?types.ElicitResult {
     const raw = try call.input(key, .{ .elicit = request }) orelse return null;
     const answer = try parseAnswer(types.ElicitResult, call.arena, raw, call.limits);
-    if (!validation.built or answer.action != .accept) return answer;
+    const validator = call.validator orelse return answer;
+    if (answer.action != .accept) return answer;
     const form = switch (request) {
         .form => |f| f,
         .url => return answer,
     };
-    var schema = validation.compile(call.arena, call.io, form.requested_schema.bytes, .refuse, call.arena, null) catch |err| return switch (err) {
+    var schema = validator.compile(call.arena, call.io, form.requested_schema.bytes, .refuse, call.arena, null) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.Canceled => error.Canceled,
         error.Refused => error.HandlerFailed,
     };
     defer schema.release();
-    return switch (try validation.check(&schema, call.io, call.arena, if (answer.content) |c| c.bytes else "{}")) {
+    return switch (try Validator.check(&schema, call.io, call.arena, if (answer.content) |c| c.bytes else "{}")) {
         .valid => answer,
         .invalid => error.InvalidInput,
     };
