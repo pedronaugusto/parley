@@ -289,25 +289,26 @@ pub fn toolHeaders(s: *Server, io: Io, arena: Allocator, name: []const u8) (Allo
 
 /// What removing a tool or a prompt can fail with.
 pub const RemoveError = Io.Cancelable || error{
-    /// Asked by a call to the very tool or prompt it removes (`from`): the
-    /// remove would wait for the call making it.
-    RemovesItsOwnCall,
     /// More removes wait at once than the server's wait admits (65535).
     WaiterLimit,
 };
 
-/// Removes the tool named `name`; false when there is none. `from` is the
-/// call asking, when a handler removes a tool, and null outside any call.
+/// Removes the tool named `name`; false when there is none. No new call
+/// reaches the tool once it is unlinked, at the start; a call that found it
+/// before, a task's round among them, may still run its handler, and the
+/// tool is freed when the last of them ends.
 ///
-/// No new call reaches the tool once it is unlinked, at the start; a call
-/// that found it before, a task's round among them, may still run its
-/// handler, so the remove returns only when the last of them has ended:
-/// then nothing runs the handler, and an application may free one it
-/// owns. A handler that removes its own tool would wait for itself:
-/// given its call as `from`, that is refused (`RemovesItsOwnCall`), the
-/// tool left as it was. Canceled while it waits, the remove returns
-/// `Canceled` with the tool already unlinked, and the last of those calls
-/// to end frees it; the handler may still be running then.
+/// Outside any call (`from` null), the remove returns only then: once it
+/// returns, nothing runs the handler, and an application may free one it
+/// owns. Canceled while it waits, it returns `Canceled` with the tool
+/// already unlinked, and the last of those calls to end frees it.
+///
+/// From inside a call (`from` the asking call), it never waits, for its
+/// own tool or any other: it unlinks the tool and returns, since a handler
+/// waiting on another's calls could wait in a cycle (A's handler removing
+/// B while B's removes A). A handler may remove its own tool; the tool is
+/// freed when its call ends, and the handler may still be running when the
+/// remove returns.
 pub fn removeTool(s: *Server, io: Io, name: []const u8, from: ?*const Call) RemoveError!bool {
     return s.remove(io, .tools, name, from);
 }
@@ -327,7 +328,7 @@ pub fn addResource(s: *Server, io: Io, spec: registry.ResourceSpec, handler: *re
 pub fn removeResource(s: *Server, io: Io, uri: []const u8) Io.Cancelable!bool {
     return s.remove(io, .resources, uri, null) catch |err| switch (err) {
         error.Canceled => error.Canceled,
-        error.RemovesItsOwnCall, error.WaiterLimit => unreachable, // unreachable: a resource has no calls held on it
+        error.WaiterLimit => unreachable, // unreachable: a resource has no calls held on it
     };
 }
 
@@ -373,9 +374,9 @@ fn addPromptWith(s: *Server, io: Io, spec: registry.PromptSpec, arguments: []con
     try s.insert(io, .prompts, prompt, name);
 }
 
-/// Removes the prompt named `name`, as `removeTool` removes a tool: it
-/// returns once no call runs its handler, refuses a removal by a call to
-/// the prompt itself, and canceled, leaves the free to the last call.
+/// Removes the prompt named `name`, as `removeTool` removes a tool: from
+/// outside any call it returns once no call runs its handler, and canceled
+/// leaves the free to the last call; from inside a call it never waits.
 pub fn removePrompt(s: *Server, io: Io, name: []const u8, from: ?*const Call) RemoveError!bool {
     return s.remove(io, .prompts, name, from);
 }
@@ -412,7 +413,10 @@ fn insert(s: *Server, io: Io, comptime which: List, entry: anytype, key: []const
 }
 
 fn remove(s: *Server, io: Io, comptime which: List, key: []const u8, from: ?*const Call) RemoveError!bool {
-    const gone: std.meta.Elem(@FieldType(@FieldType(Lists, @tagName(which)), "items")), const failed: ?RemoveError = found: {
+    const Entry = std.meta.Elem(@FieldType(@FieldType(Lists, @tagName(which)), "items"));
+    // What becomes of the unlinked entry: freed here, left to the last call
+    // holding it, or left so by a wait that failed.
+    const fate: union(enum) { free: Entry, left, failed: RemoveError } = found: {
         var held = try s.lists.acquire(io);
         defer held.deinit(io);
         const l = held.value();
@@ -421,29 +425,36 @@ fn remove(s: *Server, io: Io, comptime which: List, key: []const u8, from: ?*con
             if (std.mem.eql(u8, keyOf(e), key)) break i;
         } else return false;
         const entry = items.items[index];
-        if (from) |call| if (call.holding == @as(*const anyopaque, entry)) return error.RemovesItsOwnCall;
         l.generations.getPtr(which).* +%= 1;
         // Order kept: a list is written in the order it was made.
         _ = items.orderedRemove(index);
         // No call finds it now; one that found it before may still run its
         // handler, which may be the entry's own.
-        if (@hasField(@TypeOf(entry.*), "use")) while (entry.use.calls != 0) held.wait(&s.released, io, .none) catch |err| {
-            // The last call to end frees it.
-            entry.use.orphaned = true;
-            break :found .{
-                entry,
-                switch (err) {
-                    error.Canceled => error.Canceled,
-                    error.WaiterLimit => error.WaiterLimit,
-                    error.Timeout => unreachable, // unreachable: the wait has no timeout
-                },
+        if (@hasField(@TypeOf(entry.*), "use")) {
+            if (from != null and entry.use.calls != 0) {
+                // A call never waits on another's: the last holder frees it.
+                entry.use.orphaned = true;
+                break :found .left;
+            }
+            while (entry.use.calls != 0) held.wait(&s.released, io, .none) catch |err| {
+                entry.use.orphaned = true;
+                break :found .{
+                    .failed = switch (err) {
+                        error.Canceled => error.Canceled,
+                        error.WaiterLimit => error.WaiterLimit,
+                        error.Timeout => unreachable, // unreachable: the wait has no timeout
+                    },
+                };
             };
-        };
-        break :found .{ entry, null };
+        }
+        break :found .{ .free = entry };
     };
     s.hub.listChanged(io, changeOf(which));
-    if (failed) |err| return err;
-    s.destroyEntry(which, gone);
+    switch (fate) {
+        .free => |entry| s.destroyEntry(which, entry),
+        .left => {},
+        .failed => |err| return err,
+    }
     return true;
 }
 
@@ -1079,7 +1090,6 @@ fn callTool(s: *Server, io: Io, arena: Allocator, request: wire.Request, context
     };
     if (task_support != .forbidden and tasks_declared) return s.callAsTask(io, arena, request, context, sink, tool, p.name, r);
     var call = s.newCall(io, arena, request, context, sink, r);
-    call.holding = tool;
     const returned = handler.call(&call, if (p.arguments) |a| a.bytes else null);
     return s.answerTool(io, arena, &call, returned, request.method, p.name, context.revision);
 }
@@ -1188,7 +1198,6 @@ const Run = struct {
             .responses = if (responses) |r| try a.dupe(u8, r) else null,
             .state_in = if (state_in) |st| try a.dupe(u8, st) else null,
             .task = &run.hook,
-            .holding = tool,
         };
         // Last, past every failure: the round's hold, let go when it is freed.
         s.holdAgain(s.task_table.?.io, tool);
@@ -1674,7 +1683,6 @@ fn getPrompt(s: *Server, io: Io, arena: Allocator, request: wire.Request, contex
         .refused => |reply| return reply,
     };
     var call = s.newCall(io, arena, request, context, sink, r);
-    call.holding = prompt;
     const result = handler.get(&call, if (p.arguments) |a| a.bytes else null) catch |err|
         return s.outcome(io, arena, &call, err, request.method, p.name);
     var out: Result = .begin(s, arena, context.revision);

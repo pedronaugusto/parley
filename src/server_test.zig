@@ -393,28 +393,35 @@ const Slow = struct {
     removed: std.atomic.Value(bool) = .init(false),
     /// A call that ran on after its tool's remove returned.
     outlived: std.atomic.Value(bool) = .init(false),
-    /// What a call that removes its own tool was answered.
-    own_removal: ?parley.Server.RemoveError!bool = null,
+    /// The tool each call removes from inside it, as the call asking, and
+    /// what the last such remove was answered.
+    removes: ?[]const u8 = null,
+    removal: ?parley.Server.RemoveError!bool = null,
     /// Held shut, calls wait until it opens.
     gate: std.atomic.Value(bool) = .init(true),
-    removes_itself: bool = false,
 
     fn call(h: *parley.registry.ToolHandler, c: *Call, _: ?[]const u8) Call.Error!parley.registry.ToolResult {
         const slow: *Slow = @alignCast(@fieldParentPtr("handler", h));
         _ = slow.running.fetchAdd(1, .acq_rel);
         defer _ = slow.running.fetchSub(1, .acq_rel);
-        if (slow.removes_itself) slow.own_removal = slow.server.removeTool(c.io, "slow", c);
         while (!slow.gate.load(.acquire)) try c.io.sleep(.fromMilliseconds(1), .awake);
         try c.io.sleep(.fromMilliseconds(1), .awake);
+        // After a pause, so that calls started together are all inside their handlers.
+        if (slow.removes) |name| slow.removal = slow.server.removeTool(c.io, name, c);
         if (slow.removed.load(.acquire)) slow.outlived.store(true, .release);
         return .ofText("done");
     }
 };
 
 fn callSlow(s: *Server, io: std.Io) void {
+    callNamed(s, io, "slow");
+}
+
+fn callNamed(s: *Server, io: std.Io, name: []const u8) void {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const request: parley.wire.Request = .{ .id = .{ .integer = 1 }, .method = "tools/call", .params = "{\"name\":\"slow\"," ++ meta ++ "}" };
+    const params = arena.allocator().print("{{\"name\":\"{s}\",{s}}}", .{ name, meta }) catch @panic("out of memory");
+    const request: parley.wire.Request = .{ .id = .{ .integer = 1 }, .method = "tools/call", .params = params };
     // Its answer is not what is tested: what runs while it is asked is.
     _ = s.serve(io, arena.allocator(), request, null, .none) catch return;
 }
@@ -427,16 +434,24 @@ fn removeSlow(s: *Server, io: std.Io, slow: *Slow, delay: u8) parley.Server.Remo
     if (removed and slow.running.load(.acquire) != 0) slow.outlived.store(true, .release);
 }
 
-fn slowServer(io: std.Io, slow: *Slow) !Server {
-    var s = try Server.init(testing.allocator, io, .{ .info = .{ .name = "test", .version = "1.0.0" } });
+/// A server at `s`, where it stays: the tool's handler holds its address.
+fn slowServer(s: *Server, io: std.Io, slow: *Slow) !void {
+    s.* = try Server.init(testing.allocator, io, .{ .info = .{ .name = "test", .version = "1.0.0" } });
     errdefer s.deinit();
-    try s.addDynamicTool(io, .{ .name = "slow", .input_schema = "{\"type\":\"object\"}" }, &slow.handler);
-    return s;
+    try addSlow(s, io, "slow", slow);
+}
+
+fn addSlow(s: *Server, io: std.Io, name: []const u8, slow: *Slow) !void {
+    slow.server = s;
+    try s.addDynamicTool(io, .{ .name = name, .input_schema = "{\"type\":\"object\"}" }, &slow.handler);
 }
 
 fn finished(outcome: shakedown.Sim.Outcome) !void {
     if (outcome == .failed) return outcome.failed;
-    errdefer std.debug.print("the simulation ended {t}\n", .{outcome});
+    errdefer switch (outcome) {
+        .deadlock => |tasks| for (tasks) |t| std.debug.print("waiting: {any}\n", .{t}),
+        else => std.debug.print("the simulation ended {t}\n", .{outcome}),
+    };
     try testing.expect(outcome == .finished);
 }
 
@@ -444,7 +459,8 @@ test "a removed tool is freed only after every call that found it ends, and its 
     const Race = struct {
         fn run(io: std.Io, seed: u64) !void {
             var slow: Slow = .{};
-            var s = try slowServer(io, &slow);
+            var s: Server = undefined;
+            try slowServer(&s, io, &slow);
             defer s.deinit();
             var group: std.Io.Group = .init;
             for (0..4) |_| group.async(io, callSlow, .{ &s, io });
@@ -464,21 +480,59 @@ test "a removed tool is freed only after every call that found it ends, and its 
     }
 }
 
-test "a call that removes its own tool is refused by name, and the tool stays" {
-    var slow: Slow = .{ .removes_itself = true };
-    var s = try slowServer(testing.io, &slow);
-    defer s.deinit();
-    slow.server = &s;
-    callSlow(&s, testing.io);
-    try testing.expectError(error.RemovesItsOwnCall, slow.own_removal.?);
-    try testing.expect(try s.removeTool(testing.io, "slow", null));
+test "a call removes its own tool without waiting on itself, and the tool is freed when the call ends" {
+    const Own = struct {
+        fn run(io: std.Io) !void {
+            var slow: Slow = .{ .removes = "slow" };
+            var s: Server = undefined;
+            try slowServer(&s, io, &slow);
+            defer s.deinit();
+            callSlow(&s, io);
+            try testing.expect(try slow.removal.?);
+            // Unlinked at once, freed as the call ended: the allocator's leak check holds it to that.
+            try testing.expect(!try s.removeTool(io, "slow", null));
+        }
+    };
+    const sim = try shakedown.Sim.init(testing.allocator, .{ .watchdog = null });
+    defer sim.deinit();
+    try finished(sim.run(Own.run, .{sim.io()}));
+}
+
+test "two calls removing each other's tools never wait in a cycle: raced in the simulation" {
+    const Cycle = struct {
+        fn run(io: std.Io) !void {
+            var a: Slow = .{ .removes = "b" };
+            var b: Slow = .{ .removes = "a" };
+            var s = try Server.init(testing.allocator, io, .{ .info = .{ .name = "test", .version = "1.0.0" } });
+            defer s.deinit();
+            try addSlow(&s, io, "a", &a);
+            try addSlow(&s, io, "b", &b);
+            var group: std.Io.Group = .init;
+            // Concurrent, so that both are inside their handlers when each removes the other's tool.
+            try group.concurrent(io, callNamed, .{ &s, io, "a" });
+            try group.concurrent(io, callNamed, .{ &s, io, "b" });
+            try group.await(io);
+            // Neither waited: both calls ended, each having removed the other's tool.
+            try testing.expect(try a.removal.?);
+            try testing.expect(try b.removal.?);
+            _ = try s.removeTool(io, "a", null);
+            _ = try s.removeTool(io, "b", null);
+        }
+    };
+    for (0..64) |seed| {
+        const sim = try shakedown.Sim.init(testing.allocator, .{ .watchdog = null, .seed = seed });
+        defer sim.deinit();
+        errdefer std.debug.print("seed {d}\n", .{seed});
+        try finished(sim.run(Cycle.run, .{sim.io()}));
+    }
 }
 
 test "a canceled remove returns Canceled with the tool unlinked, and the last call to end frees it" {
     const Canceled = struct {
         fn run(io: std.Io) !void {
             var slow: Slow = .{ .gate = .init(false) };
-            var s = try slowServer(io, &slow);
+            var s: Server = undefined;
+            try slowServer(&s, io, &slow);
             defer s.deinit();
             // Concurrent, not async: the simulation may run an async call at once, on this task.
             var call = try io.concurrent(callSlow, .{ &s, io });
