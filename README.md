@@ -329,6 +329,8 @@ at each revision, batches on each transport, and the TypeScript SDK's
   output schema on the client; given input schemas and elicitation answers on
   the server.
 - [aegis](https://github.com/pedronaugusto/aegis): checked types.
+- [almanac](https://github.com/pedronaugusto/almanac): civil time, for a
+  task's times.
 - [uplink](https://github.com/pedronaugusto/uplink) (`parley.http`): HTTP.
 - [clearance](https://github.com/pedronaugusto/clearance) (`parley.oauth`):
   OAuth 2.1 and JOSE.

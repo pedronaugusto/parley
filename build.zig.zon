@@ -20,6 +20,11 @@
             .hash = "aegis-0.2.4-rsxouoquDQApwYDuGdd2YyEeTeNp6CnJoOZKdVCfc3jt",
         },
 
+        .almanac = .{
+            .url = "git+https://github.com/pedronaugusto/almanac#514f562cda12d4a6fb2915afe146a4474151bc6f",
+            .hash = "almanac-0.0.0-sQeSOWtoCgDbTpJJ6xIDc7nridOruMC_DFStdIuDe_z8",
+        },
+
         .strand = .{
             .url = "git+https://github.com/pedronaugusto/strand#cb3d74c1d706376899172b921459f99958bb3159",
             .hash = "strand-0.15.0-8LNWVs2dNwAUUxHJE0TrcXd-rO4EGm7paRc3lKe1ppzt",

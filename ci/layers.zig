@@ -58,6 +58,7 @@ const package_references = [_]gantry.rules.ReferenceRule{
         "strand",
         "strand_schema",
         "parley_options",
+        "almanac",
         "uplink",
         "conduit",
         "shakedown",

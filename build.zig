@@ -23,6 +23,8 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
     // Its own name: an options file the same as strand_options would be one
     // file in two modules, which Zig refuses.
     options.addOption(bool, "validation", with_schema);
+    // almanac writes a task's times; strand_schema reads dates through the same one.
+    const almanac = b.dependency("almanac", .{ .target = target, .optimize = optimize }).module("almanac");
     const parley = b.addModule("parley", .{
         .root_source_file = b.path("src/parley.zig"),
         .target = target,
@@ -31,6 +33,7 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
             .{ .name = "aegis", .module = aegis },
             .{ .name = "strand", .module = strand },
             .{ .name = "parley_options", .module = options.createModule() },
+            .{ .name = "almanac", .module = almanac },
         },
     });
     // strand adds `strand_schema` once its own lazy dependencies are
@@ -41,6 +44,7 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
     const strand_schema = if (with_schema) b.dependency("strand", .{ .target = target, .optimize = optimize, .schema = true }).builder.modules.get("strand_schema") else null;
     if (strand_schema) |m| {
         m.addImport("strand", strand);
+        m.addImport("almanac", almanac);
         parley.addImport("strand_schema", m);
     }
     // Each module is declared before what it needs is fetched: a consumer's

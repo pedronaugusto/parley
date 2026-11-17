@@ -93,7 +93,7 @@ pub fn check(schema: *const Compiled, io: Io, scratch: Allocator, instance: []co
 
 /// `failure` as one line: the message, then where.
 pub fn describe(arena: Allocator, failure: Failure) Allocator.Error![]const u8 {
-    if (failure.instance_location.len != 0) return std.fmt.allocPrint(arena, "{s} at {s}", .{ failure.message, failure.instance_location });
-    if (failure.schema_location.len != 0) return std.fmt.allocPrint(arena, "{s} at {s}", .{ failure.message, failure.schema_location });
+    if (failure.instance_location.len != 0) return arena.print("{s} at {s}", .{ failure.message, failure.instance_location });
+    if (failure.schema_location.len != 0) return arena.print("{s} at {s}", .{ failure.message, failure.schema_location });
     return failure.message;
 }

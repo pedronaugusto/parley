@@ -10,6 +10,7 @@
 const std = @import("std");
 const aegis = @import("aegis");
 const strand = @import("strand");
+const almanac = @import("almanac");
 const wire = @import("wire.zig");
 
 const Io = std.Io;
@@ -385,21 +386,19 @@ pub fn write(w: *Writer, task: *const Task, form: Form, ttl: Duration, poll: Dur
     try w.writeByte('}');
 }
 
-/// `at` as ISO 8601 in UTC, to the millisecond, quoted.
+/// `at` as ISO 8601 in UTC, to the millisecond, quoted, through almanac's calendar: an instant
+/// before 1970 is written as its first, one past almanac's range (the year 9999) as its last.
 pub fn writeTime(w: *Writer, at: Instant) Writer.Error!void {
-    const clamped: u64 = @intCast(@max(at.raw(), 0)); // safe: clamped to zero and up
-    const seconds: std.time.epoch.EpochSeconds = .{ .secs = clamped / 1000 };
-    const day = seconds.getEpochDay().calculateYearDay();
-    const month_day = day.calculateMonthDay();
-    const in_day = seconds.getDaySeconds();
+    const from_epoch: Instant = .fromRaw(@max(at.raw(), 0));
+    const t = almanac.instant.toDateTime(from_epoch, .utc) catch almanac.instant.toDateTime(almanac.instant.max, .utc) catch aegis.assert.never("almanac's last instant is in its calendar");
     try w.print("\"{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z\"", .{
-        day.year,
-        month_day.month.numeric(),
-        month_day.day_index + 1,
-        in_day.getHoursIntoDay(),
-        in_day.getMinutesIntoHour(),
-        in_day.getSecondsIntoMinute(),
-        clamped % 1000,
+        @as(u16, @intCast(t.date.year.raw())), // safe: from 1970 to almanac's last year, 9999; unsigned, so no sign is written
+        t.date.month.raw(),
+        t.date.day.raw(),
+        t.time.hour.raw(),
+        t.time.minute.raw(),
+        t.time.second.raw(),
+        t.time.nanosecond.raw() / std.time.ns_per_ms,
     });
 }
 
@@ -408,6 +407,12 @@ test "a time is written as ISO 8601 to the millisecond" {
     var w: Writer = .fixed(&buffer);
     try writeTime(&w, .fromRaw(1_791_206_906_669));
     try std.testing.expectEqualStrings("\"2026-10-05T13:28:26.669Z\"", w.buffered());
+    w = .fixed(&buffer);
+    try writeTime(&w, .fromRaw(-1));
+    try std.testing.expectEqualStrings("\"1970-01-01T00:00:00.000Z\"", w.buffered());
+    w = .fixed(&buffer);
+    try writeTime(&w, .fromRaw(std.math.maxInt(i64)));
+    try std.testing.expectEqualStrings("\"9999-12-31T23:59:59.999Z\"", w.buffered());
     w = .fixed(&buffer);
     try writeTime(&w, .fromRaw(0));
     try std.testing.expectEqualStrings("\"1970-01-01T00:00:00.000Z\"", w.buffered());
