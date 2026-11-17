@@ -22,6 +22,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A task a transport starts and never reads the result of runs in an `std.Io.Group`, which ends it on `cancel` without a result to discard: `http.Transport.stream` and `stdio.Channel.reading` are `std.Io.Group`s where they were `?std.Io.Future`s, and `stdio.Connection.session_stream` is gone, the session's stream running in the connection's own `stdio.Connection.group`, which `finish` waits for and `deinit` cancels, as it does the requests.
 - `build.zig.build` returns `error{LazyDependencyNeeded}!void`: it returns `error.LazyDependencyNeeded` once every lazy dependency the modules asked for is marked, as `std.Build.dependencyLazy` says, where it declared the modules without what was not fetched yet and returned `void`. A build that calls it directly `try`s it; the development build asks for its lazy dependencies with `dependency`, which ends the pass the same way.
 - `tasks.Task.stop` is called under the table's lock, as every change to a task is: the first stop alone sets the task's cancel.
+- `Client.CallError` gains `StructuredContentInvalid` and `OutputSchemaRefused` (a tool's result checked against its output schema, below), and so the errors of `Client.callTool`, `Client.list`, `Client.getPrompt` and `Client.readResource`, which return it.
 
 ### Changed
 
