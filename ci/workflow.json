@@ -10,5 +10,6 @@
     "aarch64-macos"
   ],
   "compile_once": true,
+  "cross_job_timeout": 45,
   "hardened": true
 }
