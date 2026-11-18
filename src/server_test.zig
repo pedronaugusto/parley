@@ -112,7 +112,7 @@ fn newServer(io: std.Io) !Server {
         .instructions = "for tests",
         .cache = .{ .tools = .{ .ttl = .literal("5m") } },
     });
-    errdefer s.deinit();
+    errdefer s.deinit(io);
     try s.addTool(io, .{ .name = "forecast", .description = "The weather" }, forecast);
     try s.addTool(io, .{ .name = "echo" }, echo);
     try s.addTool(io, .{ .name = "broken" }, broken);
@@ -148,7 +148,7 @@ test "server/discover names the versions, the capabilities and the server, with 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var s = try newServer(testing.io);
-    defer s.deinit();
+    defer s.deinit(testing.io);
     var r: Recorder = .{ .gpa = testing.allocator };
     defer r.deinit();
     const answer = try ask(&s, arena.allocator(), &r, "server/discover", "{" ++ meta ++ "}");
@@ -164,7 +164,7 @@ test "tools/list in order, schemas derived from the handlers' types" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var s = try newServer(testing.io);
-    defer s.deinit();
+    defer s.deinit(testing.io);
     var r: Recorder = .{ .gpa = testing.allocator };
     defer r.deinit();
     const answer = try ask(&s, arena.allocator(), &r, "tools/list", "{" ++ meta ++ "}");
@@ -178,7 +178,7 @@ test "a page at a time, and a cursor into a list that changed is refused" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var s = try newServer(testing.io);
-    defer s.deinit();
+    defer s.deinit(testing.io);
     s.options.page_size = 2;
     var r: Recorder = .{ .gpa = testing.allocator };
     defer r.deinit();
@@ -195,7 +195,7 @@ test "a typed tool: structured content, the same JSON as text, progress on the r
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var s = try newServer(testing.io);
-    defer s.deinit();
+    defer s.deinit(testing.io);
     var r: Recorder = .{ .gpa = testing.allocator };
     defer r.deinit();
     const answer = try ask(&s, arena.allocator(), &r, "tools/call", "{\"name\":\"forecast\",\"arguments\":{\"city\":\"Lisbon\"}," ++ meta ++ "}");
@@ -208,7 +208,7 @@ test "arguments a tool cannot take, and a tool's own error, are errors the model
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var s = try newServer(testing.io);
-    defer s.deinit();
+    defer s.deinit(testing.io);
     var r: Recorder = .{ .gpa = testing.allocator };
     defer r.deinit();
     const bad = try ask(&s, arena.allocator(), &r, "tools/call", "{\"name\":\"forecast\",\"arguments\":{\"city\":\"Oslo\",\"days\":9}," ++ meta ++ "}");
@@ -225,7 +225,7 @@ test "input across rounds: asked, retried with the answer and the sealed state, 
     defer arena.deinit();
     const a = arena.allocator();
     var s = try newServer(testing.io);
-    defer s.deinit();
+    defer s.deinit(testing.io);
     var r: Recorder = .{ .gpa = testing.allocator };
     defer r.deinit();
     const first = try ask(&s, a, &r, "tools/call", "{\"name\":\"greet\"," ++ meta ++ "}");
@@ -253,7 +253,7 @@ test "input a client did not declare it can give is -32021, naming the capabilit
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var s = try newServer(testing.io);
-    defer s.deinit();
+    defer s.deinit(testing.io);
     var r: Recorder = .{ .gpa = testing.allocator };
     defer r.deinit();
     const answer = try ask(&s, arena.allocator(), &r, "tools/call", "{\"name\":\"sample\"," ++ meta ++ "}");
@@ -264,7 +264,7 @@ test "resources: a static one, a template's match, and a URI that is neither" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var s = try newServer(testing.io);
-    defer s.deinit();
+    defer s.deinit(testing.io);
     var r: Recorder = .{ .gpa = testing.allocator };
     defer r.deinit();
     const static = try ask(&s, arena.allocator(), &r, "resources/read", "{\"uri\":\"test://static\"," ++ meta ++ "}");
@@ -281,7 +281,7 @@ test "prompts: arguments from the handler's struct, a missing required one refus
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var s = try newServer(testing.io);
-    defer s.deinit();
+    defer s.deinit(testing.io);
     var r: Recorder = .{ .gpa = testing.allocator };
     defer r.deinit();
     const listed = try ask(&s, arena.allocator(), &r, "prompts/list", "{" ++ meta ++ "}");
@@ -296,7 +296,7 @@ test "what every 2026-07-28 request must carry, and versions not served" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var s = try newServer(testing.io);
-    defer s.deinit();
+    defer s.deinit(testing.io);
     var r: Recorder = .{ .gpa = testing.allocator };
     defer r.deinit();
     try expectContains(try ask(&s, arena.allocator(), &r, "tools/list", "{}"), "\"code\":-32602");
@@ -327,7 +327,7 @@ test "a given input schema checks every call's arguments before the handler runs
     defer arena.deinit();
     const a = arena.allocator();
     var s = try newServer(testing.io);
-    defer s.deinit();
+    defer s.deinit(testing.io);
     var r: Recorder = .{ .gpa = testing.allocator };
     defer r.deinit();
     var handler: parley.ToolHandler = .{ .callFn = echoArguments };
@@ -367,7 +367,7 @@ test "an accepted elicitation's content is checked against the schema it asked w
     defer arena.deinit();
     const a = arena.allocator();
     var s = try newServer(testing.io);
-    defer s.deinit();
+    defer s.deinit(testing.io);
     var r: Recorder = .{ .gpa = testing.allocator };
     defer r.deinit();
     const first = try ask(&s, a, &r, "tools/call", "{\"name\":\"greet\"," ++ meta ++ "}");
@@ -437,7 +437,7 @@ fn removeSlow(s: *Server, io: std.Io, slow: *Slow, delay: u8) parley.Server.Remo
 /// A server at `s`, where it stays: the tool's handler holds its address.
 fn slowServer(s: *Server, io: std.Io, slow: *Slow) !void {
     s.* = try Server.init(testing.allocator, io, .{ .info = .{ .name = "test", .version = "1.0.0" }, .validator = &validation.json_schema });
-    errdefer s.deinit();
+    errdefer s.deinit(io);
     try addSlow(s, io, "slow", slow);
 }
 
@@ -461,7 +461,7 @@ test "a removed tool is freed only after every call that found it ends, and its 
             var slow: Slow = .{};
             var s: Server = undefined;
             try slowServer(&s, io, &slow);
-            defer s.deinit();
+            defer s.deinit(io);
             var group: std.Io.Group = .init;
             for (0..4) |_| group.async(io, callSlow, .{ &s, io });
             const removal = io.async(removeSlow, .{ &s, io, &slow, @as(u8, @truncate(seed % 4)) });
@@ -486,7 +486,7 @@ test "a call removes its own tool without waiting on itself, and the tool is fre
             var slow: Slow = .{ .removes = "slow" };
             var s: Server = undefined;
             try slowServer(&s, io, &slow);
-            defer s.deinit();
+            defer s.deinit(io);
             callSlow(&s, io);
             try testing.expect(try slow.removal.?);
             // Unlinked at once, freed as the call ended: the allocator's leak check holds it to that.
@@ -504,7 +504,7 @@ test "two calls removing each other's tools never wait in a cycle: raced in the 
             var a: Slow = .{ .removes = "b" };
             var b: Slow = .{ .removes = "a" };
             var s = try Server.init(testing.allocator, io, .{ .info = .{ .name = "test", .version = "1.0.0" }, .validator = &validation.json_schema });
-            defer s.deinit();
+            defer s.deinit(io);
             try addSlow(&s, io, "a", &a);
             try addSlow(&s, io, "b", &b);
             var group: std.Io.Group = .init;
@@ -533,7 +533,7 @@ test "a canceled remove returns Canceled with the tool unlinked, and the last ca
             var slow: Slow = .{ .gate = .init(false) };
             var s: Server = undefined;
             try slowServer(&s, io, &slow);
-            defer s.deinit();
+            defer s.deinit(io);
             // Concurrent, not async: the simulation may run an async call at once, on this task.
             var call = try io.concurrent(callSlow, .{ &s, io });
             while (slow.running.load(.acquire) == 0) try io.sleep(.fromMilliseconds(1), .awake);

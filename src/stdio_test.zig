@@ -35,7 +35,7 @@ fn large(_: *Call) error{}![]const u8 {
 
 fn newServer(io: std.Io) !parley.Server {
     var s = try parley.Server.init(testing.allocator, io, .{ .info = .{ .name = "stdio", .version = "0" }, .validator = &validation.json_schema });
-    errdefer s.deinit();
+    errdefer s.deinit(io);
     try s.addTool(io, .{ .name = "echo" }, echo);
     try s.addTool(io, .{ .name = "slow" }, slow);
     try s.addTool(io, .{ .name = "large" }, large);
@@ -53,7 +53,7 @@ fn answerTo(lines: []const u8, id: []const u8) ?[]const u8 {
 
 test "a line a message: answers, refusals naming their request, blank lines passed over, the end of input the end" {
     var server = try newServer(testing.io);
-    defer server.deinit();
+    defer server.deinit(testing.io);
     const input =
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"text\":\"one\"}," ++ meta ++ "}}\r\n" ++
         "\n" ++
@@ -79,7 +79,7 @@ test "a line a message: answers, refusals naming their request, blank lines pass
 
 test "a line past the limit is refused and the next one read" {
     var server = try newServer(testing.io);
-    defer server.deinit();
+    defer server.deinit(testing.io);
     server.options.limits.message = .literal("1KiB");
     const input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{\"padding\":\"" ++ @as([1100]u8, @splat('x')) ++ "\"}}\n" ++
         "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{" ++ meta ++ "}}\n";
@@ -94,7 +94,7 @@ test "a line past the limit is refused and the next one read" {
 
 test "an answer past the limit is refused, not written" {
     var server = try newServer(testing.io);
-    defer server.deinit();
+    defer server.deinit(testing.io);
     const request = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{" ++ meta ++ "}}";
     server.options.limits.message = .fromRaw(request.len);
     var in: std.Io.Reader = .fixed(request ++ "\n");
@@ -109,7 +109,7 @@ test "an answer past the limit is refused, not written" {
 
 test "a tool's answer past the limit is refused, and nothing of it is written" {
     var server = try newServer(testing.io);
-    defer server.deinit();
+    defer server.deinit(testing.io);
     server.options.limits.message = .literal("4KiB");
     const request = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"large\"," ++ meta ++ "}}";
     var in: std.Io.Reader = .fixed(request ++ "\n");
@@ -134,7 +134,7 @@ fn readLine(p: *Pipe) ![]const u8 {
 test "a long request holds up nothing behind it, and is canceled without an answer" {
     const io = testing.io;
     var server = try newServer(io);
-    defer server.deinit();
+    defer server.deinit(io);
     var in_storage: [4096]u8 = undefined;
     var in_buffer: [4096]u8 = undefined;
     var in: Pipe = .init(io, &in_storage, &in_buffer, &.{});
@@ -163,7 +163,7 @@ test "a long request holds up nothing behind it, and is canceled without an answ
 test "a stream ends by its client's cancellation, and by the end of input, unanswered" {
     const io = testing.io;
     var server = try newServer(io);
-    defer server.deinit();
+    defer server.deinit(io);
     var in_storage: [4096]u8 = undefined;
     var in_buffer: [4096]u8 = undefined;
     var in: Pipe = .init(io, &in_storage, &in_buffer, &.{});
@@ -197,7 +197,7 @@ test "a stream ends by its client's cancellation, and by the end of input, unans
 
 test "a message past strand's defaults, within the message limit, is read and answered" {
     var server = try newServer(testing.io);
-    defer server.deinit();
+    defer server.deinit(testing.io);
     server.options.limits.message = .literal("48MiB");
     const text = try testing.allocator.alloc(u8, 20 << 20);
     defer testing.allocator.free(text);
@@ -253,7 +253,7 @@ fn serveOn(io: std.Io, server: *parley.Server, in: *std.Io.Reader, out: *std.Io.
 
 test "a request answered on serve's own task, canceled there, ends serve Canceled, unanswered" {
     var server = try newServer(testing.io);
-    defer server.deinit();
+    defer server.deinit(testing.io);
     try server.addTool(testing.io, .{ .name = "stall" }, Stall.handle);
     Stall.started.store(false, .release);
     var serial: Serial = .init(testing.io, 0);
@@ -294,19 +294,19 @@ const Holding = struct {
     }
 };
 
-fn keepAlive(conn: *stdio.Connection) error{ WriteFailed, Canceled }!void {
-    return conn.keepAlive();
+fn keepAlive(conn: *stdio.Connection, io: std.Io) error{ WriteFailed, Canceled }!void {
+    return conn.keepAlive(io);
 }
 
-fn take(conn: *stdio.Connection, bytes: []u8) stdio.Connection.TakeError!void {
-    return conn.take(bytes);
+fn take(conn: *stdio.Connection, io: std.Io, bytes: []u8) stdio.Connection.TakeError!void {
+    return conn.take(io, bytes);
 }
 
 /// Takes `message` on a task of its own while another holds the stream,
 /// cancels it, and returns what the take returned.
-fn takeWhileHeld(conn: *stdio.Connection, holding: *Holding, message: []const u8) stdio.Connection.TakeError!void {
+fn takeWhileHeld(conn: *stdio.Connection, io: std.Io, holding: *Holding, message: []const u8) stdio.Connection.TakeError!void {
     holding.let_go.reset();
-    var keeping = try testing.io.concurrent(keepAlive, .{conn});
+    var keeping = try testing.io.concurrent(keepAlive, .{ conn, io });
     defer {
         holding.let_go.set(testing.io);
         // the holder only holds; how it ends is not what the test checks
@@ -314,25 +314,25 @@ fn takeWhileHeld(conn: *stdio.Connection, holding: *Holding, message: []const u8
     }
     var waited: u32 = 0;
     while (!holding.holding.load(.acquire) and waited < 1000) : (waited += 1) try testing.io.sleep(.fromMilliseconds(1), .awake);
-    var taking = try testing.io.concurrent(take, .{ conn, try testing.allocator.dupe(u8, message) });
+    var taking = try testing.io.concurrent(take, .{ conn, io, try testing.allocator.dupe(u8, message) });
     return taking.cancel(testing.io);
 }
 
 test "an answer canceled while it waits for its turn on the stream returns Canceled: a request's, and a batch's" {
     var server = try newServer(testing.io);
-    defer server.deinit();
+    defer server.deinit(testing.io);
     var serial: Serial = .init(testing.io, 0);
     var holding: Holding = .{ .written = .init(testing.allocator) };
     defer holding.written.deinit();
-    var conn: stdio.Connection = .init(serial.io(), testing.allocator, &server, &holding.out, .{});
-    defer conn.deinit();
+    var conn: stdio.Connection = .init(testing.allocator, &server, &holding.out, .{});
+    defer conn.deinit(serial.io());
     // A request answered on the task that takes it: its answer waits for
     // the stream, and the cancel lands there. Where it was dropped, the
     // take returned as if answered.
-    try testing.expectError(error.Canceled, takeWhileHeld(&conn, &holding, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{" ++ meta ++ "}}"));
+    try testing.expectError(error.Canceled, takeWhileHeld(&conn, serial.io(), &holding, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{" ++ meta ++ "}}"));
     // A batch's array, written once its last request is answered.
-    try conn.take(try testing.allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"1\"}}}"));
-    try testing.expectError(error.Canceled, takeWhileHeld(&conn, &holding, "[{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}]"));
+    try conn.take(serial.io(), try testing.allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"1\"}}}"));
+    try testing.expectError(error.Canceled, takeWhileHeld(&conn, serial.io(), &holding, "[{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}]"));
     // Neither went out; the handshake's answer did.
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, holding.written.written(), "\n"));
     try testing.expect(answerTo(holding.written.written(), "\"id\":2,") != null);
@@ -347,7 +347,7 @@ const cancel_first_write = [_]shakedown.IoPlan.Entry{
 
 test "an answer on serve's own task whose flush is canceled ends serve Canceled" {
     var server = try newServer(testing.io);
-    defer server.deinit();
+    defer server.deinit(testing.io);
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(testing.io, "out", .{});
@@ -405,7 +405,7 @@ const Ran = struct {
 
 test "a handler with nothing to answer, its stream gone, does not end serve" {
     var server = try newServer(testing.io);
-    defer server.deinit();
+    defer server.deinit(testing.io);
     try server.addTool(testing.io, .{ .name = "reporting" }, reporting);
     try server.addTool(testing.io, .{ .name = "ran" }, Ran.handle);
     Ran.ran.store(false, .release);

@@ -400,7 +400,7 @@ const Bench = struct {
     }
 
     fn serverTeardown(b: *Bench) WorkloadError!void {
-        b.server.deinit();
+        b.server.deinit(b.io);
         b.arena.deinit();
     }
 

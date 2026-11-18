@@ -96,7 +96,7 @@ const Harness = struct {
         h.sse.deinit();
         h.listener.deinit(io);
         h.router.deinit();
-        h.core.deinit();
+        h.core.deinit(io);
     }
 
     const Answer = struct { status: std.http.Status, content_type: []const u8, body: []const u8 };

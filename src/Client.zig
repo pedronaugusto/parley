@@ -184,8 +184,9 @@ pub const Exchange = struct {
     status: u16 = 0,
 
     /// A message that arrived for the request before its answer.
-    /// `Canceled`: the application's handler was, and nothing answers it.
-    pub fn inbound(x: *Exchange, io: Io, arena: Allocator, message: wire.Message) Io.Cancelable!Answer {
+    /// `Canceled`: the application's handler was, and nothing answers it;
+    /// `OutOfMemory`: its answer could not be written.
+    pub fn inbound(x: *Exchange, io: Io, arena: Allocator, message: wire.Message) ServeRequestError!Answer {
         return switch (message) {
             .request => |r| x.client.serveRequest(io, arena, r),
             else => .none,
@@ -423,9 +424,13 @@ fn writeWithMeta(c: *const Client, w: *Writer, params: []const u8) Writer.Error!
     try w.writeByte('}');
 }
 
+/// What `serveRequest` fails with.
+pub const ServeRequestError = Io.Cancelable || Allocator.Error;
+
 /// A server's request in a session, answered by the application. A handler
-/// canceled is `Canceled`, the caller's to return: nothing answers it.
-pub fn serveRequest(c: *Client, io: Io, arena: Allocator, request: wire.Request) Io.Cancelable!Answer {
+/// canceled is `Canceled`, the caller's to return: nothing answers it. An
+/// answer that cannot be written for memory is `OutOfMemory`, never dropped.
+pub fn serveRequest(c: *Client, io: Io, arena: Allocator, request: wire.Request) ServeRequestError!Answer {
     const params = request.params orelse "{}";
     var out: Writer.Allocating = .init(arena);
     const result: (HandlerError || error{ MethodNotFound, WriteFailed })![]const u8 = blk: {
@@ -450,11 +455,11 @@ pub fn serveRequest(c: *Client, io: Io, arena: Allocator, request: wire.Request)
         break :blk error.MethodNotFound;
     };
     if (result) |bytes| {
-        wire.writeResult(&out.writer, request.id, bytes) catch return .none;
+        wire.writeResult(&out.writer, request.id, bytes) catch return error.OutOfMemory;
     } else |err| {
         if (err == error.Canceled) return error.Canceled;
         const code: wire.Code = if (err == error.MethodNotFound) .method_not_found else .internal_error;
-        wire.writeFailure(&out.writer, request.id, code, if (err == error.Refused) "the user declined" else @errorName(err), null) catch return .none;
+        wire.writeFailure(&out.writer, request.id, code, if (err == error.Refused) "the user declined" else @errorName(err), null) catch return error.OutOfMemory;
     }
     return .{ .message = out.written() };
 }

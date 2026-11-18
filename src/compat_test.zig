@@ -31,7 +31,7 @@ fn chatty(call: *Call) Call.Error!parley.ToolResult {
 
 fn newServer(io: std.Io) !parley.Server {
     var s = try parley.Server.init(testing.allocator, io, .{ .info = .{ .name = "legacy", .version = "0" }, .validator = &validation.json_schema });
-    errdefer s.deinit();
+    errdefer s.deinit(io);
     try s.addTool(io, .{ .name = "echo", .description = "Echo text" }, echo);
     try s.addTool(io, .{ .name = "greet" }, greet);
     try s.addTool(io, .{ .name = "chatty" }, chatty);
@@ -53,7 +53,7 @@ fn expectContains(haystack: []const u8, needle: []const u8) !void {
 
 test "Codex 0.160.0's session, as it sent it: initialize 2025-06-18, list, call" {
     var server = try newServer(testing.io);
-    defer server.deinit();
+    defer server.deinit(testing.io);
     var in: std.Io.Reader = .fixed(@embedFile("testing/captures/codex-0.160.0.jsonl"));
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
@@ -71,7 +71,7 @@ test "Codex 0.160.0's session, as it sent it: initialize 2025-06-18, list, call"
 
 test "Claude Code 2.1.302's probe is answered modern, and it stays modern" {
     var server = try newServer(testing.io);
-    defer server.deinit();
+    defer server.deinit(testing.io);
     // Its second session, against a modern server: the probe, then listen,
     // list and call, each with its `_meta`. Every request is answered.
     const capture = @embedFile("testing/captures/claude-code-2.1.302.jsonl");
@@ -100,7 +100,7 @@ test "Claude Code 2.1.302's probe is answered modern, and it stays modern" {
 
 test "the session's own methods: ping, the log level, subscriptions; requests before initialize refused" {
     var server = try newServer(testing.io);
-    defer server.deinit();
+    defer server.deinit(testing.io);
     const input =
         \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
         \\{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}
@@ -131,7 +131,7 @@ test "the session's own methods: ping, the log level, subscriptions; requests be
 test "2025-03-26 and 2024-11-05 are answered as asked, and a later session's handshake as before" {
     for ([_][]const u8{ "2025-03-26", "2024-11-05", "2025-11-25" }) |version| {
         var server = try newServer(testing.io);
-        defer server.deinit();
+        defer server.deinit(testing.io);
         var input: std.ArrayList(u8) = .empty;
         defer input.deinit(testing.allocator);
         try input.print(testing.allocator, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{s}\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"t\",\"version\":\"1\"}}}}}}\n", .{version});
@@ -149,7 +149,7 @@ test "2025-03-26 and 2024-11-05 are answered as asked, and a later session's han
 
 test "a 2025-03-26 session takes a batch: one array of its requests' answers, its notifications taken, initialize refused inside it" {
     var server = try newServer(testing.io);
-    defer server.deinit();
+    defer server.deinit(testing.io);
     const input =
         \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}
         \\[{"jsonrpc":"2.0","method":"notifications/initialized"},{"jsonrpc":"2.0","id":2,"method":"ping"},{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"text":"in a batch"}}},{"jsonrpc":"2.0","id":4,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{}}},{"jsonrpc":"1.0","id":5,"method":"ping"}]
@@ -192,7 +192,7 @@ test "a 2025-03-26 session takes a batch: one array of its requests' answers, it
 
 test "a batch is refused whole on a session whose revision removed them, and before a session" {
     var server = try newServer(testing.io);
-    defer server.deinit();
+    defer server.deinit(testing.io);
     const input =
         \\[{"jsonrpc":"2.0","id":1,"method":"ping"}]
         \\{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}
@@ -225,7 +225,7 @@ const Serial = shakedown.Layer(u8, .{
 
 test "a session whose list changes have no task to go out on is refused, where its client would never hear of them" {
     var server = try newServer(testing.io);
-    defer server.deinit();
+    defer server.deinit(testing.io);
     var serial: Serial = .init(testing.io, 0);
     const input =
         \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}
@@ -254,7 +254,7 @@ fn readLine(p: *Pipe) ![]const u8 {
 test "input the handler asks for goes to the client as the server's request, and its answer back to the handler" {
     const io = testing.io;
     var server = try newServer(io);
-    defer server.deinit();
+    defer server.deinit(io);
     var in_storage: [4096]u8 = undefined;
     var in_buffer: [4096]u8 = undefined;
     var in: Pipe = .init(io, &in_storage, &in_buffer, &.{});

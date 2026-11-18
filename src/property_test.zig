@@ -110,7 +110,7 @@ fn anyLines(_: void, c: *shake.Case) !void {
     defer threaded.deinit();
     const io = threaded.io();
     var owned = try Server.init(gpa, io, .{ .info = .{ .name = "fuzz", .version = "0" }, .validator = &validation.json_schema });
-    defer owned.deinit();
+    defer owned.deinit(io);
     const server = &owned;
     try server.addTool(io, .{ .name = "echo" }, echo);
     try server.addTool(io, .{ .name = "asks" }, asks);

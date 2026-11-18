@@ -155,7 +155,6 @@ pub const Form = enum { created, polled, notified };
 /// lock (`held`), whose value each of those calls is given.
 pub const Table = struct {
     gpa: Allocator,
-    io: Io,
     options: Options,
     /// The tasks held, and every task's fields with them.
     held: aegis.BlockingGuarded(Held) = .init(.{}),
@@ -167,17 +166,17 @@ pub const Table = struct {
     };
 
     /// The table's lock, until the guard's `deinit`.
-    pub fn lock(t: *Table) aegis.BlockingGuarded(Held).Guard {
-        return t.held.acquireUncancelable(t.io);
+    pub fn lock(t: *Table, io: Io) aegis.BlockingGuarded(Held).Guard {
+        return t.held.acquireUncancelable(io);
     }
 
-    pub fn init(gpa: Allocator, io: Io, options: Options) Table {
-        return .{ .gpa = gpa, .io = io, .options = options };
+    pub fn init(gpa: Allocator, options: Options) Table {
+        return .{ .gpa = gpa, .options = options };
     }
 
     /// Stops every round, then frees every task.
-    pub fn deinit(t: *Table) void {
-        t.group.cancel(t.io);
+    pub fn deinit(t: *Table, io: Io) void {
+        t.group.cancel(io);
         const h = t.held.teardown();
         for (h.tasks.items) |task| t.destroy(task);
         h.tasks.deinit(t.gpa);
@@ -185,11 +184,11 @@ pub const Table = struct {
 
     /// A task not yet held: the call it is made for may still answer
     /// without it.
-    pub fn create(t: *Table, principal: ?[]const u8, params: []const u8, at: Instant) (Allocator.Error || Io.RandomSecureError)!*Task {
+    pub fn create(t: *Table, io: Io, principal: ?[]const u8, params: []const u8, at: Instant) (Allocator.Error || Io.RandomSecureError)!*Task {
         const task = try t.gpa.create(Task);
         errdefer t.gpa.destroy(task);
         var bytes: [16]u8 = undefined;
-        try t.io.randomSecure(&bytes);
+        try io.randomSecure(&bytes);
         const owned_params = try t.gpa.dupe(u8, params);
         errdefer t.gpa.free(owned_params);
         const owned_principal = if (principal) |p| try t.gpa.dupe(u8, p) else null;
@@ -204,16 +203,16 @@ pub const Table = struct {
 
     /// Holds `task`, unless as many are held as allowed (after the ones
     /// whose time is up are let go).
-    pub fn hold(t: *Table, h: *Held, task: *Task, at: Instant) Allocator.Error!bool {
-        t.sweep(h, at);
+    pub fn hold(t: *Table, io: Io, h: *Held, task: *Task, at: Instant) Allocator.Error!bool {
+        t.sweep(io, h, at);
         if (h.tasks.items.len >= t.options.max) return false;
         try h.tasks.append(t.gpa, task);
         return true;
     }
 
     /// The task `id` held for `principal`, or null.
-    pub fn find(t: *Table, h: *Held, id: []const u8, principal: ?[]const u8, at: Instant) ?*Task {
-        t.sweep(h, at);
+    pub fn find(t: *Table, io: Io, h: *Held, id: []const u8, principal: ?[]const u8, at: Instant) ?*Task {
+        t.sweep(io, h, at);
         for (h.tasks.items) |task| if (std.mem.eql(u8, &task.id, id)) {
             const same = if (task.principal) |p| (if (principal) |q| std.mem.eql(u8, p, q) else false) else principal == null;
             return if (same) task else null;
@@ -223,7 +222,7 @@ pub const Table = struct {
 
     /// Lets go of the tasks whose time is up; one still running is told to
     /// stop, and goes once it has.
-    pub fn sweep(t: *Table, h: *Held, at: Instant) void {
+    pub fn sweep(t: *Table, io: Io, h: *Held, at: Instant) void {
         var i: usize = 0;
         while (i < h.tasks.items.len) {
             const task = h.tasks.items[i];
@@ -232,7 +231,7 @@ pub const Table = struct {
                 continue;
             }
             if (task.running) {
-                task.stop(t.io);
+                task.stop(io);
                 i += 1;
                 continue;
             }

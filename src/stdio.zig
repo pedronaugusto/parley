@@ -49,8 +49,8 @@ pub const ServeError = error{ ReadFailed, WriteFailed, Canceled, OutOfMemory, Co
 /// because the task was canceled is `Canceled`, as the end says.
 pub fn serve(io: Io, gpa: Allocator, server: *Server, in: ReadEnd, out: WriteEnd, options: Options) ServeError!void {
     var lines: Out.Lines = .{ .end = out };
-    var conn: Connection = .init(io, gpa, server, &lines.out, options);
-    defer conn.deinit();
+    var conn: Connection = .init(gpa, server, &lines.out, options);
+    defer conn.deinit(io);
     while (true) {
         const job = try Job.create(&conn);
         const read = conn.readLine(in, job) catch |err| {
@@ -60,14 +60,14 @@ pub fn serve(io: Io, gpa: Allocator, server: *Server, in: ReadEnd, out: WriteEnd
         switch (read) {
             .end => {
                 job.destroy();
-                return conn.finish();
+                return conn.finish(io);
             },
             .empty => job.destroy(),
             .too_long => {
                 job.destroy();
-                try conn.writeFailure(null, .invalid_request, "the message is longer than the server reads");
+                try conn.writeFailure(io, null, .invalid_request, "the message is longer than the server reads");
             },
-            .line => try conn.dispatch(job),
+            .line => try conn.dispatch(io, job),
         }
     }
 }
@@ -110,7 +110,6 @@ pub const Out = struct {
 /// reads line by line, and what HTTP+SSE takes POST by POST. It must not
 /// move once it takes a message.
 pub const Connection = struct {
-    io: Io,
     gpa: Allocator,
     server: *Server,
     /// Private: where messages go, one at a time.
@@ -131,17 +130,17 @@ pub const Connection = struct {
 
     const Taking = enum { open, ended };
 
-    pub fn init(io: Io, gpa: Allocator, server: *Server, out: *Out, options: Options) Connection {
-        return .{ .io = io, .gpa = gpa, .server = server, .out = .init(out), .options = options };
+    pub fn init(gpa: Allocator, server: *Server, out: *Out, options: Options) Connection {
+        return .{ .gpa = gpa, .server = server, .out = .init(out), .options = options };
     }
 
     /// Takes no more messages; stops what is still answering, its streams
     /// first, each ended by its own act; and frees the session.
-    pub fn deinit(c: *Connection) void {
-        c.close();
-        c.endStreams();
-        c.endSession();
-        c.group.cancel(c.io);
+    pub fn deinit(c: *Connection, io: Io) void {
+        c.close(io);
+        c.endStreams(io);
+        c.endSession(io);
+        c.group.cancel(io);
         if (c.session) |session| {
             session.deinit();
             c.gpa.destroy(session);
@@ -151,16 +150,16 @@ pub const Connection = struct {
 
     /// The client is done sending: the requests taken are answered, and the
     /// streams that would never end are ended.
-    pub fn finish(c: *Connection) ServeError!void {
-        c.close();
-        c.endStreams();
-        c.endSession();
-        return c.group.await(c.io);
+    pub fn finish(c: *Connection, io: Io) ServeError!void {
+        c.close(io);
+        c.endStreams(io);
+        c.endSession(io);
+        return c.group.await(io);
     }
 
-    fn close(c: *Connection) void {
-        var held = c.taking.acquireUncancelable(c.io);
-        defer held.deinit(c.io);
+    fn close(c: *Connection, io: Io) void {
+        var held = c.taking.acquireUncancelable(io);
+        defer held.deinit(io);
         held.value().* = .ended;
     }
 
@@ -174,26 +173,26 @@ pub const Connection = struct {
     /// `bytes`, on the connection's allocator, is the connection's from
     /// here, whatever is returned. Messages are taken one at a time, in
     /// the order the calls come.
-    pub fn take(c: *Connection, bytes: []u8) TakeError!void {
+    pub fn take(c: *Connection, io: Io, bytes: []u8) TakeError!void {
         const job = Job.create(c) catch |err| {
             c.gpa.free(bytes);
             return err;
         };
         job.bytes = .fromOwnedSlice(bytes);
         job.line = bytes;
-        var held = c.taking.acquireUncancelable(c.io);
-        defer held.deinit(c.io);
+        var held = c.taking.acquireUncancelable(io);
+        defer held.deinit(io);
         if (held.value().* == .ended) {
             job.destroy();
             return error.Ended;
         }
-        return c.dispatch(job);
+        return c.dispatch(io, job);
     }
 
     /// Keeps a quiet stream open, where `out` has a way to.
-    pub fn keepAlive(c: *Connection) error{ WriteFailed, Canceled }!void {
-        var held = try c.out.acquire(c.io);
-        defer held.deinit(c.io);
+    pub fn keepAlive(c: *Connection, io: Io) error{ WriteFailed, Canceled }!void {
+        var held = try c.out.acquire(io);
+        defer held.deinit(io);
         const out = held.value().*;
         const keep = out.keepAliveFn orelse return;
         try keep(out);
@@ -239,16 +238,16 @@ pub const Connection = struct {
         return .line;
     }
 
-    fn dispatch(c: *Connection, job: *Job) ServeError!void {
+    fn dispatch(c: *Connection, io: Io, job: *Job) ServeError!void {
         // A batch, on a session whose revision has them (2025-03-26 and
         // 2024-11-05); anywhere else the decode refuses it.
-        if (wire.isBatch(job.line)) if (c.session) |session| if (session.revision(c.io).batches()) return c.dispatchBatch(job, session);
+        if (wire.isBatch(job.line)) if (c.session) |session| if (session.revision(io).batches()) return c.dispatchBatch(io, job, session);
         var fault: wire.Fault = .{};
         const message = wire.decode(job.arena.allocator(), job.line, .{ .fault = &fault, .limits = c.server.jsonLimits() }) catch |err| {
             job.destroy();
             return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
-                error.Malformed, error.Invalid => c.writeFailure(fault.id, fault.code, fault.reason),
+                error.Malformed, error.Invalid => c.writeFailure(io, fault.id, fault.code, fault.reason),
             };
         };
         switch (message) {
@@ -261,41 +260,41 @@ pub const Connection = struct {
                 }
                 // Which era answers it is decided here, in reading order.
                 job.session = if (c.session) |session| (if (sessionEra(job)) session else null) else null;
-                if (!try c.admit(job)) {
+                if (!try c.admit(io, job)) {
                     job.destroy();
-                    return c.writeFailure(request.id, .internal_error, "the server is answering as many requests as it takes at once");
+                    return c.writeFailure(io, request.id, .internal_error, "the server is answering as many requests as it takes at once");
                 }
                 // What sets the session's state (the handshake, the log
                 // level, subscriptions) is answered before the next line is
                 // read, so the requests after it find it set. Answered on
                 // this task, a cancel of it is this task's to return.
-                if (job.session != null and setsSession(request.method)) return Job.run(job);
-                c.group.concurrent(c.io, Job.run, .{job}) catch {
+                if (job.session != null and setsSession(request.method)) return Job.run(job, io);
+                c.group.concurrent(io, Job.run, .{ job, io }) catch {
                     // No task to spare: answered here, before the next line
                     // is read.
-                    return Job.run(job);
+                    return Job.run(job, io);
                 };
             },
             .notification => |n| {
                 defer job.destroy();
-                try c.notice(job.arena.allocator(), n);
+                try c.notice(io, job.arena.allocator(), n);
             },
             // Answers to requests the session sent (2025-11-25 and before).
             .result, .failure => {
                 defer job.destroy();
-                if (c.session) |session| session.deliver(c.io, message);
+                if (c.session) |session| session.deliver(io, message);
             },
         }
     }
 
     /// A notification from the client: a request canceled, or the session
     /// begun.
-    fn notice(c: *Connection, arena: Allocator, n: wire.Notification) ServeError!void {
-        if (std.mem.eql(u8, n.method, "notifications/cancelled")) try c.cancel(arena, n.params);
+    fn notice(c: *Connection, io: Io, arena: Allocator, n: wire.Notification) ServeError!void {
+        if (std.mem.eql(u8, n.method, "notifications/cancelled")) try c.cancel(io, arena, n.params);
         if (std.mem.eql(u8, n.method, "notifications/initialized")) if (c.session) |session| {
-            if (session.initialized(c.io)) {
+            if (session.initialized(io)) {
                 // The session's list changes go out on stdout from here.
-                try c.group.concurrent(c.io, streamSession, .{ c, session });
+                try c.group.concurrent(io, streamSession, .{ c, io, session });
             }
         };
     }
@@ -304,33 +303,33 @@ pub const Connection = struct {
     /// requests run as tasks whose answers go out together, one array on one
     /// line, once the last is answered (none when it held no request, or
     /// none was answered). `initialize` is refused inside one (2025-03-26).
-    fn dispatchBatch(c: *Connection, job: *Job, session: *compat.Session) ServeError!void {
+    fn dispatchBatch(c: *Connection, io: Io, job: *Job, session: *compat.Session) ServeError!void {
         var fault: wire.Fault = .{};
         const elements = wire.decodeBatch(job.arena.allocator(), job.line, .{ .fault = &fault, .limits = c.server.jsonLimits() }) catch |err| {
             job.destroy();
             return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
-                error.Malformed, error.Invalid => c.writeFailure(fault.id, fault.code, fault.reason),
+                error.Malformed, error.Invalid => c.writeFailure(io, fault.id, fault.code, fault.reason),
             };
         };
         // The batch holds the line its messages point into until its last
         // answer is written.
         const batch = try c.gpa.create(Batch);
         batch.* = .{ .conn = c, .source = job };
-        const taken = c.takeBatch(batch, session, elements);
+        const taken = c.takeBatch(io, batch, session, elements);
         // The reader's hold: let go whatever came of the elements.
-        const released = batch.release();
+        const released = batch.release(io);
         try taken;
         return released;
     }
 
     /// The elements of `batch`, each as `dispatch` takes one message.
-    fn takeBatch(c: *Connection, batch: *Batch, session: *compat.Session, elements: []const wire.Element) ServeError!void {
+    fn takeBatch(c: *Connection, io: Io, batch: *Batch, session: *compat.Session, elements: []const wire.Element) ServeError!void {
         const job = batch.source;
         for (elements) |element| {
             const message = switch (element.read) {
                 .refused => |f| {
-                    try batch.addFailure(f.id, f.code, f.reason);
+                    try batch.addFailure(io, f.id, f.code, f.reason);
                     continue;
                 },
                 .message => |m| m,
@@ -338,35 +337,35 @@ pub const Connection = struct {
             switch (message) {
                 .request => |request| {
                     if (std.mem.eql(u8, request.method, "initialize")) {
-                        try batch.addFailure(request.id, .invalid_request, "initialize is not sent in a batch");
+                        try batch.addFailure(io, request.id, .invalid_request, "initialize is not sent in a batch");
                         continue;
                     }
                     const member = try Job.create(c);
                     member.request = request;
                     member.session = session;
                     member.batch = batch;
-                    if (!try c.admit(member)) {
+                    if (!try c.admit(io, member)) {
                         member.destroy();
-                        try batch.addFailure(request.id, .internal_error, "the server is answering as many requests as it takes at once");
+                        try batch.addFailure(io, request.id, .internal_error, "the server is answering as many requests as it takes at once");
                         continue;
                     }
-                    batch.hold();
+                    batch.hold(io);
                     if (setsSession(request.method)) {
-                        try Job.run(member);
+                        try Job.run(member, io);
                         continue;
                     }
-                    c.group.concurrent(c.io, Job.run, .{member}) catch try Job.run(member);
+                    c.group.concurrent(io, Job.run, .{ member, io }) catch try Job.run(member, io);
                 },
-                .notification => |n| try c.notice(job.arena.allocator(), n),
-                .result, .failure => session.deliver(c.io, message),
+                .notification => |n| try c.notice(io, job.arena.allocator(), n),
+                .result, .failure => session.deliver(io, message),
             }
         }
     }
 
     /// Ends the session's stream, which returns on its own: the connection's
     /// group waits for it, as for the requests.
-    fn endSession(c: *Connection) void {
-        if (c.session) |session| session.end(c.io);
+    fn endSession(c: *Connection, io: Io) void {
+        if (c.session) |session| session.end(io);
     }
 
     fn setsSession(method: []const u8) bool {
@@ -382,8 +381,8 @@ pub const Connection = struct {
         return m.version == null;
     }
 
-    fn streamSession(c: *Connection, session: *compat.Session) Io.Cancelable!void {
-        session.stream(c.io, c.sink()) catch |err| switch (err) {
+    fn streamSession(c: *Connection, io: Io, session: *compat.Session) Io.Cancelable!void {
+        session.stream(io, c.sink()) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             // The stream is gone, or never opened: it ends.
             error.Closed, error.OutOfMemory => {},
@@ -396,34 +395,33 @@ pub const Connection = struct {
     }
 
     fn sendLine(t: *Sink.Target, io: Io, message: []const u8) Sink.SendError!void {
-        _ = io;
         const c: *Connection = @alignCast(@fieldParentPtr("target", t));
-        c.send(message) catch |err| return switch (err) {
+        c.send(io, message) catch |err| return switch (err) {
             error.Canceled => error.Canceled,
             error.WriteFailed => error.Closed,
         };
     }
 
     /// Adds `job` to the requests in flight, unless they are at the bound.
-    fn admit(c: *Connection, job: *Job) Io.Cancelable!bool {
-        var held = try c.jobs.acquire(c.io);
-        defer held.deinit(c.io);
+    fn admit(c: *Connection, io: Io, job: *Job) (Io.Cancelable || Allocator.Error)!bool {
+        var held = try c.jobs.acquire(io);
+        defer held.deinit(io);
         const jobs = held.value();
         if (jobs.items.len >= c.options.max_in_flight) return false;
-        jobs.append(c.gpa, job) catch return false;
+        try jobs.append(c.gpa, job);
         return true;
     }
 
     /// Ends every `subscriptions/listen` in flight, unanswered.
-    fn endStreams(c: *Connection) void {
-        var held = c.jobs.acquireUncancelable(c.io);
-        defer held.deinit(c.io);
-        for (held.value().items) |j| if (j.streams()) j.stop(c.io);
+    fn endStreams(c: *Connection, io: Io) void {
+        var held = c.jobs.acquireUncancelable(io);
+        defer held.deinit(io);
+        for (held.value().items) |j| if (j.streams()) j.stop(io);
     }
 
-    fn retire(c: *Connection, job: *Job) void {
-        var held = c.jobs.acquireUncancelable(c.io);
-        defer held.deinit(c.io);
+    fn retire(c: *Connection, io: Io, job: *Job) void {
+        var held = c.jobs.acquireUncancelable(io);
+        defer held.deinit(io);
         const jobs = held.value();
         for (jobs.items, 0..) |j, i| if (j == job) {
             _ = jobs.swapRemove(i);
@@ -434,7 +432,7 @@ pub const Connection = struct {
     /// `notifications/cancelled`: the request it names, if still running,
     /// is canceled. One it does not name, or one already answered, is
     /// passed over (cancellation §error handling).
-    fn cancel(c: *Connection, arena: Allocator, params: ?[]const u8) ServeError!void {
+    fn cancel(c: *Connection, io: Io, arena: Allocator, params: ?[]const u8) ServeError!void {
         const limits = c.server.jsonLimits();
         const p = strand.json.parseLeaky(types.CancelledParams, arena, params orelse return, types.readOptions(limits)) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -446,15 +444,15 @@ pub const Connection = struct {
             // One naming no valid id names no request.
             error.Invalid => return,
         };
-        var held = try c.jobs.acquire(c.io);
-        defer held.deinit(c.io);
-        for (held.value().items) |j| if (j.request.id.eql(id)) j.stop(c.io);
+        var held = try c.jobs.acquire(io);
+        defer held.deinit(io);
+        for (held.value().items) |j| if (j.request.id.eql(id)) j.stop(io);
     }
 
     /// Writes `message`, whole.
-    fn send(c: *Connection, message: []const u8) error{ WriteFailed, Canceled }!void {
-        var held = try c.out.acquire(c.io);
-        defer held.deinit(c.io);
+    fn send(c: *Connection, io: Io, message: []const u8) error{ WriteFailed, Canceled }!void {
+        var held = try c.out.acquire(io);
+        defer held.deinit(io);
         const out = held.value().*;
         const end = try out.beginFn(out);
         end.writer().writeAll(message) catch |err| return end.settle(err);
@@ -462,16 +460,16 @@ pub const Connection = struct {
     }
 
     /// Writes a request's answer, whole.
-    fn sendAnswer(c: *Connection, id: wire.Id, answer: Answer) error{ WriteFailed, Canceled }!void {
-        var held = try c.out.acquire(c.io);
-        defer held.deinit(c.io);
+    fn sendAnswer(c: *Connection, io: Io, id: wire.Id, answer: Answer) error{ WriteFailed, Canceled }!void {
+        var held = try c.out.acquire(io);
+        defer held.deinit(io);
         const out = held.value().*;
         const end = try out.beginFn(out);
         answer.write(end.writer(), id) catch |err| return end.settle(err);
         try out.endFn(out);
     }
 
-    fn writeFailure(c: *Connection, id: ?wire.Id, code: wire.Code, message: []const u8) error{ WriteFailed, Canceled }!void {
+    fn writeFailure(c: *Connection, io: Io, id: ?wire.Id, code: wire.Code, message: []const u8) error{ WriteFailed, Canceled }!void {
         var buffer: [512]u8 = undefined;
         var w: Io.Writer = .fixed(&buffer);
         wire.writeFailure(&w, id, code, message, null) catch {
@@ -479,7 +477,7 @@ pub const Connection = struct {
             w = .fixed(&buffer);
             wire.writeFailure(&w, null, code, message, null) catch aegis.assert.never("each of the connection's own failure messages fits the buffer");
         };
-        return c.send(w.buffered());
+        return c.send(io, w.buffered());
     }
 };
 
@@ -516,16 +514,16 @@ const Batch = struct {
         out: std.ArrayList(u8) = .empty,
     };
 
-    fn hold(b: *Batch) void {
-        var held = b.held.acquireUncancelable(b.conn.io);
-        defer held.deinit(b.conn.io);
+    fn hold(b: *Batch, io: Io) void {
+        var held = b.held.acquireUncancelable(io);
+        defer held.deinit(io);
         held.value().holders += 1;
     }
 
     /// One answer into the array.
-    fn add(b: *Batch, id: wire.Id, answer: Answer) Allocator.Error!void {
-        var held = b.held.acquireUncancelable(b.conn.io);
-        defer held.deinit(b.conn.io);
+    fn add(b: *Batch, io: Io, id: wire.Id, answer: Answer) Allocator.Error!void {
+        var held = b.held.acquireUncancelable(io);
+        defer held.deinit(io);
         const a = held.value();
         var w: Io.Writer.Allocating = .fromArrayList(b.conn.gpa, &a.out);
         defer a.out = w.toArrayList();
@@ -533,9 +531,9 @@ const Batch = struct {
         answer.write(&w.writer, id) catch return error.OutOfMemory;
     }
 
-    fn addFailure(b: *Batch, id: ?wire.Id, code: wire.Code, message: []const u8) Allocator.Error!void {
-        var held = b.held.acquireUncancelable(b.conn.io);
-        defer held.deinit(b.conn.io);
+    fn addFailure(b: *Batch, io: Io, id: ?wire.Id, code: wire.Code, message: []const u8) Allocator.Error!void {
+        var held = b.held.acquireUncancelable(io);
+        defer held.deinit(io);
         const a = held.value();
         var w: Io.Writer.Allocating = .fromArrayList(b.conn.gpa, &a.out);
         defer a.out = w.toArrayList();
@@ -546,11 +544,11 @@ const Batch = struct {
     /// A holder is done: the last writes the array and frees the batch.
     /// `Canceled`: the last holder's task was, while the array waited to go
     /// out.
-    fn release(b: *Batch) Io.Cancelable!void {
+    fn release(b: *Batch, io: Io) Io.Cancelable!void {
         const c = b.conn;
         {
-            var held = b.held.acquireUncancelable(c.io);
-            defer held.deinit(c.io);
+            var held = b.held.acquireUncancelable(io);
+            defer held.deinit(io);
             const a = held.value();
             a.holders -= 1;
             if (a.holders != 0) return;
@@ -564,8 +562,8 @@ const Batch = struct {
         }
         // No answer: nothing is written (JSON-RPC 2.0 §6, never an empty array).
         if (out.items.len == 0) return;
-        out.append(c.gpa, ']') catch return wentOut(c.writeFailure(null, .internal_error, "out of memory"));
-        return wentOut(c.send(out.items));
+        out.append(c.gpa, ']') catch return wentOut(c.writeFailure(io, null, .internal_error, "out of memory"));
+        return wentOut(c.send(io, out.items));
     }
 };
 
@@ -636,46 +634,45 @@ const Job = struct {
     /// Answers the request, or stops at its client's cancellation, then
     /// frees it. `Canceled`: the task running it was canceled (on `serve`'s
     /// own task, `serve` returns it); nothing is answered then.
-    fn run(job: *Job) Io.Cancelable!void {
+    fn run(job: *Job, io: Io) Io.Cancelable!void {
         const c = job.conn;
         const batch = job.batch;
-        const ran = job.respond();
-        c.retire(job);
+        const ran = job.respond(io);
+        c.retire(io, job);
         job.destroy();
-        if (batch) |b| try b.release();
+        if (batch) |b| try b.release(io);
         return ran;
     }
 
-    fn respond(job: *Job) Io.Cancelable!void {
-        const io = job.conn.io;
+    fn respond(job: *Job, io: Io) Io.Cancelable!void {
         var buffer: [2]Outcome = undefined;
         var select: Io.Select(Outcome) = .init(io, &buffer);
         // Every task of the select has ended before the job's memory goes:
         // a task still finishing would write into what is freed. What they
         // return lives in the job's arena.
         defer select.cancelDiscard();
-        select.concurrent(.done, answer, .{job}) catch {
+        select.concurrent(.done, answer, .{ job, io }) catch {
             // No task to spare for watching: answered here, where a cancel
             // the handler meets is this task's (its client's cancel reaches
             // it only through its sink, as `Closed`).
-            return job.finish(answer(job));
+            return job.finish(io, answer(job, io));
         };
         select.concurrent(.canceled, waitCancel, .{ &job.cancel, io }) catch {
             const result = try select.await();
-            return job.finish(result.done);
+            return job.finish(io, result.done);
         };
         switch (try select.await()) {
-            .done => |result| return job.finish(result),
+            .done => |result| return job.finish(io, result),
             // Canceled by its client: the request's task ends; nothing is
             // answered.
             .canceled => {},
         }
     }
 
-    fn answer(job: *Job) Server.HandleError!Server.Reply {
+    fn answer(job: *Job, io: Io) Server.HandleError!Server.Reply {
         const c = job.conn;
-        if (job.session) |session| return session.handle(c.io, job.arena.allocator(), job.request, job.sink());
-        return c.server.serve(c.io, job.arena.allocator(), job.request, null, job.sink());
+        if (job.session) |session| return session.handle(io, job.arena.allocator(), job.request, job.sink());
+        return c.server.serve(io, job.arena.allocator(), job.request, null, job.sink());
     }
 
     fn waitCancel(cancel: *const aegis.Signal(void), io: Io) Io.Cancelable!void {
@@ -684,7 +681,7 @@ const Job = struct {
 
     /// Writes what the handler returned. `Canceled`: the task running it
     /// was, in the handler or while the answer waited to go out.
-    fn finish(job: *Job, result: Server.HandleError!Server.Reply) Io.Cancelable!void {
+    fn finish(job: *Job, io: Io, result: Server.HandleError!Server.Reply) Io.Cancelable!void {
         const c = job.conn;
         const returned: ?Server.Reply = result catch |err| switch (err) {
             // The task the handler ran on was canceled: nothing is answered,
@@ -697,7 +694,7 @@ const Job = struct {
         };
         // Canceled by its client: nothing more is written for it.
         if (job.canceled.load(.acquire) == .canceled) return;
-        const reply = returned orelse return wentOut(c.writeFailure(job.request.id, .internal_error, "out of memory"));
+        const reply = returned orelse return wentOut(c.writeFailure(io, job.request.id, .internal_error, "out of memory"));
         // The answer goes to the stream as it is written: a result is never
         // copied into a message first.
         const out: Answer = switch (reply) {
@@ -705,17 +702,17 @@ const Job = struct {
             .input_required => |ir| .{
                 .result = .{
                     .json = c.server.inputRequiredJson(job.arena.allocator(), ir) catch
-                        return wentOut(c.writeFailure(job.request.id, .internal_error, "out of memory")),
+                        return wentOut(c.writeFailure(io, job.request.id, .internal_error, "out of memory")),
                 },
             },
             .failure => |f| .{ .failure = f },
         };
         if (job.batch) |batch| {
-            batch.add(job.request.id, out) catch
-                return wentOut(c.writeFailure(job.request.id, .internal_error, "out of memory"));
+            batch.add(io, job.request.id, out) catch
+                return wentOut(c.writeFailure(io, job.request.id, .internal_error, "out of memory"));
             return;
         }
-        return wentOut(c.sendAnswer(job.request.id, out));
+        return wentOut(c.sendAnswer(io, job.request.id, out));
     }
 
     fn sink(job: *Job) Sink {
@@ -723,12 +720,11 @@ const Job = struct {
     }
 
     fn sendFn(t: *Sink.Target, io: Io, message: []const u8) Sink.SendError!void {
-        _ = io;
         const job: *Job = @alignCast(@fieldParentPtr("target", t));
         // Canceled by its client: nothing more is written for it, which is
         // not a cancel of the task sending.
         if (job.canceled.load(.acquire) == .canceled) return error.Closed;
-        job.conn.send(message) catch |err| return switch (err) {
+        job.conn.send(io, message) catch |err| return switch (err) {
             error.Canceled => error.Canceled,
             error.WriteFailed => error.Closed,
         };

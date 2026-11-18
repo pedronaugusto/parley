@@ -189,13 +189,13 @@ pub fn init(gpa: Allocator, io: Io, options: Options) InitError!Server {
         .options = options,
         .sealer = sealer,
         .identity = try out.toOwnedSlice(),
-        .task_table = if (options.tasks) |o| tasks.Table.init(gpa, io, o) else null,
+        .task_table = if (options.tasks) |o| tasks.Table.init(gpa, o) else null,
     };
 }
 
 /// Stops the tasks' handlers first: every task ends with the server.
-pub fn deinit(s: *Server) void {
-    if (s.task_table) |*t| t.deinit();
+pub fn deinit(s: *Server, io: Io) void {
+    if (s.task_table) |*t| t.deinit(io);
     const l = s.lists.teardown();
     for (l.tools.items) |t| s.freeEntry(t);
     for (l.resources.items) |r| s.freeEntry(r);
@@ -1160,7 +1160,7 @@ const Run = struct {
     hook: Call.TaskHook = .{ .becomeFn = become },
 
     /// A round over `task`'s call, with the answers and state given.
-    fn create(s: *Server, task: *tasks.Task, tool: *registry.Tool, attached: bool, id: wire.Id, sink: Sink, responses: ?[]const u8, state_in: ?[]const u8) Allocator.Error!*Run {
+    fn create(s: *Server, io: Io, task: *tasks.Task, tool: *registry.Tool, attached: bool, id: wire.Id, sink: Sink, responses: ?[]const u8, state_in: ?[]const u8) Allocator.Error!*Run {
         const run = try s.gpa.create(Run);
         errdefer s.gpa.destroy(run);
         run.* = .{
@@ -1199,7 +1199,7 @@ const Run = struct {
             .string => |text| .{ .string = try a.dupe(u8, text) },
         };
         run.call = .{
-            .io = s.task_table.?.io,
+            .io = io,
             .arena = a,
             .context = &run.context,
             .id = owned_id,
@@ -1211,7 +1211,7 @@ const Run = struct {
             .task = &run.hook,
         };
         // Last, past every failure: the round's hold, let go when it is freed.
-        s.holdAgain(s.task_table.?.io, tool);
+        s.holdAgain(io, tool);
         return run;
     }
 
@@ -1227,17 +1227,17 @@ const Run = struct {
 
 fn callAsTask(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: *const Context, sink: Sink, tool: *registry.Tool, name: []const u8, r: Round) BuildError!Reply {
     const table = &s.task_table.?;
-    const task = table.create(context.principal, request.params orelse "{}", tasks.now(io)) catch |err| switch (err) {
+    const task = table.create(io, context.principal, request.params orelse "{}", tasks.now(io)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Canceled => return error.Canceled,
         error.EntropyUnavailable => return failure(.internal_error, "no entropy for a task's id"),
     };
-    const run = Run.create(s, task, tool, true, request.id, sink, r.responses, r.state) catch |err| {
+    const run = Run.create(s, io, task, tool, true, request.id, sink, r.responses, r.state) catch |err| {
         table.destroy(task);
         return err;
     };
     defer run.release();
-    table.group.concurrent(table.io, runRound, .{run}) catch {
+    table.group.concurrent(io, runRound, .{run}) catch {
         // No task to run it on: answered here, as it was asked.
         run.may_detach = false;
         runRound(run) catch |err| {
@@ -1250,9 +1250,9 @@ fn callAsTask(s: *Server, io: Io, arena: Allocator, request: wire.Request, conte
         // The call was canceled: its handler stops, unless it runs as a
         // task already.
         const attached = attached: {
-            var held = table.lock();
-            defer held.deinit(table.io);
-            if (run.attached) task.stop(table.io);
+            var held = table.lock(io);
+            defer held.deinit(io);
+            if (run.attached) task.stop(io);
             break :attached run.attached;
         };
         if (attached) {
@@ -1264,8 +1264,8 @@ fn callAsTask(s: *Server, io: Io, arena: Allocator, request: wire.Request, conte
     const answered = switch (decided.*) {
         .done => |done| done,
         .detached => {
-            var held = table.lock();
-            defer held.deinit(table.io);
+            var held = table.lock(io);
+            defer held.deinit(io);
             var out: Writer.Allocating = .init(arena);
             tasks.write(&out.writer, task, .created, table.options.ttl, table.options.poll_interval, s.identityMembers()) catch return error.OutOfMemory;
             return .{ .result = .{ .json = out.written() } };
@@ -1292,16 +1292,17 @@ fn identityMembers(s: *const Server) ?[]const u8 {
 /// answers with it.
 fn become(hook: *Call.TaskHook) Call.Error!bool {
     const run: *Run = @alignCast(@fieldParentPtr("hook", hook));
+    const io = run.call.io;
     if (!run.attached) return true;
     if (!run.may_detach) return false;
     const s = run.server;
     const table = &s.task_table.?;
     {
-        var held = table.lock();
-        defer held.deinit(table.io);
+        var held = table.lock(io);
+        defer held.deinit(io);
         // A call canceled while it waited takes its task with it.
         if (run.task.stopping()) return error.Canceled;
-        if (!try table.hold(held.value(), run.task, tasks.now(table.io))) return false;
+        if (!try table.hold(io, held.value(), run.task, tasks.now(io))) return false;
         run.task.running = true;
         run.attached = false;
     }
@@ -1309,7 +1310,7 @@ fn become(hook: *Call.TaskHook) Call.Error!bool {
     run.call.sink = .none;
     // One side decides: the round's end only while the call is attached, and here only once this
     // detached it, both under the table's lock.
-    run.decided.set(table.io, .detached) catch aegis.assert.never("a round is decided once: here, once this detached it, or at its end while attached");
+    run.decided.set(io, .detached) catch aegis.assert.never("a round is decided once: here, once this detached it, or at its end while attached");
     return true;
 }
 
@@ -1378,11 +1379,11 @@ fn waitCancel(cancel: *const aegis.Signal(void), io: Io) Io.Cancelable!void {
 /// `Canceled`: that next round ran on this task, and the task was canceled.
 fn recordRound(s: *Server, run: *Run, returned: Call.Error!registry.ToolResult) Io.Cancelable!void {
     const table = &s.task_table.?;
-    const io = table.io;
+    const io = run.call.io;
     const task = run.task;
     const Next = struct { again: bool, state: ?[]const u8, id: tasks.Id };
     const next: ?Next = recorded: {
-        var held = table.lock();
+        var held = table.lock(io);
         defer held.deinit(io);
         if (run.attached) break :recorded null;
         const again = s.recordOutcome(table, held.value(), run, returned) catch blk: {
@@ -1402,14 +1403,15 @@ fn recordRound(s: *Server, run: *Run, returned: Call.Error!registry.ToolResult) 
     s.hub.changed(io, .task, &n.id);
     // Let go after the next round holds the tool: between, a remove could free it.
     defer run.release();
-    if (n.again) try s.startRound(task, run.tool, null, n.state);
+    if (n.again) try s.startRound(io, task, run.tool, null, n.state);
 }
 
 /// Records `returned` on the run's task (the caller holds the table's lock):
 /// true when the handler is to run again at once.
 fn recordOutcome(s: *Server, table: *tasks.Table, h: *tasks.Table.Held, run: *Run, returned: Call.Error!registry.ToolResult) Allocator.Error!bool {
+    const io = run.call.io;
     const task = run.task;
-    const at = tasks.now(table.io);
+    const at = tasks.now(io);
     const a = run.arena.allocator();
     const result = returned catch |err| switch (err) {
         error.Canceled => {
@@ -1461,7 +1463,7 @@ fn recordOutcome(s: *Server, table: *tasks.Table, h: *tasks.Table.Held, run: *Ru
             return false;
         },
         else => |e| {
-            const reply = s.outcome(table.io, a, &run.call, e, "tools/call", "") catch |failed| switch (failed) {
+            const reply = s.outcome(io, a, &run.call, e, "tools/call", "") catch |failed| switch (failed) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.TooLong => failure(.internal_error, too_long),
                 error.Canceled => unreachable, // unreachable: only `error.InputRequired` waits, handled above
@@ -1486,16 +1488,16 @@ fn recordOutcome(s: *Server, table: *tasks.Table, h: *tasks.Table.Held, run: *Ru
 /// Starts a round of `task`'s handler with `responses` (its `inputResponses`)
 /// and `state`; one that cannot start ends the task failed. `Canceled`: no
 /// task was free, the round ran on this one, and this one was canceled.
-fn startRound(s: *Server, task: *tasks.Task, tool: *registry.Tool, responses: ?[]const u8, state_in: ?[]const u8) Io.Cancelable!void {
+fn startRound(s: *Server, io: Io, task: *tasks.Task, tool: *registry.Tool, responses: ?[]const u8, state_in: ?[]const u8) Io.Cancelable!void {
     const table = &s.task_table.?;
-    const run = Run.create(s, task, tool, false, .{ .string = &task.id }, .none, responses, state_in) catch {
-        var held = table.lock();
-        defer held.deinit(table.io);
-        table.failOutOfMemory(held.value(), task, tasks.now(table.io));
+    const run = Run.create(s, io, task, tool, false, .{ .string = &task.id }, .none, responses, state_in) catch {
+        var held = table.lock(io);
+        defer held.deinit(io);
+        table.failOutOfMemory(held.value(), task, tasks.now(io));
         task.running = false;
         return;
     };
-    table.group.concurrent(table.io, runRound, .{run}) catch return runRound(run);
+    table.group.concurrent(io, runRound, .{run}) catch return runRound(run);
 }
 
 const TaskMethod = enum { get, update, cancel };
@@ -1518,10 +1520,10 @@ fn taskRequest(s: *Server, io: Io, arena: Allocator, request: wire.Request, cont
     var task: *tasks.Task = undefined;
     var id: tasks.Id = undefined;
     {
-        var held = table.lock();
-        defer held.deinit(table.io);
+        var held = table.lock(io);
+        defer held.deinit(io);
         const h = held.value();
-        task = table.find(h, task_id, context.principal, tasks.now(io)) orelse return failure(.invalid_params, "Failed to retrieve task: Task not found");
+        task = table.find(io, h, task_id, context.principal, tasks.now(io)) orelse return failure(.invalid_params, "Failed to retrieve task: Task not found");
         // Copied: a task no round runs may be let go once the lock is.
         id = task.id;
         switch (method) {
@@ -1552,7 +1554,7 @@ fn taskRequest(s: *Server, io: Io, arena: Allocator, request: wire.Request, cont
             .cancel => if (!task.lifecycle.isTerminal()) {
                 if (task.running) {
                     // The round sees it and ends the task cancelled.
-                    task.stop(table.io);
+                    task.stop(io);
                 } else {
                     try table.cancelled(h, task, tasks.now(io), "The task was cancelled");
                     changed = true;
@@ -1561,7 +1563,7 @@ fn taskRequest(s: *Server, io: Io, arena: Allocator, request: wire.Request, cont
         }
     }
     if (changed) s.hub.changed(io, .task, &id);
-    if (next) |responses| try s.startRound(task, tool.?, responses, task.state);
+    if (next) |responses| try s.startRound(io, task, tool.?, responses, task.state);
     var out: Result = .begin(s, arena, context.revision);
     try out.end(s, null, false);
     return .{ .result = try out.body() };
@@ -1570,9 +1572,9 @@ fn taskRequest(s: *Server, io: Io, arena: Allocator, request: wire.Request, cont
 /// The task `id` as `form` writes it, or null when it is not held.
 fn taskJson(s: *Server, io: Io, arena: Allocator, id: []const u8, principal: ?[]const u8, form: tasks.Form) BuildError!?[]const u8 {
     const table = &s.task_table.?;
-    var held = table.lock();
-    defer held.deinit(table.io);
-    const task = table.find(held.value(), id, principal, tasks.now(io)) orelse return null;
+    var held = table.lock(io);
+    defer held.deinit(io);
+    const task = table.find(io, held.value(), id, principal, tasks.now(io)) orelse return null;
     var out: Writer.Allocating = .init(arena);
     tasks.write(&out.writer, task, form, table.options.ttl, table.options.poll_interval, s.identityMembers()) catch return error.OutOfMemory;
     return out.written();
@@ -1767,9 +1769,9 @@ fn listen(s: *Server, io: Io, arena: Allocator, request: wire.Request, context: 
         var held: std.ArrayList([]const u8) = .empty;
         for (ids) |id| {
             const known = known: {
-                var guard = table.lock();
-                defer guard.deinit(table.io);
-                break :known table.find(guard.value(), id, context.principal, tasks.now(io)) != null;
+                var guard = table.lock(io);
+                defer guard.deinit(io);
+                break :known table.find(io, guard.value(), id, context.principal, tasks.now(io)) != null;
             };
             if (!known) continue;
             listener.watch(io, s.gpa, .task, id, s.options.limits.watched) catch |err| switch (err) {

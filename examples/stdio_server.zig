@@ -23,7 +23,7 @@ fn add(call: *parley.Call, args: struct { numbers: []const i64 }) parley.Call.Er
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     var server = try parley.Server.init(init.gpa, io, .{ .info = .{ .name = "parley-example", .version = "0.1.0" }, .validator = &validation.json_schema });
-    defer server.deinit();
+    defer server.deinit(io);
     try server.addTool(io, .{ .name = "echo", .description = "Echoes the text it is given" }, echo);
     try server.addTool(io, .{ .name = "add", .description = "Adds whole numbers" }, add);
     var in_buffer: [64 * 1024]u8 = undefined;

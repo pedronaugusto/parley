@@ -569,7 +569,7 @@ fn statusOf(f: parley.Server.Failure) std.http.Status {
 }
 
 /// Why the headers disagree with the body, or null when they agree.
-fn mismatch(e: *Endpoint, io: Io, arena: Allocator, request: *const Request, req: wire.Request) Allocator.Error!?[]const u8 {
+fn mismatch(e: *Endpoint, io: Io, arena: Allocator, request: *const Request, req: wire.Request) (Allocator.Error || Io.Cancelable)!?[]const u8 {
     const limits = e.server.jsonLimits();
     const m = parley.meta.read(arena, req.params, limits) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -603,11 +603,10 @@ fn mismatch(e: *Endpoint, io: Io, arena: Allocator, request: *const Request, req
 
 /// Why the tool's `Mcp-Param-*` headers disagree with its arguments, or
 /// null when they agree (2026-07-28 streamable-http, custom headers).
-fn paramMismatch(e: *Endpoint, io: Io, arena: Allocator, request: *const Request, req: wire.Request, tool: []const u8) Allocator.Error!?[]const u8 {
-    const params = (e.server.toolHeaders(io, arena, tool) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.Canceled => return null,
-    }) orelse return null;
+fn paramMismatch(e: *Endpoint, io: Io, arena: Allocator, request: *const Request, req: wire.Request, tool: []const u8) (Allocator.Error || Io.Cancelable)!?[]const u8 {
+    // A cancel is returned: the headers were never compared, so the call
+    // cannot go on as if they agreed.
+    const params = try e.server.toolHeaders(io, arena, tool) orelse return null;
     const limits = e.server.jsonLimits();
     const arguments = rawMember(req.params, "arguments", limits);
     for (params) |p| {

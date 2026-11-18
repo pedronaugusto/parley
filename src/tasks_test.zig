@@ -67,7 +67,7 @@ fn protocolError(call: *Call) Call.Error!parley.ToolResult {
 
 fn newServer(io: Io) !Server {
     var s = try Server.init(testing.allocator, io, .{ .info = .{ .name = "tasks", .version = "1" }, .validator = &validation.json_schema, .tasks = .{ .poll_interval = .literal("10ms") } });
-    errdefer s.deinit();
+    errdefer s.deinit(io);
     try s.addTool(io, .{ .name = "slow", .task = .optional }, slow);
     try s.addTool(io, .{ .name = "confirm", .task = .required }, confirm);
     try s.addTool(io, .{ .name = "two", .task = .required }, two);
@@ -80,11 +80,16 @@ fn newServer(io: Io) !Server {
 /// The result of `method` with `params` (members, `_meta` added), or the
 /// error's code as `error:<code>`.
 fn ask(s: *Server, arena: std.mem.Allocator, method: []const u8, params: []const u8, declared: bool) ![]const u8 {
+    return askOn(s, testing.io, arena, method, params, declared);
+}
+
+/// `ask` on `io`: the Io the request, and any round it starts, runs on.
+fn askOn(s: *Server, io: std.Io, arena: std.mem.Allocator, method: []const u8, params: []const u8, declared: bool) ![]const u8 {
     const m = if (declared) with_tasks else without_tasks;
     const sep: []const u8 = if (params.len == 0) "" else ",";
     const message = try arena.print("{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"{s}\",\"params\":{{{s}{s}{s}}}}}", .{ method, params, sep, m });
     const request = (try parley.wire.decode(arena, message, .{ .limits = parley.wire.limitsFor(parley.wire.default_message) })).request;
-    const reply = try s.serve(testing.io, arena, request, null, .none);
+    const reply = try s.serve(io, arena, request, null, .none);
     return switch (reply) {
         .result => |r| try r.whole(arena),
         .input_required => |ir| try s.inputRequiredJson(arena, ir),
@@ -116,7 +121,7 @@ fn poll(s: *Server, arena: std.mem.Allocator, id: []const u8, want: []const u8) 
 
 test "a call runs as a task the client polls to its result" {
     var s = try newServer(testing.io);
-    defer s.deinit();
+    defer s.deinit(testing.io);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -136,7 +141,7 @@ test "a call runs as a task the client polls to its result" {
 
 test "removing a tool a task's round still runs returns once the round has ended" {
     var s = try newServer(testing.io);
-    defer s.deinit();
+    defer s.deinit(testing.io);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -151,7 +156,7 @@ test "removing a tool a task's round still runs returns once the round has ended
 
 test "a client that did not declare the extension: answered as asked, or -32021" {
     var s = try newServer(testing.io);
-    defer s.deinit();
+    defer s.deinit(testing.io);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -168,7 +173,7 @@ test "a client that did not declare the extension: answered as asked, or -32021"
 
 test "input given to a task: asked, answered, finished" {
     var s = try newServer(testing.io);
-    defer s.deinit();
+    defer s.deinit(testing.io);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -185,7 +190,7 @@ test "input given to a task: asked, answered, finished" {
 
 test "two inputs answered one at a time: the task waits for the rest" {
     var s = try newServer(testing.io);
-    defer s.deinit();
+    defer s.deinit(testing.io);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -204,7 +209,7 @@ test "two inputs answered one at a time: the task waits for the rest" {
 
 test "a task cancelled while it runs ends cancelled; cancelling an ended one is acknowledged" {
     var s = try newServer(testing.io);
-    defer s.deinit();
+    defer s.deinit(testing.io);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -219,7 +224,7 @@ test "a task cancelled while it runs ends cancelled; cancelling an ended one is 
 
 test "a tool's error completes the task; a protocol error fails it" {
     var s = try newServer(testing.io);
-    defer s.deinit();
+    defer s.deinit(testing.io);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -234,7 +239,7 @@ test "a tool's error completes the task; a protocol error fails it" {
 
 test "input asked before the task is the call's own round; the task comes after" {
     var s = try newServer(testing.io);
-    defer s.deinit();
+    defer s.deinit(testing.io);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -248,7 +253,7 @@ test "input asked before the task is the call's own round; the task comes after"
 
 test "a tool that may run as a task needs a server that serves tasks" {
     var s = try Server.init(testing.allocator, testing.io, .{ .info = .{ .name = "plain", .version = "1" }, .validator = &validation.json_schema });
-    defer s.deinit();
+    defer s.deinit(testing.io);
     try testing.expectError(error.TasksNotServed, s.addTool(testing.io, .{ .name = "slow", .task = .optional }, slow));
 }
 
@@ -288,27 +293,28 @@ const ConfirmThenStall = struct {
     }
 };
 
-fn update(s: *Server, id: []const u8) !void {
+fn update(s: *Server, io: std.Io, id: []const u8) !void {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    _ = try ask(s, arena.allocator(), "tasks/update", try arena.allocator().print("\"taskId\":\"{s}\",\"inputResponses\":{{\"confirm\":{{\"action\":\"accept\",\"content\":{{}}}}}}", .{id}), true);
+    _ = try askOn(s, io, arena.allocator(), "tasks/update", try arena.allocator().print("\"taskId\":\"{s}\",\"inputResponses\":{{\"confirm\":{{\"action\":\"accept\",\"content\":{{}}}}}}", .{id}), true);
 }
 
 test "a round run on tasks/update's own task, canceled there, ends the request Canceled and the task cancelled" {
     var gate: Gate = .init(testing.io, .init(1));
     var s = try Server.init(testing.allocator, gate.io(), .{ .info = .{ .name = "tasks", .version = "1" }, .validator = &validation.json_schema, .tasks = .{ .poll_interval = .literal("10ms") } });
-    defer s.deinit();
+    defer s.deinit(gate.io());
     try s.addTool(testing.io, .{ .name = "confirm_then_stall", .task = .required }, ConfirmThenStall.handle);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const id = try field(a, try ask(&s, a, "tools/call", "\"name\":\"confirm_then_stall\",\"arguments\":{}", true), "taskId");
+    // The request, and the rounds it starts, run on the gate's Io.
+    const id = try field(a, try askOn(&s, gate.io(), a, "tools/call", "\"name\":\"confirm_then_stall\",\"arguments\":{}", true), "taskId");
     _ = try poll(&s, a, id, "input_required");
     // No task to spare from here: the next round runs on the request that
     // gives the input.
     gate.state.store(0, .release);
     ConfirmThenStall.started.store(false, .release);
-    var updating = try testing.io.concurrent(update, .{ &s, id });
+    var updating = try testing.io.concurrent(update, .{ &s, gate.io(), id });
     var waited: u32 = 0;
     while (!ConfirmThenStall.started.load(.acquire) and waited < 1000) : (waited += 1) try testing.io.sleep(.fromMilliseconds(10), .awake);
     try testing.expect(ConfirmThenStall.started.load(.acquire));

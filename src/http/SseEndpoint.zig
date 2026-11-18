@@ -175,7 +175,7 @@ fn open(e: *SseEndpoint, io: Io, request: *Request, response: *Response) anyerro
         return err;
     };
     session.* = .{ .id = std.fmt.bytesToHex(random, .lower), .io = io, .response = response, .connection = undefined };
-    session.connection = .init(io, e.gpa, e.server, &session.out, e.options.connection);
+    session.connection = .init(e.gpa, e.server, &session.out, e.options.connection);
     if (!try e.admit(io, session)) {
         e.gpa.destroy(session);
         return refuse(io, response, .service_unavailable, null, .internal_error, "The server holds as many sessions as it takes");
@@ -194,7 +194,7 @@ fn serveStream(e: *SseEndpoint, io: Io, request: *Request, response: *Response, 
     defer e.release(session);
     defer {
         e.forget(io, session);
-        session.connection.deinit();
+        session.connection.deinit(io);
     }
     // Opened once the endpoint event is written, or where the stream ends
     // before it: a POST waiting then finds the session ended.
@@ -210,7 +210,7 @@ fn serveStream(e: *SseEndpoint, io: Io, request: *Request, response: *Response, 
             error.BodyUnread => break,
         };
         if (left) break;
-        session.connection.keepAlive() catch |err| switch (err) {
+        session.connection.keepAlive(io) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.WriteFailed => break,
         };
@@ -261,7 +261,7 @@ fn post(e: *SseEndpoint, io: Io, arena: Allocator, request: *Request, response: 
         e.gpa.free(body);
         return err;
     };
-    session.connection.take(body) catch |err| switch (err) {
+    session.connection.take(io, body) catch |err| switch (err) {
         error.Ended => return refuse(io, response, .not_found, null, .invalid_request, "Session not found: its stream has ended"),
         // The stream broke: the session ends with its GET.
         error.WriteFailed, error.ReadFailed => return refuse(io, response, .not_found, null, .invalid_request, "Session not found: its stream has ended"),
@@ -302,12 +302,12 @@ fn sessionOf(query: ?[]const u8) ?[]const u8 {
 }
 
 /// Adds `session`, unless the endpoint holds as many as it takes.
-fn admit(e: *SseEndpoint, io: Io, session: *Session) Io.Cancelable!bool {
+fn admit(e: *SseEndpoint, io: Io, session: *Session) (Io.Cancelable || Allocator.Error)!bool {
     var held = try e.sessions.acquire(io);
     defer held.deinit(io);
     const sessions = held.value();
     if (sessions.items.len >= e.options.max_sessions) return false;
-    sessions.append(e.gpa, session) catch return false;
+    try sessions.append(e.gpa, session);
     return true;
 }
 

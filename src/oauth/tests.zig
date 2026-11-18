@@ -331,7 +331,7 @@ const Guarded = struct {
 
     fn start(g: *Guarded, gpa: std.mem.Allocator, io: Io, web: *uplink.Client, issuer: []const u8) !void {
         g.core = try .init(gpa, io, .{ .info = .{ .name = "guarded", .version = "0" }, .validator = null });
-        errdefer g.core.deinit();
+        errdefer g.core.deinit(io);
         try g.core.addTool(io, .{ .name = "read" }, read);
         try g.core.addTool(io, .{ .name = "write" }, write);
         g.listener = try (try Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{ .reuse_address = true });
@@ -372,7 +372,7 @@ const Guarded = struct {
         g.keys.deinit();
         g.metadata.deinit(g.core.gpa);
         g.listener.deinit(io);
-        g.core.deinit();
+        g.core.deinit(io);
     }
 };
 

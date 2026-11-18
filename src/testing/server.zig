@@ -84,7 +84,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn serve(gpa: std.mem.Allocator, io: Io, arguments: Arguments) !void {
     var server = try parley.Server.init(gpa, io, .{ .info = .{ .name = "parley-fixture", .version = "1.0.0" }, .validator = null, .limits = .{ .message = .literal("128MiB") } });
-    defer server.deinit();
+    defer server.deinit(io);
     try server.addTool(io, .{ .name = "echo", .description = "Echoes the text it is given" }, echo);
     try server.addTool(io, .{ .name = "sleep", .description = "Answers after ms milliseconds" }, sleep);
     var wide: parley.ToolHandler = .{ .callFn = wideCall };

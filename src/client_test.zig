@@ -54,7 +54,7 @@ fn serveTask(io: Io, server: *parley.Server, in: *Pipe, out: *Pipe) void {
 test "a 2026-07-28 server: discovered, listed, called, input given across rounds" {
     const io = testing.io;
     var server = try parley.Server.init(testing.allocator, io, .{ .info = .{ .name = "s", .version = "1" }, .validator = &validation.json_schema, .instructions = "be kind" });
-    defer server.deinit();
+    defer server.deinit(io);
     try server.addTool(io, .{ .name = "echo" }, echo);
     try server.addTool(io, .{ .name = "greet" }, greet);
 
@@ -118,7 +118,7 @@ fn callGreet(client: *Client, io: Io) Client.CallError!void {
 test "a call canceled while the application answers the server's input comes back Canceled" {
     const io = testing.io;
     var server = try parley.Server.init(testing.allocator, io, .{ .info = .{ .name = "s", .version = "1" }, .validator = &validation.json_schema });
-    defer server.deinit();
+    defer server.deinit(io);
     try server.addTool(io, .{ .name = "greet" }, greet);
 
     var wiring: Wiring = .{ .to_server = undefined, .from_server = undefined };
@@ -170,7 +170,7 @@ fn refuseTask(call: *Call) Call.Error!parley.ToolResult {
 test "a call the server runs as a task: polled, its input given, answered as if at once" {
     const io = testing.io;
     var server = try parley.Server.init(testing.allocator, io, .{ .info = .{ .name = "s", .version = "1" }, .validator = &validation.json_schema, .tasks = .{ .poll_interval = .literal("5ms") } });
-    defer server.deinit();
+    defer server.deinit(io);
     try server.addTool(io, .{ .name = "knock", .task = .required }, knock);
     try server.addTool(io, .{ .name = "refuse", .task = .optional }, refuseTask);
 
@@ -351,7 +351,7 @@ fn report(_: *parley.ToolHandler, _: *Call, arguments: ?[]const u8) Call.Error!p
 test "a tool's structured content is checked against the output schema tools/list gave for it" {
     const io = testing.io;
     var server = try parley.Server.init(testing.allocator, io, .{ .info = .{ .name = "s", .version = "1" }, .validator = &validation.json_schema });
-    defer server.deinit();
+    defer server.deinit(io);
     var handler: parley.ToolHandler = .{ .callFn = report };
     const input = "{\"type\":\"object\",\"properties\":{\"mode\":{\"type\":\"string\"}}}";
     try server.addDynamicTool(io, .{ .name = "count", .input_schema = input, .output_schema = "{\"type\":\"object\",\"properties\":{\"count\":{\"type\":\"integer\"}},\"required\":[\"count\"]}" }, &handler);

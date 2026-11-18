@@ -464,7 +464,7 @@ pub fn main(init: std.process.Init) !void {
         },
         .tasks = .{ .poll_interval = .literal("200ms") },
     });
-    defer server.deinit();
+    defer server.deinit(io);
     server_handle = &server;
 
     try server.addTool(io, .{ .name = "test_simple_text", .description = "Tests simple text content response" }, simpleText);

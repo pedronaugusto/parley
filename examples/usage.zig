@@ -12,7 +12,7 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
     var server = try newServer(gpa, io);
-    defer server.deinit();
+    defer server.deinit(io);
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len > 1 and std.mem.eql(u8, args[1], "--serve")) return serveStdio(io, gpa, &server);
     try overStdio(io, gpa, &server);
@@ -88,7 +88,7 @@ fn newServer(gpa: std.mem.Allocator, io: Io) !parley.Server {
         .validator = &validation.json_schema,
         .cache = .{ .tools = .{ .ttl = .literal("5m") } },
     });
-    errdefer server.deinit();
+    errdefer server.deinit(io);
     try server.addTool(io, .{ .name = "forecast", .description = "The weather in a city" }, forecast);
     try server.addTool(io, .{ .name = "greet", .description = "Greets the user by name" }, greet);
     return server;

@@ -79,7 +79,7 @@ fn newServer(gpa: std.mem.Allocator, io: Io) !parley.Server {
         .validator = &validation.json_schema,
         .cache = .{ .tools = .{ .ttl = .literal("5m") } },
     });
-    errdefer server.deinit();
+    errdefer server.deinit(io);
     try server.addTool(io, .{ .name = "forecast", .description = "The weather in a city" }, forecast);
     try server.addTool(io, .{ .name = "greet", .description = "Greets the user by name" }, greet);
     return server;
