@@ -282,6 +282,9 @@ const BatchingServer = struct {
     /// The line the client answered the batch with.
     answer: [256]u8 = undefined,
     answer_len: usize = 0,
+    /// Set once the answer has come: the call's result reaches its caller
+    /// before the client has answered the server's requests beside it.
+    answered: Io.Event = .unset,
 
     fn run(s: *BatchingServer, io: Io, in: *Pipe, out: *Pipe) void {
         defer out.close();
@@ -289,6 +292,7 @@ const BatchingServer = struct {
             if (line.len != 0 and line[0] == '[') {
                 @memcpy(s.answer[0..line.len], line);
                 s.answer_len = line.len;
+                s.answered.set(io);
                 continue;
             }
             const id_at = std.mem.find(u8, line, "\"id\":") orelse continue;
@@ -328,6 +332,7 @@ test "a 2024-11-05 server: its revision taken, a batch from it taken, its reques
     defer arena.deinit();
     const called = try client.callTool(io, arena.allocator(), "anything", .{}, null);
     try testing.expectEqualStrings("batched", called.content[0].text.text);
+    try server.answered.wait(io);
     wiring.to_server.close();
     task.await(io);
     try testing.expectEqualStrings("[{\"jsonrpc\":\"2.0\",\"id\":900,\"result\":{}}]", server.answer[0..server.answer_len]);
