@@ -397,42 +397,12 @@ pub fn writeNotification(w: *Writer, method: []const u8, params: ?[]const u8) Wr
     try w.writeByte('}');
 }
 
-/// `s` as a JSON string. Text that is not UTF-8 is written with each bad
-/// byte as U+FFFD, so the message stays JSON whatever a caller passes.
+/// `s` as a JSON string, written by strand's own string writer. Text that
+/// is not UTF-8 is written with each bad byte as U+FFFD, so the message stays
+/// JSON whatever a caller passes.
 pub fn writeString(w: *Writer, s: []const u8) Writer.Error!void {
-    try w.writeByte('"');
-    var start: usize = 0;
-    var i: usize = 0;
-    while (i < s.len) {
-        const b = s[i];
-        if (b >= 0x20 and b != '"' and b != '\\' and b < 0x80) {
-            i += 1;
-            continue;
-        }
-        if (b >= 0x80) {
-            const n = std.unicode.utf8ByteSequenceLength(b) catch 0;
-            if (n != 0 and i + n <= s.len and std.unicode.utf8ValidateSlice(s[i..][0..n])) {
-                i += n;
-                continue;
-            }
-            try w.writeAll(s[start..i]);
-            try w.writeAll("\u{FFFD}");
-            i += 1;
-            start = i;
-            continue;
-        }
-        try w.writeAll(s[start..i]);
-        switch (b) {
-            '"' => try w.writeAll("\\\""),
-            '\\' => try w.writeAll("\\\\"),
-            '\n' => try w.writeAll("\\n"),
-            '\r' => try w.writeAll("\\r"),
-            '\t' => try w.writeAll("\\t"),
-            else => try w.print("\\u{x:0>4}", .{b}),
-        }
-        i += 1;
-        start = i;
-    }
-    try w.writeAll(s[start..]);
-    try w.writeByte('"');
+    json.writeString(w, s, .replace) catch |err| switch (err) {
+        error.WriteFailed => return error.WriteFailed,
+        error.InvalidUtf8 => aegis.assert.never("strand replaces bad bytes, refusing none"),
+    };
 }

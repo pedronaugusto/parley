@@ -31,6 +31,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `wire.writeString` is strand's own string writer (`strand.json.writeString`, bad UTF-8 replaced), where parley kept a copy; the property tests write their JSON strings through it, off `std.json` (the family adoption pass).
 - A task's times (`tasks.writeTime`) are written through almanac's calendar, a new dependency, in place of std's epoch arithmetic: an instant past almanac's last year, 9999, is written as its last instant, where std's arithmetic ran on unchecked.
 - Family move, part B: pins aegis f52eabe, the one aegis of the family, and strand main cb3d74c, uplink main e3cd60c, clearance main 61767a3, conduit main 60ee9d6 and shakedown main c29751d, each on it; preflight ci-standard 158c176. uplink's `Method` constants are named in lower case (`.get`, `.post`, `.delete`); a session's event stream is read through the response's `readEnd`, where a canceled read is `error.Canceled` itself; a child's standard error file goes to conduit as the `aegis.own.Unowned` handle parley holds; the token store's `forget`, now cancelable, passes a cancel on.
 - aegis 0.3: contracts are `assert.invariant` where `assert.pre` and `assert.post` were, and a listener waits on its ordered guard (`held.wait(&condition, io, deadline)`). Pins aegis breaking-0.3 (7bdb587), and strand, uplink, clearance, conduit and shakedown on it. A child's stderr, which conduit now lends as the `std.Io.File` itself, is read without `.get()`.

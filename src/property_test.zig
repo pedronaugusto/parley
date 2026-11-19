@@ -233,7 +233,8 @@ fn requestMeta(_: void, c: *shake.Case) !void {
             var keys: usize = 0;
             if (shake.gen.boolean(c.source)) {
                 const text = try shake.gen.string(c.source, c.gpa, .{ .kind = .utf8, .max_len = 16 });
-                try w.print("\"{s}\":{f}", .{ meta.protocol_version, std.json.fmt(text, .{}) });
+                try w.print("\"{s}\":", .{meta.protocol_version});
+                try wire.writeString(w, text);
                 version = text;
                 keys += 1;
             }
@@ -271,7 +272,8 @@ fn requestMeta(_: void, c: *shake.Case) !void {
                 2 => {
                     if (keys > 0) try w.writeAll(",");
                     const text = try shake.gen.string(c.source, c.gpa, .{ .kind = .utf8, .max_len = 16 });
-                    try w.print("\"{s}\":{f}", .{ meta.progress_token, std.json.fmt(text, .{}) });
+                    try w.print("\"{s}\":", .{meta.progress_token});
+                    try wire.writeString(w, text);
                     token = .{ .string = text };
                     keys += 1;
                 },
