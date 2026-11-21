@@ -38,10 +38,12 @@ session: ?[]u8 = null,
 /// answers for.
 stream: Io.Group = .init,
 client: ?*Client = null,
+/// Private: set once the session's GET was answered, or could not be sent.
+stream_answered: Io.Event = .unset,
 /// Private: the tools' `x-mcp-header` marks, from the last `tools/list`.
 marks: aegis.BlockingGuarded(std.ArrayList(Marked)) = .init(.empty),
 /// Private: the transport the client holds, `transport()`.
-transporting: Client.Transport = .{ .vtable = &.{ .request = request, .notify = notify, .opened = opened, .listed = listedFn } },
+transporting: Client.Transport = .{ .vtable = &.{ .request = request, .notify = notify, .opened = opened, .established = established, .listed = listedFn } },
 
 const Marked = struct {
     tool: []u8,
@@ -190,7 +192,20 @@ fn opened(ct: *Client.Transport, io: Io, client: *Client) Io.ConcurrentError!voi
     try t.stream.concurrent(io, sessionStream, .{ t, io });
 }
 
+/// Waits until the session's GET is answered, as `connect` returns only then
+/// (`Client.Transport.VTable.established`).
+fn established(ct: *Client.Transport, io: Io, timeout: Io.Duration) Io.Cancelable!void {
+    const t: *Transport = @alignCast(@fieldParentPtr("transporting", ct));
+    t.stream_answered.waitTimeout(io, .{ .duration = .{ .raw = timeout, .clock = .awake } }) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        // A server that holds its answer to the GET: requests go on by POST.
+        error.Timeout => log.warn("the session's stream was not answered in time; requests go on without it", .{}),
+    };
+}
+
 fn sessionStream(t: *Transport, io: Io) Io.Cancelable!void {
+    // However the task ends, `connect` waits no longer.
+    defer t.stream_answered.set(io);
     var arena_state: std.heap.ArenaAllocator = .init(t.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -211,7 +226,11 @@ fn readSession(t: *Transport, io: Io, arena: Allocator, client: *Client) (Io.Can
         .{ .name = headers.protocol_version, .value = client.revision.text() },
     });
     if (t.session) |id| try fields.append(arena, .{ .name = headers.session_id, .value = id });
-    var response = t.send(io, arena, .{ .method = .get, .url = t.url, .headers = fields.items }) catch |err| switch (err) {
+    const sent = t.send(io, arena, .{ .method = .get, .url = t.url, .headers = fields.items });
+    // Answered (or refused, or out of reach): what the server sends from
+    // here has the stream, or there is none to wait for.
+    t.stream_answered.set(io);
+    var response = sent catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         error.OutOfMemory => return error.OutOfMemory,
         // A server with no stream for the session, or one out of reach:

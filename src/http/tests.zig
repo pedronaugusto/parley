@@ -320,6 +320,57 @@ test "a session client with no task for the session's stream is refused at conne
     try testing.expectError(error.ConcurrencyUnavailable, client.connect(serial.io()));
 }
 
+/// An `Io` whose every group task starts a while after it is asked for, as
+/// on a machine busy with other work: the session's GET is late.
+const Late = shakedown.Layer(u8, .{
+    .groupConcurrent = struct {
+        const Delayed = struct {
+            base: Io,
+            start: *const fn (*const anyopaque) void,
+            context: [256]u8 align(16),
+
+            fn run(raw: *const anyopaque) void {
+                const d: *const Delayed = @ptrCast(@alignCast(raw));
+                d.base.sleep(.fromMilliseconds(300), .awake) catch return;
+                d.start(&d.context);
+            }
+        };
+        fn groupConcurrent(userdata: ?*anyopaque, group: *Io.Group, context: []const u8, alignment: std.mem.Alignment, start: *const fn (*const anyopaque) void) Io.ConcurrentError!void {
+            const base = Late.of(userdata).base;
+            if (context.len > 256 or alignment.toByteUnits() > 16) return base.vtable.groupConcurrent(base.userdata, group, context, alignment, start);
+            var d: Delayed = .{ .base = base, .start = start, .context = undefined };
+            @memcpy(d.context[0..context.len], context);
+            return base.vtable.groupConcurrent(base.userdata, group, std.mem.asBytes(&d), .of(Delayed), Delayed.run);
+        }
+    }.groupConcurrent,
+});
+
+test "connect returns once the session's stream is answered, however late its task starts: what the server sends on it after is not lost" {
+    const io = testing.io;
+    var h: Harness = undefined;
+    try h.start(io);
+    defer h.stop(io);
+    var late: Late = .init(io, 0);
+    var url_buffer: [64]u8 = undefined;
+    const url = try std.mem.print(&url_buffer, "http://127.0.0.1:{d}/mcp", .{h.port});
+    var remote: Transport = .init(testing.allocator, &h.client, url, .{});
+    defer remote.deinit();
+    defer remote.close(io);
+    var client: parley.Client = .init(testing.allocator, remote.transport(), .{
+        .info = .{ .name = "c", .version = "1" },
+        .validator = null,
+        .revisions = &.{.@"2025-11-25"},
+    });
+    defer client.deinit();
+    try client.connect(late.io());
+    // The server holds the session's stream before the client's first
+    // request: a server-to-client request a tool call starts goes to it.
+    var held = h.endpoint.sessions.acquireUncancelable(io);
+    defer held.deinit(io);
+    try testing.expectEqual(@as(usize, 1), held.value().items.len);
+    try testing.expect(held.value().items[0].streaming.load(.acquire) == .open);
+}
+
 test "a session's stream ends when the session is deleted" {
     const io = testing.io;
     var h: Harness = undefined;

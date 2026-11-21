@@ -144,6 +144,13 @@ pub const Transport = struct {
         /// when the `Io` gives no task to read it on: `connect` returns it,
         /// where a session without it would miss what the server sends.
         opened: *const fn (t: *Transport, io: Io, client: *Client) Io.ConcurrentError!void,
+        /// Waits, at most `timeout`, until the stream `opened` started is
+        /// answered (open, or refused): what the server sends on it once
+        /// the client's next request is in then has a stream to go to. A
+        /// server keeps nothing it sends before (the SDKs drop it), so a
+        /// request whose handler asks the client something would wait for an
+        /// answer that never comes. Null: no stream to wait for.
+        established: ?*const fn (t: *Transport, io: Io, timeout: Io.Duration) Io.Cancelable!void = null,
         /// A `tools/list` answer, as the application should see it: a
         /// transport that mirrors arguments into headers learns the tools'
         /// marks, and leaves out a tool whose marks it cannot honour.
@@ -362,6 +369,7 @@ fn openSession(c: *Client, io: Io, arena: Allocator) ConnectError!void {
     c.instructions = r.instructions;
     try c.transport.vtable.opened(c.transport, io, c);
     try c.transport.notify(io, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
+    if (c.transport.vtable.established) |wait| try wait(c.transport, io, c.options.timeout.toIoDuration());
 }
 
 fn writeCapabilities(c: *const Client, w: *Writer) Writer.Error!void {
