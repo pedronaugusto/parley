@@ -282,7 +282,7 @@ fn refused(auth: *http.Transport.Authorization, io: Io, sent: ?[]const u8, statu
 
 const RenewError = oauth.DiscoverError || oauth.RefreshError || oauth.RegisterError || oauth.AuthorizationFlow.BeginError || oauth.AuthorizationFlow.FinishError ||
     oauth.IdJagError || oauth.RedeemError || oauth.challenge.ReadError || oauth.store.LoadError || oauth.store.SaveError || SignInError || SourceError || error{
-    /// No `WWW-Authenticate` challenge is Bearer.
+    /// No `WWW-Authenticate` challenge is Bearer or DPoP.
     NotBearer,
     /// A 403 that is not for more scope: more credentials would not help.
     Forbidden,
@@ -309,7 +309,10 @@ const RenewError = oauth.DiscoverError || oauth.RefreshError || oauth.RegisterEr
 /// New tokens, as MCP's authorization asks, for a request refused with
 /// `status` and `challenges`.
 fn renew(a: *Authorizer, h: *Held, io: Io, arena: Allocator, status: u16, challenges: []const []const u8) RenewError!void {
-    const challenge = (try oauth.challenge.read(arena, challenges)) orelse return error.NotBearer;
+    // A resource that takes DPoP-bound tokens challenges with `DPoP` (RFC
+    // 9449 §7.1), whose parameters are a Bearer challenge's and `algs`.
+    const challenge = (try oauth.challenge.read(arena, challenges)) orelse
+        (try oauth.challenge.readScheme(arena, challenges, .dpop)) orelse return error.NotBearer;
     if (status == 403 and challenge.@"error" != .insufficient_scope) return error.Forbidden;
     var prm = try oauth.discoverResource(a.gpa, io, a.web, a.resource, challenge.resource_metadata, .ancestor, .{ .fetch = a.options.fetch });
     defer prm.deinit();

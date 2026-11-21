@@ -492,6 +492,36 @@ test "DPoP nonces: the token endpoint's and the MCP server's each asked for, and
     try dpopRound(true);
 }
 
+test "a resource that challenges with DPoP alone (RFC 9449 §7.1) is answered: tokens got, bound to the key" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var provider: Provider = undefined;
+    try provider.start(io);
+    defer provider.stop(io);
+    provider.dpop = .proof;
+    var web: uplink.Client = .init(gpa, .{});
+    defer web.deinit(io);
+    var mcp: Guarded = undefined;
+    try mcp.start(gpa, io, &web, provider.base);
+    defer mcp.stop(io);
+    mcp.verifier.dpop = .{ .algorithms = &.{.eddsa} };
+
+    var private = try clearance.jwk.PrivateKey.parse(gpa, dpop_jwk, .{});
+    defer private.deinit();
+    var session: oauth.dpop.Session = .init(try .fromJwk(&private, .eddsa));
+    var browser: Browser = .{ .web = &web };
+    var authorizer: Authorizer = .init(gpa, &web, mcp.url, .{ .sign_in = &browser.sign_in, .client_name = "parley-test", .dpop = &session });
+    defer authorizer.deinit();
+    const auth = authorizer.authorization();
+    // The first request's refusal, as MCP's conformance server writes it: no Bearer challenge.
+    try testing.expect(try auth.refused(io, null, 401, &.{"DPoP algs=\"EdDSA\""}));
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const sent = (try auth.credentials(io, arena_state.allocator(), "POST", mcp.url)).?;
+    try testing.expect(std.mem.startsWith(u8, sent.authorization, "DPoP "));
+    try testing.expect(sent.dpop != null);
+}
+
 test "enterprise-managed authorization: no sign-in; the identity provider's ID-JAG redeemed, again for a step-up" {
     const gpa = testing.allocator;
     const io = testing.io;
