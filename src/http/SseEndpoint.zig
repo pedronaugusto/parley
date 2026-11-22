@@ -108,7 +108,7 @@ const Session = struct {
     /// Lets the POSTs waiting through: the endpoint event is written, or
     /// the stream ended first. Its stream's task alone calls it, once.
     fn open(s: *Session, io: Io) void {
-        s.opened.set(io, {}) catch aegis.assert.never("a session is opened once, by its stream");
+        aegis.assert.invariant(s.opened.set(io, {}), "a session is opened once, by its stream");
     }
 
     fn begin(o: *parley.stdio.Out) parley.stdio.Out.Error!aegis.io.WriteEnd {

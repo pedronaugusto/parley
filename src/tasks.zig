@@ -104,7 +104,7 @@ pub const Task = struct {
     /// stands. Under the table's lock, as every change to a task is.
     pub fn stop(t: *Task, io: Io) void {
         if (t.stopping()) return;
-        t.cancel.set(io, {}) catch aegis.assert.never("a task's cancel is set by its first stop alone, under the table's lock");
+        aegis.assert.invariant(t.cancel.set(io, {}), "a task's cancel is set by its first stop alone, under the table's lock");
     }
 
     /// Whether the task was asked to stop.

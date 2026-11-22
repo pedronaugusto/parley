@@ -207,10 +207,9 @@ fn established(ct: *Client.Transport, io: Io, timeout: Io.Duration) Io.Cancelabl
 /// The session's GET answered, or out of reach: `connect` goes on. Set once,
 /// by the answer or else by the task's end.
 fn answered(t: *Transport, io: Io) void {
-    // glint-ignore: Z026 -- the task's end after the GET's answer: connect was told by the answer
-    t.stream_answered.set(io, {}) catch |err| switch (err) {
-        error.AlreadySet => {},
-    };
+    // The answer and the task's end race to set it, and whichever comes
+    // second has nothing to do: connect was told by the first.
+    _ = t.stream_answered.set(io, {});
 }
 
 fn sessionStream(t: *Transport, io: Io) Io.Cancelable!void {

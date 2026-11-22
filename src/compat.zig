@@ -188,7 +188,7 @@ pub const Session = struct {
             else
                 .{ .failure = "" };
             // Under the session's lock, the one place it is set: unset here.
-            o.answer.set(io, answer) catch aegis.assert.never("an answer is set under the session's lock, checked unset above");
+            aegis.assert.invariant(o.answer.set(io, answer), "an answer is set under the session's lock, checked unset above");
             return;
         };
     }

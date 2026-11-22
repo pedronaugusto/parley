@@ -1310,7 +1310,7 @@ fn become(hook: *Call.TaskHook) Call.Error!bool {
     run.call.sink = .none;
     // One side decides: the round's end only while the call is attached, and here only once this
     // detached it, both under the table's lock.
-    run.decided.set(io, .detached) catch aegis.assert.never("a round is decided once: here, once this detached it, or at its end while attached");
+    aegis.assert.invariant(run.decided.set(io, .detached), "a round is decided once: here, once this detached it, or at its end while attached");
     return true;
 }
 
@@ -1396,7 +1396,7 @@ fn recordRound(s: *Server, run: *Run, returned: Call.Error!registry.ToolResult) 
     };
     // Attached: the waiting call answers with the outcome.
     const n = next orelse {
-        run.decided.set(io, .{ .done = returned }) catch aegis.assert.never("a round is decided once: attached, its end decides, never `become`");
+        aegis.assert.invariant(run.decided.set(io, .{ .done = returned }), "a round is decided once: attached, its end decides, never `become`");
         run.release();
         return;
     };

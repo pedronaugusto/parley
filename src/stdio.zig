@@ -616,7 +616,7 @@ const Job = struct {
     fn stop(job: *Job, io: Io) void {
         // Stopped already: the request's task sees the first stop.
         if (job.canceled.swap(.canceled, .acq_rel) == .canceled) return;
-        if (job.streams()) job.end.end(io) else job.cancel.set(io, {}) catch aegis.assert.never("a request's cancel is set by its first stop alone");
+        if (job.streams()) job.end.end(io) else aegis.assert.invariant(job.cancel.set(io, {}), "a request's cancel is set by its first stop alone");
     }
 
     fn destroy(job: *Job) void {
@@ -907,7 +907,7 @@ pub const Channel = struct {
             waiting.closed = true;
             // A waiter answered already keeps its answer.
             for (waiting.list.items) |w| if (w.answer.get() == null) {
-                w.answer.set(io, .closed) catch aegis.assert.never("an answer is set under the waiting list's lock, checked unset here");
+                aegis.assert.invariant(w.answer.set(io, .closed), "an answer is set under the waiting list's lock, checked unset here");
             };
         }
         var line_buffer: Io.Writer.Allocating = .init(ch.gpa);
@@ -992,7 +992,7 @@ pub const Channel = struct {
             // One that cannot be copied fails its request for want of memory.
             const answer: Answered = if (ch.gpa.dupe(u8, bytes)) |copy| .{ .bytes = copy } else |_| .out_of_memory;
             // Under the waiting list's lock, where the channel's end sets it too: unset here.
-            w.answer.set(io, answer) catch aegis.assert.never("an answer is set under the waiting list's lock, checked unset above");
+            aegis.assert.invariant(w.answer.set(io, answer), "an answer is set under the waiting list's lock, checked unset above");
             return;
         };
     }

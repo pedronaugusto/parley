@@ -16,8 +16,8 @@
     },
     .dependencies = .{
         .aegis = .{
-            .url = "git+https://github.com/pedronaugusto/aegis#f52eabef3ec6534c3a74bea3a3b7d95a91ce2581",
-            .hash = "aegis-0.2.4-rsxouoquDQApwYDuGdd2YyEeTeNp6CnJoOZKdVCfc3jt",
+            .url = "git+https://github.com/pedronaugusto/aegis?ref=v0.4.0#4739dccd71cfc16b0c15bc27e2d7dca76de9bc21",
+            .hash = "aegis-0.4.0-rsxouv1KDgCdGc-mhY-qBfyE70ar4OQiGGKHKndirWnQ",
         },
 
         .almanac = .{
@@ -37,20 +37,20 @@
         },
 
         .uplink = .{
-            .url = "git+https://github.com/pedronaugusto/uplink#51e2436292a06b6d5351a625c6ac4fdc060d0450",
-            .hash = "uplink-0.10.2-0eVSJvm1HgAUfb0gFpU4sETXCtpFT8EPUnAWmREXUSGq",
+            .url = "git+https://github.com/pedronaugusto/uplink#46e64a5aa69717a529ac6d5e43bdf73adfb8ed5d",
+            .hash = "uplink-0.10.2-0eVSJu3zHgB8AjPYGbjnwLA7mTnPzNSc3NBM0Df85eFM",
             .lazy = true,
         },
 
         .clearance = .{
-            .url = "git+https://github.com/pedronaugusto/clearance#c278fd182ad40929c88f61130a0d4b958b9830e4",
-            .hash = "clearance-0.4.0--QKm-FomFgC7o8I0de_LcbtQxsFCSAWeqCP4ufaOlMq_",
+            .url = "git+https://github.com/pedronaugusto/clearance#fe26dd1e56d9a9936c7d2df7805cc33285ac5287",
+            .hash = "clearance-0.4.0--QKm-ClCDQDBAQsE9fi8uLLPdjxs8sRxYXmjM_6DLv8W",
             .lazy = true,
         },
 
         .conduit = .{
-            .url = "git+https://github.com/pedronaugusto/conduit#60ee9d63b1a426dd0c3eea71d3e3f40710f945d4",
-            .hash = "conduit-0.10.6-4rIA797xFQC3Nf4LTEJlFjWX_IOAWD-JOfbTCoi9OfY9",
+            .url = "git+https://github.com/pedronaugusto/conduit#cad2151c50b47e5ba93f4607b0c61a5e880fd079",
+            .hash = "conduit-0.10.6-4rIA75KBFgDQ6Xj7OTKNrBXksvyuhJeXqb3xK2mRWp7x",
             .lazy = true,
         },
     },
