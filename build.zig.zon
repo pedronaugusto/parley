@@ -37,14 +37,14 @@
         },
 
         .uplink = .{
-            .url = "git+https://github.com/pedronaugusto/uplink#8ad9482a97510b144e9bac66417e67f6e8af7a5f",
-            .hash = "uplink-0.10.2-0eVSJqIEHwAfQIH9R5Qbxr7xSJFCMWNySLvj-Ka-hkxD",
+            .url = "git+https://github.com/pedronaugusto/uplink#bd2755ea3e416ccbab30daf69fdaf47c127ffba8",
+            .hash = "uplink-0.10.2-0eVSJpARHwBLtmfgNs1c6huQT-0f25VShhqbE1pOR6oA",
             .lazy = true,
         },
 
         .clearance = .{
-            .url = "git+https://github.com/pedronaugusto/clearance#57f30fba2292d24bd5170d0b66d29e8cb1a4f843",
-            .hash = "clearance-0.4.0--QKm-PxCDQCRs0pK52eAkf1Ca9xBDwAcl-Lm2nwmoywA",
+            .url = "git+https://github.com/pedronaugusto/clearance#da0f52469724162474b5d15a13d715f9e1ef7bdd",
+            .hash = "clearance-0.4.0--QKm-ExEDQBCJaClanfdqESO0x2UyGPfx2krxwGJQCX4",
             .lazy = true,
         },
 
