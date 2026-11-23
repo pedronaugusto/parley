@@ -536,11 +536,23 @@ fn member(object: []const u8, name: []const u8, limits: strand.core.Limits) ?[]c
     return null;
 }
 
+/// Each of uplink's failures by what it means to a client: none is the
+/// connection closed, which a request learns reading the answer.
 fn sendError(err: (uplink.Client.SendError || Authorization.Error)) Client.RequestError {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.Canceled => error.Canceled,
         error.TimedOut => error.TimedOut,
-        else => error.Closed,
+        error.ConcurrencyUnavailable => error.ConcurrencyUnavailable,
+        error.ConnectionFailed, error.AccessDenied, error.FileNotFound, error.AddressFamilyMismatch, error.ProxyRefused, error.ProxyHostUnreachable, error.ProxyAddressUnsupported => error.Unreachable,
+        error.TlsFailed, error.ClientCertificateRejected, error.ClientCertificateSchemeUnsupported, error.CertificateBundleUnreadable => error.HandshakeFailed,
+        error.ProxyAuthenticationRequired, error.ProxyAuthMethodUnsupported, error.CredentialsUnavailable => error.Unauthorized,
+        error.HttpProtocolError, error.ProxyProtocolError, error.InvalidRedirect, error.TooManyRedirects, error.InsecureRedirect => error.Protocol,
+        error.InvalidUrl, error.UnsupportedScheme, error.InvalidHeader, error.InvalidProxy, error.OptionUnsupported, error.NamedPipeUnsupported, error.InvalidBody, error.BodyNotReplayable, error.BodyIncomplete, error.BodyReadFailed, error.ExtendedConnectUnsupported, error.PrepareFailed => error.Misconfigured,
+        // What is left is the host name's lookup, which found no address:
+        // the set it must fit is uplink's lookup failures, checked here.
+        else => |lookup| switch (@as(uplink.net.Resolver.LookupError, lookup)) {
+            else => error.Unreachable,
+        },
     };
 }
