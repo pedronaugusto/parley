@@ -320,6 +320,36 @@ test "a session client with no task for the session's stream is refused at conne
     try testing.expectError(error.ConcurrencyUnavailable, client.connect(serial.io()));
 }
 
+test "a request the Io has no task to bound is refused by name before it is sent, never as the connection closed" {
+    const io = testing.io;
+    var h: Harness = undefined;
+    try h.start(io);
+    defer h.stop(io);
+    var serial: Serial = .init(io, 0);
+    var url_buffer: [64]u8 = undefined;
+    const url = try std.mem.print(&url_buffer, "http://127.0.0.1:{d}/mcp", .{h.port});
+    var remote: Transport = .init(testing.allocator, &h.client, url, .{});
+    defer remote.deinit();
+    defer remote.close(io);
+    var client: parley.Client = .init(testing.allocator, remote.transport(), .{
+        .info = .{ .name = "c", .version = "1" },
+        .validator = null,
+        .revisions = &.{.@"2025-11-25"},
+    });
+    defer client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var exchange: parley.Client.Exchange = .{
+        .id = .{ .integer = 1 },
+        .method = "ping",
+        .message = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}",
+        .revision = .@"2025-11-25",
+        .timeout = .fromSeconds(5),
+        .client = &client,
+    };
+    try testing.expectError(error.ConcurrencyUnavailable, remote.transport().request(serial.io(), arena.allocator(), &exchange));
+}
+
 /// An `Io` whose every group task starts a while after it is asked for, as
 /// on a machine busy with other work: the session's GET is late.
 const Late = shakedown.Layer(u8, .{
