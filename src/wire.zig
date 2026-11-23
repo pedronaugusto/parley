@@ -127,12 +127,15 @@ pub fn limitsFor(message: aegis.units.Bytes(u32)) strand.core.Limits {
     const bytes = message.convert(usize);
     const m: usize = bytes.raw();
     const base: strand.core.Limits = .{};
+    // Two bytes an item (`1,`), and one item even in an empty message.
+    const pairs = bytes.divTrunc(2) catch aegis.assert.never("two is not zero");
+    const items: usize = if (pairs.eql(.fromRaw(0))) 1 else pairs.raw();
     return .{
         .input_bytes = bytes,
         .output_bytes = bytes,
         .string_bytes = bytes,
-        .items = @max(1, m / 2),
-        .container_items = @max(1, m / 2),
+        .items = items,
+        .container_items = items,
         // strand's default allocation per input byte, scaled to the message; past the range, the most there is.
         .allocation_bytes = if (base.allocation_bytes.ratio(base.input_bytes)) |per| bytes.mul(per) catch .fromRaw(std.math.maxInt(usize)) else |_| .fromRaw(std.math.maxInt(usize)),
         // As above for the work, a count and no size: so many steps per byte of input.
